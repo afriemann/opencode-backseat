@@ -716,6 +716,7 @@ export async function captureNativeCoordinator(
 }
 
 export interface NativeFrame {
+  commands?: Array<{ id?: string; title?: string; slash?: { name: string } }>;
   pid: number;
   width: number;
   height: number;
@@ -733,6 +734,7 @@ const nativeProbe = (options: Record<string, unknown>) => `
 import { Plugin } from "@opencode/plugin/tui";
 import { writeFileSync } from "node:fs";
 import { applyNativeNoColor, coordinationStatusDetails, overview, sharedVersionDetails } from ${JSON.stringify(new URL("../src/ui.ts", import.meta.url).href)};
+import { setupNativeTui } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
 import { FixtureRpc } from "./rpc.js";
 export default Plugin.define({ id: ${JSON.stringify(options.modelTurn ? "conman" : "conman.native-frame-probe")}, setup(context) {
   const o = ${JSON.stringify(options)};
@@ -743,14 +745,20 @@ export default Plugin.define({ id: ${JSON.stringify(options.modelTurn ? "conman"
   const capture = buffer => {
     if (buffer.width !== o.width || buffer.height !== o.height) return;
     const text = new TextDecoder().decode(buffer.getRealCharBytes(true));
-     if (!text.includes(o.versions ? "Shared versions" : "Coordinate / search") && !text.includes("Status (read only)")) return;
+      if (!o.discovery && !text.includes(o.versions ? "Shared versions" : "Coordinate / search") && !text.includes("Status (read only)")) return;
      if (o.statusReason && text.includes("Status (read only)") && !pages.includes(text)) pages.push(text);
     const spans = buffer.getSpanLines().flatMap(line => line.spans.map(span => ({
       text: span.text, fg: span.fg.toInts(), bg: span.bg.toInts(), attributes: span.attributes,
     })));
-     writeFileSync(o.frame, JSON.stringify({ pid: process.pid, width: buffer.width, height: buffer.height, text, spans, pages }));
+      writeFileSync(o.frame, JSON.stringify({ pid: process.pid, width: buffer.width, height: buffer.height, text, spans, pages,
+        commands: o.discovery ? context.keymap.commands().filter(command=>command.id?.startsWith("conman.")).map(command=>({id:command.id,title:command.title,slash:command.slash})) : undefined }));
   };
   context.renderer.addPostProcessFn(capture);
+  if(o.discovery){
+    const close=setupNativeTui(context);
+    queueMicrotask(()=>context.keymap.dispatch("command.palette.show"));
+    return ()=>{close();context.renderer.removePostProcessFn(capture);restore()};
+  }
   let action;
    const actions = ["Create", "Adopt", "Open", "Share", "Hold", "Resume", "Manual"].map((title, i) => ({
     title, bind: ["alt+c", "alt+a", "alt+o", "alt+s", "alt+h", "alt+r", "alt+t"][i],
@@ -842,6 +850,7 @@ export async function captureNativeOverview(
   state: import("../src/ui.ts").UiState = "ready",
   versions = false,
   statusReason?: string,
+  discovery = false,
 ) {
   const root = resolve(import.meta.dir, "../.opencode/conman/native-fixtures");
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -884,6 +893,7 @@ export async function captureNativeOverview(
         state,
         versions,
         statusReason,
+        discovery,
         home,
         proof: proofPath,
         frame: framePath,
@@ -965,6 +975,43 @@ export async function captureNativeOverview(
       terminal = (terminal + String(bytes)).slice(-200000);
     });
     try {
+      if (discovery) {
+        frame = await readCapture<NativeFrame>(framePath, (value) =>
+          value.text.includes("Commands"),
+        );
+        child.stdin?.write("coord");
+        const palette = await readCapture<NativeFrame>(
+          framePath,
+          (value) =>
+            value.text.includes("Commands") &&
+            /^\s+coord\s*$/m.test(value.text),
+        );
+        await writeFile(
+          "/tmp/opencode/conman-command-palette.json",
+          JSON.stringify(palette, null, 2),
+        );
+        if (
+          !palette.commands?.some((command) => command.id === "conman.overview")
+        )
+          return { frame: palette, terminal };
+        child.stdin?.write("\u001b");
+        await readCapture<NativeFrame>(
+          framePath,
+          (value) => !value.text.includes("Commands"),
+        );
+        child.stdin?.write("/coord");
+        const slash = await readCapture<NativeFrame>(
+          framePath,
+          (value) =>
+            !value.text.includes("Commands") &&
+            value.text.includes("/coordinate"),
+        );
+        await writeFile(
+          "/tmp/opencode/conman-command-slash.json",
+          JSON.stringify(slash, null, 2),
+        );
+        return { frame: palette, slash, terminal };
+      }
       frame = await readCapture<NativeFrame>(
         framePath,
         (value) =>

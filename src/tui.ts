@@ -1508,6 +1508,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       else await ui.control(action, task);
     };
   context.keymap.layer(() => ({
+    mode: "global",
     commands: [
       {
         id: "conman.overview",

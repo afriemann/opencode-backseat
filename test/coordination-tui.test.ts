@@ -913,6 +913,26 @@ async function assertLocalObserverFailureFences() {
 
 describe("Native project and worker selection", () => {
   it("Selects a project-specific agent and worker", async () => {
+    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+      const discovery = await captureNativeOverview(
+        [task],
+        80,
+        24,
+        false,
+        {},
+        false,
+        "ready",
+        false,
+        undefined,
+        true,
+      );
+      expect(discovery.frame.commands).toContainEqual(
+        expect.objectContaining({ id: "conman.overview" }),
+      );
+      expect(discovery.frame.text).toContain("Coordinate / search");
+      expect(discovery.frame.text).toContain("Coordinate: open worker");
+      expect(discovery.slash?.text).toContain("/coordinate");
+    }
     const passive = await supervisedRuntime("continue");
     await passive.ready();
     expect(passive.requests[0]?.location?.directory).toBe(task.location);
