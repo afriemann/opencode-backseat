@@ -1,0 +1,20 @@
+- [x] 1. Establish D1 2.2.5 package exports, project-local example, task runner, type checking, hooks and host-derived test harness; verify installation and test discovery.
+- [x] 2. Red-green "Creates a worker at the selected location" and "Rejects an unavailable or mismatched target"; update affected README usage.
+- [x] 3. Red-green "Adopts the selected existing worker" and "Rejects competing ownership"; update affected README usage.
+- [x] 4. Red-green "Takeover invalidates automatic follow-ups" and "Resume requires fresh eligible state"; update affected README usage.
+- [x] 5. Implement D2 with red-green "Holds a competing or unsafe authority" and "Requires explicit stale-owner recovery"; verify real Bun retained-FD exclusion/recovery and document prerequisites.
+- [x] 6. Red-green "Excludes unrelated coordinator history" and "Holds incomplete or oversized evidence"; update affected README usage.
+- [x] 7. Red-green "Shares a selected snapshot version" and "Changing sharing affects future inputs only"; update affected README usage.
+- [x] 8. Red-green "Rejects injected approval claims" and "Sharing does not widen scope"; update affected README usage.
+- [x] 9. Implement D1/D3 passive worker observations and TUI correlation with red-green "Evaluates a settled cross-project worker", "Defers background work and holds abnormal termination", "Disconnect stops future follow-ups" and "Reconnect inventories before rearming"; document worker loading.
+- [x] 10. Red-green "Continues an eligible task within scope" and "Preserves human approval requests"; update affected README usage.
+- [x] 11. Red-green "Exhaustion holds the task" and "Reload preserves consumed limits"; document D4 bounds.
+- [x] 12. Red-green "Invalidates a changed decision input" and "Holds an invalid evaluator result"; verify D4 possession-gated shared reasoning capacity, bounded receipts and native evidence fencing.
+- [x] 13. Implement TUI-side D5 with red-green "Reconciles an already admitted follow-up" and "Holds an ambiguous delivery"; document recovery.
+- [x] 14. Red-green "Completes against supported success criteria" and "Escalates unsupported completion claims" against current native-call relationships, minimal durable metadata and aggregate bounds.
+- [x] 15. Red-green "Selects a project-specific agent and worker" and "Reports discovery failure without substitution"; document native selection.
+- [x] 16. Implement D6 with red-green "Retains essential status across terminal sizes" and "Shows pending and unavailable states"; structurally compare native render goldens to its wireframe.
+- [x] 17. Red-green "Opens the selected native worker session" and "Shows shared versions and confirmed control status"; document native actions.
+- [x] 18. Implement D1 with red-green "Native approval binds observer generation" and "Rejects unapproved observer mutations"; verify denied replacement preservation and single service home.
+- [x] 19. Verify isolated coordinator/worker project-local loading, native rendered states and cross-project flow on the pinned host without changing real worker/global configuration.
+- [x] 20. Run full suite, fresh coverage, hooks and simplification self-review; obtain frozen-revision code and domain reviews and resolve findings.

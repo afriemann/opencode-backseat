@@ -1,0 +1,30 @@
+{
+  "name": "opencode-conman",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "exports": {
+    ".": "./src/server.ts",
+    "./tui": "./src/tui.ts",
+    "./rpc": "./src/rpc.ts"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.2.5 <3"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.2.5",
+    "@opencode/client": "2.2.5",
+    "@opencode/theme": "2.2.5",
+    "@opentui/core": "0.8.0",
+    "@opentui/solid": "0.8.0",
+    "solid-js": "1.9.17",
+    "@types/bun": "1.4.4",
+    "typescript": "6.0.3",
+    "prettier": "3.9.10",
+    "eslint": "10.14.0",
+    "typescript-eslint": "8.72.1"
+  }
+}

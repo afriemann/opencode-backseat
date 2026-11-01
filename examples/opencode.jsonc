@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-conman",
+      "options": {
+        "home": "/absolute/path/to/coordinator"
+      }
+    }
+  ]
+}

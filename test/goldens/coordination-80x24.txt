@@ -1,0 +1,8 @@
+Coordinate / search
+Group: migration
+> api / engineer / held
+  Goal: update endpoint; shared snapshot contract v3
+  web / engineer / needs-input
+  Goal: update interface
+Create / Adopt / Open / Share / Hold / Resume / Takeover
+Native navigation / select / back
