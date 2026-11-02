@@ -50,27 +50,18 @@ The terminal interface SHALL route explicit worker actions to the selected worke
 - **WHEN** the user shares an explicit snapshot or chooses Hold, Resume or Takeover
 - **THEN** the interface shows the immutable version or authoritative control state only after native operation approval and current-generation validation, reports failures without optimistic success, and leaves human forms and permissions in native OpenCode flows.
 
-### Requirement: Guided coordinator startup
+### Requirement: Dedicated coordinator entry
 
-The terminal interface SHALL offer a keyboard-reachable guided startup flow without requiring a user prompt to establish a coordinator session.
+The terminal interface SHALL use native selection of the bundled coordination agent as its sole coordination entry path while retaining supporting approval, status and supervision controls.
 
-#### Scenario: Starts from a blank coordinator without a prompt
+#### Scenario: Starts through the dedicated native agent
 
-- **GIVEN** coordination is unattached and the user opens the overview or startup palette entry
-- **WHEN** the user explicitly chooses to use a valid current coordinator or create a blank coordinator at the canonical home
-- **THEN** the interface opens and verifies that unarchived nonworker session before requesting native attachment approval, without a model call, user prompt or worker creation.
-- **AND** HOME, archived, bound-worker and wrong-location sessions are not repurposed; ordinary overview inspection creates nothing.
-- **AND** the canonical home can be inspected through read-only native details before creation, and the empty worker inventory remains visible.
+- **WHEN** the user selects Conman Coordinator at the canonical home and starts a conversation
+- **THEN** the session uses the dedicated role and its coordination toolset without a setup wizard, dummy message or automatic observer attachment.
+- **AND** coordination controls reject unrelated agents and conflicting user-defined roles rather than repurposing them.
 
-#### Scenario: Keeps approval and arming separate
+#### Scenario: Keeps native supervision explicit
 
-- **WHEN** the user cancels startup, denies attachment, or chooses Not now after confirmed attachment
-- **THEN** supervision remains stopped and the interface accurately distinguishes unattached from connected-but-stopped state, retaining any confirmed session and attachment.
-- **AND** only a separate Start supervision choice invokes current reconciliation and rearm; failed reads, approval, navigation or rearm never report readiness.
-
-#### Scenario: Reuses confirmed sessions after interrupted startup
-
-- **GIVEN** startup has created a coordinator or this runtime already has a current approved attachment
-- **WHEN** the user explicitly resumes startup
-- **THEN** the interface revalidates and reuses the confirmed session or attachment instead of duplicating creation or approval.
-- **AND** queued activation prevents duplicate in-flight creation; an unknown creation outcome prevents automatic retry and reports how to select the resulting session, while stale attachment or reconnect requires fresh approval.
+- **WHEN** the user inspects coordination state or converses with the dedicated agent
+- **THEN** no session creation, agent reassignment, observer approval or supervision arming is performed by overview inspection.
+- **AND** native attachment approval and explicit supervision rearm remain separate actions; unreadable or ineligible coordinator state stays stopped with a visible reason.
