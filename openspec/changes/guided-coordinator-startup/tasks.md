@@ -1,0 +1,5 @@
+- [x] 1. Red-green "Starts from a blank coordinator without a prompt" using native composition and session eligibility decisions; update README startup usage.
+- [x] 2. Red-green "Keeps approval and arming separate" using the existing attachment/rearm paths and stopped-state decisions; document cancellation.
+- [x] 3. Red-green "Reuses confirmed sessions after interrupted startup" using confirmed-ID retention and queued revalidation; document uncertain creation recovery.
+- [x] 4. Verify the guided native dialogs against the design wireframes at 80/32 columns, including keyboard navigation and NO_COLOR, through the existing native harness.
+- [x] 5. Run full tests, coverage, types, lint and hooks; obtain code and UI reviews and resolve findings.

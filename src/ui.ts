@@ -193,6 +193,70 @@ export const NATIVE_UI = Object.freeze({
   minDetailColumns: 8,
 });
 
+export function coordinatorSessionChoices(
+  home: string,
+  reusable: boolean,
+): {
+  title: string;
+  options: readonly UiOption<string>[];
+} {
+  return {
+    title: "Set up coordinator",
+    options: [
+      reusable
+        ? {
+            title: "Use coordinator session",
+            value: "reuse",
+            description:
+              "Open the verified coordinator session; no prompt is sent",
+          }
+        : {
+            title: "Create coordinator",
+            value: "create",
+            description: `Create a blank session at ${display(home)}; no prompt is sent`,
+          },
+      {
+        title: "Inspect home",
+        value: "home",
+        description: "Read the full canonical coordinator path",
+      },
+      {
+        title: "Back",
+        value: "back",
+        description: "Leave supervision stopped",
+      },
+    ],
+  };
+}
+
+export function coordinatorHomeDetails(
+  home: string,
+  width: number,
+): { title: string; options: readonly UiOption<number>[] } {
+  return textDetails("Canonical home (read only)", [display(home)], width);
+}
+
+export function supervisionChoices(): {
+  title: string;
+  options: readonly UiOption<string>[];
+} {
+  return {
+    title: "Connected - supervision stopped",
+    options: [
+      {
+        title: "Start supervision",
+        value: "start",
+        description: "Reconcile current workers and explicitly rearm",
+      },
+      {
+        title: "Not now",
+        value: "not-now",
+        description: "Keep attachment approved and supervision stopped",
+      },
+    ],
+  };
+}
+
 export function overview(
   tasks: readonly WorkerBinding[],
   state: UiState,

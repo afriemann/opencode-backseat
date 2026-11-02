@@ -21,6 +21,7 @@ import {
   type NativeCatalogClient,
   type NativeAskClient,
   type NativeRuntimeContext,
+  type NativeRuntimeClient,
 } from "../src/tui.ts";
 import type {
   DialogSelectOptions,
@@ -225,6 +226,7 @@ function runtimeFixture() {
         }),
       },
       session: {
+        create: async () => ({ ...session, id: "created-coordinator" }),
         get: async ({ sessionID }: { sessionID: string }) =>
           sessionID === "coordinator"
             ? session
@@ -325,6 +327,7 @@ function runtimeFixture() {
     ui: {
       router: {
         current: () => ({ type: "session", sessionID: "coordinator" }),
+        navigate: () => {},
       },
       tabs: {
         focus: (id: string) => {
@@ -366,6 +369,7 @@ function runtimeFixture() {
     requests,
     signals,
     context,
+    rpc,
     run,
     close,
     async nativeEmit(details: OpenCodeEvent) {
@@ -381,6 +385,306 @@ function runtimeFixture() {
     snapshot: () => snapshot,
   };
 }
+
+function startupFixture(
+  origin:
+    "home" | "valid" | "worker" | "wrong" | "archived" | "missing" = "home",
+) {
+  const f = runtimeFixture();
+  f.snapshot().bindings = [];
+  let route: ReturnType<NativeRuntimeContext["ui"]["router"]["current"]> =
+    origin === "home"
+      ? { type: "home" }
+      : {
+          type: "session",
+          sessionID: origin === "worker" ? task.workerID : "coordinator",
+        };
+  if (origin === "worker") f.snapshot().bindings = [structuredClone(task)];
+  const get = f.context.client.session.get;
+  const events: string[] = [];
+  const creates: Parameters<NativeRuntimeClient["session"]["create"]>[0][] = [];
+  const rpc = f.rpc;
+  const attach = rpc.attach;
+  let deny = false,
+    failNavigation = false,
+    unknownCreation = false;
+  f.context.ui.router.current = () => route;
+  f.context.ui.router.navigate = (destination) => {
+    events.push("navigate");
+    if (failNavigation) throw new Error("Navigation failed");
+    if (destination.type !== "plugin") route = destination;
+  };
+  f.context.client.session.create = async (input) => {
+    events.push("create");
+    creates.push(input);
+    if (unknownCreation) throw new Error("Creation acknowledgement lost");
+    return {
+      ...(await get({ sessionID: "coordinator" })),
+      id: "created-coordinator",
+    };
+  };
+  f.context.client.session.get = async (input) => {
+    if (origin === "missing" && input.sessionID === "coordinator")
+      throw new Error("Current session no longer exists");
+    if (input.sessionID === "created-coordinator")
+      return {
+        ...(await get({ sessionID: "coordinator" })),
+        id: input.sessionID,
+      };
+    const value = await get(input);
+    return input.sessionID === "coordinator"
+      ? {
+          ...value,
+          ...(origin === "wrong" ? { location: { directory: "/" } } : {}),
+          time: {
+            ...value.time,
+            ...(origin === "archived" ? { archived: 1 } : {}),
+          },
+        }
+      : value;
+  };
+  rpc.attach = async (input) => {
+    events.push("approve");
+    if (deny) throw new Error("Native approval denied");
+    expect(route).toEqual({ type: "session", sessionID: input.coordinatorID });
+    return attach(input);
+  };
+  return {
+    ...f,
+    events,
+    creates,
+    deny: () => {
+      deny = true;
+    },
+    navigation: (failed: boolean) => {
+      failNavigation = failed;
+    },
+    unknownCreation: () => {
+      unknownCreation = true;
+    },
+  };
+}
+
+// spec: openspec/specs/coordination-tui/spec.md
+describe("Guided coordinator startup", () => {
+  it("Starts from a blank coordinator without a prompt", async () => {
+    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+      for (const width of [80, 32]) {
+        const native = await captureNativeOverview(
+          [],
+          width,
+          24,
+          false,
+          {},
+          false,
+          "disconnected",
+          false,
+          undefined,
+          false,
+          "session",
+        );
+        expect(native.frame.text).toContain("Get started");
+        expect(native.frame.text).toContain("Setup: unattached");
+        expect(native.frame.text).toContain("No workers available");
+        expect(native.sessionChoice?.text).toContain("Create coordinator");
+        expect(native.sessionChoice?.text).toContain("Inspect home");
+        expect(native.startupProof?.messages).toBe(0);
+        expect(native.startupProof?.homeReadable).toBe(true);
+        expect(native.startupProof?.location).toBe(
+          native.startupProof?.canonicalHome,
+        );
+        expect(native.startupProof?.sessionID).toStartWith("ses_");
+      }
+    }
+    for (const origin of [
+      "missing",
+      "home",
+      "valid",
+      "worker",
+      "wrong",
+      "archived",
+    ] as const) {
+      const f = startupFixture(origin);
+      try {
+        await f.run("conman.overview");
+        expect(f.creates).toHaveLength(0);
+        f.inputs.push(
+          "home",
+          undefined,
+          origin === "valid" ? "reuse" : "create",
+          "not-now",
+        );
+        await f.run("conman.start");
+        expect(f.events).toEqual(
+          origin === "valid" ? ["approve"] : ["create", "navigate", "approve"],
+        );
+        expect(f.creates).toEqual(
+          origin === "valid"
+            ? []
+            : [
+                {
+                  title: "Coordinator",
+                  location: { directory: "/tmp/opencode" },
+                },
+              ],
+        );
+        expect(
+          f.dialogs
+            .find((dialog) => dialog.title === "Canonical home (read only)")
+            ?.options.map((option) => option.title)
+            .join(""),
+        ).toBe("/tmp/opencode");
+        expect(f.dialogs[0]?.options).toContainEqual(
+          expect.objectContaining({
+            title: "Get started",
+            value: "conman:get-started",
+          }),
+        );
+        expect(
+          f.controls.some((control) =>
+            ["create", "adopt", "reserve"].includes(control.operation),
+          ),
+        ).toBe(false);
+      } finally {
+        f.close();
+      }
+    }
+  });
+  it("Keeps approval and arming separate", async () => {
+    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+      for (const width of [80, 32]) {
+        const native = await captureNativeOverview(
+          [],
+          width,
+          24,
+          true,
+          {},
+          false,
+          "awaiting-rearm",
+          false,
+          undefined,
+          false,
+          "supervision",
+        );
+        expect(native.frame.text).toContain("Start supervision");
+        expect(native.frame.text).toContain("Not now");
+      }
+    }
+    for (const mode of ["cancel", "deny", "not-now", "start"] as const) {
+      const f = startupFixture();
+      try {
+        if (mode === "deny") f.deny();
+        if (mode !== "cancel")
+          f.inputs.push("create", mode === "start" ? "start" : "not-now");
+        await f.run("conman.start");
+        expect(f.events.filter((value) => value === "approve")).toHaveLength(
+          mode === "cancel" ? 0 : 1,
+        );
+        expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(
+          mode === "start",
+        );
+        expect(f.snapshot().observer !== undefined).toBe(
+          mode === "start" || mode === "not-now",
+        );
+        expect(f.controls).toHaveLength(0);
+        if (mode === "deny")
+          expect(f.notices.join("\n")).toContain("Native approval denied");
+        if (mode === "deny") {
+          expect(
+            (
+              await f.context.client.session.get({
+                sessionID: "created-coordinator",
+              })
+            ).id,
+          ).toBe("created-coordinator");
+          f.inputs.length = 0;
+          f.inputs.push("reuse");
+          await f.run("conman.start");
+          expect(f.creates).toHaveLength(1);
+          expect(f.snapshot().observer).toBeUndefined();
+        }
+        if (mode === "cancel") {
+          await f.run("conman.overview");
+          expect(f.dialogs.at(-1)?.options).toContainEqual(
+            expect.objectContaining({
+              title: "No workers available",
+              value: "conman:status",
+              disabled: false,
+            }),
+          );
+        }
+      } finally {
+        f.close();
+      }
+    }
+  });
+  it("Reuses confirmed sessions after interrupted startup", async () => {
+    const queued = startupFixture();
+    try {
+      let entered!: () => void, release!: () => void;
+      const creating = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const pending = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const create = queued.context.client.session.create;
+      queued.context.client.session.create = async (input) => {
+        entered();
+        await pending;
+        return create(input);
+      };
+      queued.inputs.push("create", "not-now", "not-now");
+      const first = queued.run("conman.start");
+      await creating;
+      const second = queued.run("conman.start");
+      release();
+      await Promise.all([first, second]);
+      expect(queued.creates).toHaveLength(1);
+      expect(queued.events.filter((value) => value === "approve")).toHaveLength(
+        1,
+      );
+      expect(queued.notices.some((value) => value.startsWith("error:"))).toBe(
+        false,
+      );
+    } finally {
+      queued.close();
+    }
+    for (const mode of [
+      "attached",
+      "navigation",
+      "unknown",
+      "reconnect",
+    ] as const) {
+      const f = startupFixture();
+      try {
+        if (mode === "navigation") f.navigation(true);
+        if (mode === "unknown") f.unknownCreation();
+        f.inputs.push(
+          "create",
+          ...(mode === "navigation" || mode === "unknown" ? [] : ["not-now"]),
+        );
+        await f.run("conman.start");
+        if (mode === "navigation") {
+          f.navigation(false);
+          f.inputs.push("reuse", "not-now");
+        } else if (mode === "unknown") f.inputs.push("create");
+        else if (mode === "reconnect") {
+          f.emit({ id: "connected", type: "server.connected", data: {} });
+          f.inputs.push("reuse", "not-now");
+        } else f.inputs.push("not-now");
+        await f.run("conman.start");
+        expect(f.creates).toHaveLength(1);
+        expect(f.events.filter((value) => value === "approve")).toHaveLength(
+          mode === "unknown" ? 0 : mode === "reconnect" ? 2 : 1,
+        );
+        expect(f.controls).toHaveLength(0);
+      } finally {
+        f.close();
+      }
+    }
+  });
+});
 
 // Real repository observer/backend at the verified SDK boundary, not an accepting
 // validation fake. No native host is launched or project configuration activated.
@@ -1266,7 +1570,11 @@ describe("Accessible coordination overview", () => {
         (command) => command.palette && command.slash?.name === "coordinate",
       ),
     ).toBe(true);
-    expect(runtime.dialogs.at(-1)?.options[0]?.category).toBe("migration");
+    expect(
+      runtime.dialogs
+        .at(-1)
+        ?.options.find((option) => option.value === task.workerID)?.category,
+    ).toBe("migration");
     runtime.close();
   });
   it("Shows pending and unavailable states", async () => {
@@ -1545,9 +1853,11 @@ describe("Accessible coordination overview", () => {
     ]);
     const runtime = runtimeFixture();
     await runtime.run("conman.overview");
-    expect(runtime.dialogs.at(-1)?.options[0]?.description).toContain(
-      "disconnected",
-    );
+    expect(
+      runtime.dialogs
+        .at(-1)
+        ?.options.find((option) => option.value === task.workerID)?.description,
+    ).toContain("disconnected");
     for (const width of [80, 32]) {
       runtime.context.renderer.width = width;
       runtime.snapshot().reason =
@@ -1587,9 +1897,11 @@ describe("Accessible coordination overview", () => {
     ).toContain(rearmReason);
     expect(runtime.controls).toEqual(beforeRearmStatus);
     await runtime.run("conman.overview");
-    expect(runtime.dialogs.at(-1)?.options[0]?.description).toContain(
-      "awaiting-rearm",
-    );
+    expect(
+      runtime.dialogs
+        .at(-1)
+        ?.options.find((option) => option.value === task.workerID)?.description,
+    ).toContain("awaiting-rearm");
     runtime.permissions.push({
       id: "ask",
       sessionID: task.workerID,
@@ -1597,13 +1909,19 @@ describe("Accessible coordination overview", () => {
       resources: [task.location],
     });
     await runtime.run("conman.overview");
-    expect(runtime.dialogs.at(-1)?.options[0]?.title).toContain("needs-input");
+    expect(
+      runtime.dialogs
+        .at(-1)
+        ?.options.find((option) => option.value === task.workerID)?.title,
+    ).toContain("needs-input");
     runtime.permissions.length = 0;
     runtime.emit({ id: "connected", type: "server.connected", data: {} });
     await runtime.run("conman.overview");
-    expect(runtime.dialogs.at(-1)?.options[0]?.description).toContain(
-      "disconnected",
-    );
+    expect(
+      runtime.dialogs
+        .at(-1)
+        ?.options.find((option) => option.value === task.workerID)?.description,
+    ).toContain("disconnected");
     runtime.close();
     expect(runtime.signals.every((signal) => signal.aborted)).toBe(true);
     const before = runtime.controls.length;

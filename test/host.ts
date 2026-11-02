@@ -14,7 +14,10 @@ import type { WorkerSnapshot } from "../src/state.ts";
 import { Rpc } from "@opencode/plugin/rpc";
 import { createServer } from "node:http";
 import type { NativeBackendHost } from "../src/server.ts";
-import { coordinationStatusDetails } from "../src/ui.ts";
+import {
+  coordinationStatusDetails,
+  coordinatorHomeDetails,
+} from "../src/ui.ts";
 
 /** A scoped approval boundary, not an unconditional permission fake. */
 export function fixtureApproval(
@@ -733,7 +736,7 @@ export interface NativeFrame {
 const nativeProbe = (options: Record<string, unknown>) => `
 import { Plugin } from "@opencode/plugin/tui";
 import { writeFileSync } from "node:fs";
-import { applyNativeNoColor, coordinationStatusDetails, overview, sharedVersionDetails } from ${JSON.stringify(new URL("../src/ui.ts", import.meta.url).href)};
+import { applyNativeNoColor, coordinationStatusDetails, overview, sharedVersionDetails, supervisionChoices } from ${JSON.stringify(new URL("../src/ui.ts", import.meta.url).href)};
 import { setupNativeTui } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
 import { FixtureRpc } from "./rpc.js";
 export default Plugin.define({ id: ${JSON.stringify(options.modelTurn ? "conman" : "conman.native-frame-probe")}, setup(context) {
@@ -745,8 +748,8 @@ export default Plugin.define({ id: ${JSON.stringify(options.modelTurn ? "conman"
   const capture = buffer => {
     if (buffer.width !== o.width || buffer.height !== o.height) return;
     const text = new TextDecoder().decode(buffer.getRealCharBytes(true));
-      if (!o.discovery && !text.includes(o.versions ? "Shared versions" : "Coordinate / search") && !text.includes("Status (read only)")) return;
-     if (o.statusReason && text.includes("Status (read only)") && !pages.includes(text)) pages.push(text);
+      if (!o.discovery && !o.startup && !text.includes(o.versions ? "Shared versions" : "Coordinate / search") && !text.includes("Status (read only)")) return;
+     if (((o.statusReason && text.includes("Status (read only)")) || (o.startup && text.includes("Canonical home"))) && !pages.includes(text)) pages.push(text);
     const spans = buffer.getSpanLines().flatMap(line => line.spans.map(span => ({
       text: span.text, fg: span.fg.toInts(), bg: span.bg.toInts(), attributes: span.attributes,
     })));
@@ -754,6 +757,14 @@ export default Plugin.define({ id: ${JSON.stringify(options.modelTurn ? "conman"
         commands: o.discovery ? context.keymap.commands().filter(command=>command.id?.startsWith("conman.")).map(command=>({id:command.id,title:command.title,slash:command.slash})) : undefined }));
   };
   context.renderer.addPostProcessFn(capture);
+  if(o.startup){
+    const close=setupNativeTui(context);
+    queueMicrotask(()=>{
+      if(o.startup === "supervision") void context.ui.dialog.select(supervisionChoices());
+      else context.keymap.dispatch("conman.overview");
+    });
+    return ()=>{close();context.renderer.removePostProcessFn(capture);restore()};
+  }
   if(o.discovery){
     const close=setupNativeTui(context);
     queueMicrotask(()=>context.keymap.dispatch("command.palette.show"));
@@ -851,6 +862,7 @@ export async function captureNativeOverview(
   versions = false,
   statusReason?: string,
   discovery = false,
+  startup: false | "session" | "supervision" = false,
 ) {
   const root = resolve(import.meta.dir, "../.opencode/conman/native-fixtures");
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -880,7 +892,25 @@ export async function captureNativeOverview(
       join(probe, "server.js"),
       modelServer
         ? nativeModelProbe(home, modelServer.endpoint)
-        : 'import { Plugin } from "@opencode/plugin"; export default Plugin.define({id:"conman.native-frame-probe",async setup(ctx){await ctx.session.hook("context",()=>{throw new Error("Model requests are forbidden in native rendering fixtures")});}});',
+        : startup
+          ? `import {Plugin} from "@opencode/plugin";
+import {Rpc} from "@opencode/plugin/rpc";
+import {writeFileSync} from "node:fs";
+import {ConmanRpc} from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
+export default Plugin.define({id:"conman.native-frame-probe",async setup(ctx){
+  await ctx.session.hook("context",()=>{throw new Error("Model requests are forbidden in startup fixtures")});
+  const rpc=Rpc.define({id:ConmanRpc.id,methods:{inspect:ConmanRpc.methods.inspect,attach:ConmanRpc.methods.attach},events:{}});
+  await ctx.rpc.register(rpc,{
+    inspect:async()=>({version:1,home:${JSON.stringify(home)},authority:"owned",bindings:[],snapshots:[],intents:[],completions:[]}),
+    attach:async({coordinatorID})=>{
+      const session=await ctx.session.get({sessionID:coordinatorID});
+      const messages=await ctx.session.context({sessionID:coordinatorID});
+      writeFileSync(${JSON.stringify(proofPath)},JSON.stringify({sessionID:session.id,location:session.location.directory,messages:messages.length}));
+      throw new Error("Startup fixture intentionally withholds attachment approval");
+    }
+  });
+}});`
+          : 'import { Plugin } from "@opencode/plugin"; export default Plugin.define({id:"conman.native-frame-probe",async setup(ctx){await ctx.session.hook("context",()=>{throw new Error("Model requests are forbidden in native rendering fixtures")});}});',
     );
     await writeFile(
       join(probe, "tui.js"),
@@ -894,6 +924,7 @@ export async function captureNativeOverview(
         versions,
         statusReason,
         discovery,
+        startup,
         home,
         proof: proofPath,
         frame: framePath,
@@ -975,6 +1006,77 @@ export async function captureNativeOverview(
       terminal = (terminal + String(bytes)).slice(-200000);
     });
     try {
+      if (startup) {
+        frame = await readCapture<NativeFrame>(framePath, (value) =>
+          value.text.includes(
+            startup === "supervision" ? "Connected" : "Get started",
+          ),
+        );
+        const first = frame;
+        if (startup === "supervision") {
+          child.stdin?.write("\u001b[B\r");
+          await writeFile(
+            `/tmp/opencode/conman-startup-${width}-supervision.json`,
+            JSON.stringify(first, null, 2),
+          );
+          return { frame: first, terminal };
+        }
+        child.stdin?.write("\r");
+        const sessionChoice = await readCapture<NativeFrame>(
+          framePath,
+          (value) => value.text.includes("Set up coordinator"),
+        );
+        child.stdin?.write("\u001b[B\r");
+        let homeDetails = await readCapture<NativeFrame>(framePath, (value) =>
+          value.text.includes("Canonical home"),
+        );
+        const segments = coordinatorHomeDetails(home, width).options;
+        for (let index = 1; index < segments.length; index++) {
+          child.stdin?.write("\u001b[B");
+          homeDetails = await readCapture<NativeFrame>(
+            framePath,
+            (value) =>
+              value.text.includes("Canonical home") &&
+              value.text.includes(segments[index]!.title),
+          );
+        }
+        child.stdin?.write("\u001b");
+        await readCapture<NativeFrame>(framePath, (value) =>
+          value.text.includes("Set up coordinator"),
+        );
+        await writeFile(
+          `/tmp/opencode/conman-startup-${width}-home.json`,
+          JSON.stringify(homeDetails, null, 2),
+        );
+        child.stdin?.write("\r");
+        const proof = await readCapture<{
+          sessionID: string;
+          location: string;
+          messages: number;
+        }>(proofPath, (value) => typeof value.sessionID === "string");
+        await writeFile(
+          `/tmp/opencode/conman-startup-${width}-overview.json`,
+          JSON.stringify(first, null, 2),
+        );
+        await writeFile(
+          `/tmp/opencode/conman-startup-${width}-session.json`,
+          JSON.stringify(sessionChoice, null, 2),
+        );
+        return {
+          frame: first,
+          sessionChoice,
+          startupProof: {
+            ...proof,
+            canonicalHome: home,
+            homeReadable: segments.every((segment) =>
+              [homeDetails.text, ...(homeDetails.pages ?? [])].some((page) =>
+                page.includes(segment.title),
+              ),
+            ),
+          },
+          terminal,
+        };
+      }
       if (discovery) {
         frame = await readCapture<NativeFrame>(framePath, (value) =>
           value.text.includes("Commands"),

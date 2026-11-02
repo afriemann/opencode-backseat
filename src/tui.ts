@@ -6,6 +6,9 @@ import {
   applyNativeNoColor,
   CoordinationUI,
   coordinationStatusDetails,
+  coordinatorSessionChoices,
+  coordinatorHomeDetails,
+  supervisionChoices,
   overview,
   sharedVersionDetails,
   type ProjectChoice,
@@ -197,7 +200,7 @@ export type NativeRuntimeClient = NativeCatalogClient &
   NativeAskClient & {
     session: Pick<
       NativeClient["session"],
-      "get" | "active" | "prompt" | "context"
+      "get" | "create" | "active" | "prompt" | "context"
     > & { inbox: Pick<NativeClient["session"]["inbox"], "list"> };
     message: Pick<NativeClient["message"], "list">;
     shell: Pick<NativeClient["shell"], "list">;
@@ -218,7 +221,7 @@ export interface NativeRuntimeContext {
     dialog: Pick<Plugin.Context["ui"]["dialog"], "select" | "prompt" | "clear">;
     toast: Plugin.Context["ui"]["toast"];
     tabs: Pick<Plugin.Context["ui"]["tabs"], "focus">;
-    router: Pick<Plugin.Context["ui"]["router"], "current">;
+    router: Pick<Plugin.Context["ui"]["router"], "current" | "navigate">;
   };
 }
 
@@ -1382,6 +1385,121 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     state = "awaiting-rearm";
     await notice(state, reconciled.reason);
   };
+  const rearm = async () => {
+    if (!generation || !isCurrent(await refresh()))
+      throw new Error("Approved current observer required");
+    const result = await supervisor.rearm(String(generation));
+    state = result.status === "reconciled" ? "ready" : "awaiting-rearm";
+    await notice(state, result.reason);
+  };
+  let createdCoordinator: string | undefined;
+  let creationUncertain = false;
+  const usableCoordinator = async (id: string, next: CoordinatorSnapshot) => {
+    if (next.bindings.some((task) => task.workerID === id)) return false;
+    const session = await context.client.session.get(
+      { sessionID: id },
+      { signal: abort.signal },
+    );
+    return (
+      session.id === id &&
+      !session.time.archived &&
+      (await realpath(session.location.directory)) === home
+    );
+  };
+  const getStarted = async () => {
+    const next = await refresh();
+    if (next.authority !== "owned")
+      throw new Error(next.reason ?? "Coordinator ownership unavailable");
+    if (state === "ready" && isCurrent(next)) {
+      await notice("ready", "Supervision is already ready");
+      return;
+    }
+    if (!isCurrent(next)) {
+      const route = context.ui.router.current();
+      let candidate: string | undefined;
+      if (route.type === "session") {
+        try {
+          if (await usableCoordinator(route.sessionID, next))
+            candidate = route.sessionID;
+        } catch {
+          await notice(
+            "disconnected",
+            "Current session is unavailable; choose a coordinator explicitly",
+          );
+        }
+      }
+      if (
+        !candidate &&
+        createdCoordinator &&
+        (await usableCoordinator(createdCoordinator, next))
+      )
+        candidate = createdCoordinator;
+      if (!candidate && creationUncertain)
+        throw new Error(
+          "Session creation outcome is unknown. Open the created coordinator session, then choose Get started; no automatic retry was made.",
+        );
+      let selected: string | undefined;
+      do {
+        selected = await context.ui.dialog.select(
+          coordinatorSessionChoices(home!, !!candidate),
+        );
+        if (selected === "home" && !closed)
+          await context.ui.dialog.select(
+            coordinatorHomeDetails(home!, context.renderer.width),
+          );
+      } while (selected === "home" && !closed);
+      if (closed || abort.signal.aborted) return;
+      if (selected !== "reuse" && selected !== "create") {
+        await notice(
+          "disconnected",
+          "Setup cancelled; no attachment or arming was requested",
+        );
+        return;
+      }
+      if (selected === "reuse" && !candidate)
+        throw new Error("Verified coordinator session required");
+      if (selected === "create") {
+        if (candidate || creationUncertain)
+          throw new Error(
+            "Reconcile the existing coordinator session before creating another",
+          );
+        await notice("loading", "Creating blank coordinator session");
+        creationUncertain = true;
+        const created = await context.client.session.create(
+          { title: "Coordinator", location: { directory: home! } },
+          { signal: abort.signal },
+        );
+        createdCoordinator = created.id;
+        candidate = created.id;
+      }
+      if (
+        closed ||
+        !candidate ||
+        !(await usableCoordinator(candidate, await refresh()))
+      )
+        throw new Error(
+          "Created coordinator could not be verified; supervision remains stopped",
+        );
+      creationUncertain = false;
+      const current = context.ui.router.current();
+      if (current.type !== "session" || current.sessionID !== candidate)
+        context.ui.router.navigate({ type: "session", sessionID: candidate });
+      if (closed || (await currentCoordinator()) !== candidate)
+        throw new Error(
+          "Coordinator navigation was not confirmed; supervision remains stopped",
+        );
+      await attach();
+    }
+    if (closed || !isCurrent(await refresh())) return;
+    const selected = await context.ui.dialog.select(supervisionChoices());
+    if (closed || abort.signal.aborted) return;
+    if (selected === "start") await rearm();
+    else
+      await notice(
+        "awaiting-rearm",
+        "Connected; supervision remains stopped. Choose Get started to start later.",
+      );
+  };
   const showOverview = async () => {
     await notice("loading", "Reading current native worker inventory");
     let next: CoordinatorSnapshot;
@@ -1486,15 +1604,42 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     }
     const selected = await context.ui.dialog.select({
       ...view,
-      options: view.options.map((option) => ({
-        ...option,
-        description: [option.description, next.reason]
-          .filter(Boolean)
-          .join("; "),
-      })),
+      options: [
+        ...(state !== "ready"
+          ? [
+              {
+                title: "Get started",
+                value: "conman:get-started",
+                category: isCurrent(next)
+                  ? "Setup: connected, stopped"
+                  : "Setup: unattached",
+                description:
+                  "Connect a coordinator, approve attachment, then choose whether to start supervision",
+              },
+            ]
+          : []),
+        ...view.options.map((option) =>
+          !next.bindings.length && state !== "ready"
+            ? {
+                ...option,
+                title: "No workers available",
+                value: "conman:status",
+                disabled: false,
+                description: "Inspect status without creating workers",
+              }
+            : {
+                ...option,
+                description: [option.description, next.reason]
+                  .filter(Boolean)
+                  .join("; "),
+              },
+        ),
+      ],
       actions,
     });
-    if (selected) {
+    if (selected === "conman:get-started") await getStarted();
+    else if (selected === "conman:status") await showStatus();
+    else if (selected) {
       const task = next.bindings.find((task) => task.workerID === selected);
       if (task) await ui.open(task);
     }
@@ -1517,6 +1662,14 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         palette: true,
         slash: { name: "coordinate" },
         run: () => enqueue(showOverview),
+      },
+      {
+        id: "conman.start",
+        title: "Coordinate: Get started",
+        group: "Coordination",
+        palette: true,
+        enabled: () => !closed,
+        run: () => enqueue(getStarted),
       },
       {
         id: "conman.status",
@@ -1548,14 +1701,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         group: "Coordination",
         palette: true,
         enabled: () => !!snapshot && isCurrent(snapshot),
-        run: () =>
-          enqueue(async () => {
-            if (!generation || !isCurrent(await refresh()))
-              throw new Error("Approved current observer required");
-            const result = await supervisor.rearm(String(generation));
-            state = result.status === "reconciled" ? "ready" : "awaiting-rearm";
-            await notice(state, result.reason);
-          }),
+        run: () => enqueue(rearm),
       },
       {
         id: "conman.create",
