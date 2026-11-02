@@ -1,0 +1,5 @@
+- [x] 1. Red-green "Registers the coordinator only at its home" and "Preserves a configured coordinator agent"; implement disposable native registration and document agent selection.
+- [x] 2. Have agent-engineer author the restricted definition after the registration RED; verify "Preserves native approval for conversational control" and document discovery/reconciliation limits.
+- [x] 3. Red-green "Rejects coordinator worker assignments" across backend create/adopt and native selectors without restricting unrelated collisions.
+- [x] 4. Red-green "Starts through the dedicated native agent" and "Keeps native supervision explicit"; remove wizard paths and tests, update README usage and verify private native role persistence/tool access.
+- [x] 5. Run regular/native coverage, types, lint, hooks and simplification self-review; resolve frozen code, agent-definition, security and UI review findings.

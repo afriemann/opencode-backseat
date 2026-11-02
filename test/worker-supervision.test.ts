@@ -35,6 +35,8 @@ import {
   type ControlBody,
 } from "../src/rpc.ts";
 
+import { coordinatorDefinition } from "./host.ts";
+
 const hash = (value: unknown) =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
 async function observerFixture() {
@@ -76,7 +78,10 @@ async function observerFixture() {
         return {
           id: input.sessionID,
           ...(s.parentID ? { parentID: s.parentID } : {}),
-          agent: "engineer",
+          agent:
+            input.sessionID === "coordinator"
+              ? coordinatorDefinition.id
+              : "engineer",
           location: { directory: s.directory },
           projectID: "p",
           cost: 0,
@@ -148,8 +153,11 @@ async function observerFixture() {
       },
     },
     agent: {
-      async list() {
-        return { location: { directory: task.location }, data: [] };
+      async list(input) {
+        return {
+          location: { directory: input?.location?.directory ?? task.location },
+          data: [coordinatorDefinition],
+        };
       },
     },
     permission: fixtureApproval(home),
@@ -185,9 +193,10 @@ async function completionFixture(
 ) {
   const f = await observerFixture();
   f.sessions.set("coordinator", { directory: f.home });
-  f.nativeHost.agent.list = async () => ({
-    location: { directory: f.task.location },
+  f.nativeHost.agent.list = async (input) => ({
+    location: { directory: input?.location?.directory ?? f.task.location },
     data: [
+      coordinatorDefinition,
       {
         id: "engineer",
         name: "Engineer",

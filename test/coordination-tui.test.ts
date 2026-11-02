@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { coordinatorAgent } from "../src/coordinator-agent.ts";
 import {
   applyNativeNoColor,
   CoordinationUI,
@@ -21,7 +22,6 @@ import {
   type NativeCatalogClient,
   type NativeAskClient,
   type NativeRuntimeContext,
-  type NativeRuntimeClient,
 } from "../src/tui.ts";
 import type {
   DialogSelectOptions,
@@ -38,7 +38,11 @@ import type {
   PermissionRequest,
 } from "@opencode/client";
 import type { CoordinatorSnapshot, ControlInput } from "../src/rpc.ts";
-import { captureNativeOverview, fixtureApproval } from "./host.ts";
+import {
+  captureNativeOverview,
+  fixtureApproval,
+  coordinatorDefinition,
+} from "./host.ts";
 import {
   createNativeBackend,
   createWorkerObserver,
@@ -188,7 +192,7 @@ function runtimeFixture() {
   const session = {
     id: "coordinator",
     projectID: "home",
-    agent: "engineer",
+    agent: coordinatorAgent.id,
     location: { directory: "/tmp/opencode" },
     time: { created: 1, updated: 1 },
     cost: 0,
@@ -211,9 +215,10 @@ function runtimeFixture() {
         ],
       },
       agent: {
-        list: async () => ({
-          location: { directory: task.location },
+        list: async (input) => ({
+          location: { directory: input?.location?.directory ?? task.location },
           data: [
+            coordinatorDefinition,
             {
               id: "engineer",
               name: "engineer",
@@ -226,13 +231,13 @@ function runtimeFixture() {
         }),
       },
       session: {
-        create: async () => ({ ...session, id: "created-coordinator" }),
         get: async ({ sessionID }: { sessionID: string }) =>
           sessionID === "coordinator"
             ? session
             : {
                 ...session,
                 id: task.workerID,
+                agent: task.agent,
                 location: { directory: task.location },
               },
         list: async () => ({
@@ -241,6 +246,7 @@ function runtimeFixture() {
               ...session,
               id: task.workerID,
               title: "api",
+              agent: task.agent,
               location: { directory: task.location },
             },
           ],
@@ -386,302 +392,106 @@ function runtimeFixture() {
   };
 }
 
-function startupFixture(
-  origin:
-    "home" | "valid" | "worker" | "wrong" | "archived" | "missing" = "home",
-) {
-  const f = runtimeFixture();
-  f.snapshot().bindings = [];
-  let route: ReturnType<NativeRuntimeContext["ui"]["router"]["current"]> =
-    origin === "home"
-      ? { type: "home" }
-      : {
-          type: "session",
-          sessionID: origin === "worker" ? task.workerID : "coordinator",
-        };
-  if (origin === "worker") f.snapshot().bindings = [structuredClone(task)];
-  const get = f.context.client.session.get;
-  const events: string[] = [];
-  const creates: Parameters<NativeRuntimeClient["session"]["create"]>[0][] = [];
-  const rpc = f.rpc;
-  const attach = rpc.attach;
-  let deny = false,
-    failNavigation = false,
-    unknownCreation = false;
-  f.context.ui.router.current = () => route;
-  f.context.ui.router.navigate = (destination) => {
-    events.push("navigate");
-    if (failNavigation) throw new Error("Navigation failed");
-    if (destination.type !== "plugin") route = destination;
-  };
-  f.context.client.session.create = async (input) => {
-    events.push("create");
-    creates.push(input);
-    if (unknownCreation) throw new Error("Creation acknowledgement lost");
-    return {
-      ...(await get({ sessionID: "coordinator" })),
-      id: "created-coordinator",
-    };
-  };
-  f.context.client.session.get = async (input) => {
-    if (origin === "missing" && input.sessionID === "coordinator")
-      throw new Error("Current session no longer exists");
-    if (input.sessionID === "created-coordinator")
-      return {
-        ...(await get({ sessionID: "coordinator" })),
-        id: input.sessionID,
-      };
-    const value = await get(input);
-    return input.sessionID === "coordinator"
-      ? {
-          ...value,
-          ...(origin === "wrong" ? { location: { directory: "/" } } : {}),
-          time: {
-            ...value.time,
-            ...(origin === "archived" ? { archived: 1 } : {}),
-          },
-        }
-      : value;
-  };
-  rpc.attach = async (input) => {
-    events.push("approve");
-    if (deny) throw new Error("Native approval denied");
-    expect(route).toEqual({ type: "session", sessionID: input.coordinatorID });
-    return attach(input);
-  };
-  return {
-    ...f,
-    events,
-    creates,
-    deny: () => {
-      deny = true;
-    },
-    navigation: (failed: boolean) => {
-      failNavigation = failed;
-    },
-    unknownCreation: () => {
-      unknownCreation = true;
-    },
-  };
-}
-
 // spec: openspec/specs/coordination-tui/spec.md
-describe("Guided coordinator startup", () => {
-  it("Starts from a blank coordinator without a prompt", async () => {
+describe("Dedicated coordinator entry", () => {
+  it("Starts through the dedicated native agent", async () => {
     if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
-      for (const width of [80, 32]) {
-        const native = await captureNativeOverview(
-          [],
-          width,
-          24,
-          false,
-          {},
-          false,
-          "disconnected",
-          false,
-          undefined,
-          false,
-          "session",
-        );
-        expect(native.frame.text).toContain("Get started");
-        expect(native.frame.text).toContain("Setup: unattached");
-        expect(native.frame.text).toContain("No workers available");
-        expect(native.sessionChoice?.text).toContain("Create coordinator");
-        expect(native.sessionChoice?.text).toContain("Inspect home");
-        expect(native.startupProof?.messages).toBe(0);
-        expect(native.startupProof?.homeReadable).toBe(true);
-        expect(native.startupProof?.location).toBe(
-          native.startupProof?.canonicalHome,
-        );
-        expect(native.startupProof?.sessionID).toStartWith("ses_");
-      }
-    }
-    for (const origin of [
-      "missing",
-      "home",
-      "valid",
-      "worker",
-      "wrong",
-      "archived",
-    ] as const) {
-      const f = startupFixture(origin);
-      try {
-        await f.run("conman.overview");
-        expect(f.creates).toHaveLength(0);
-        f.inputs.push(
-          "home",
-          undefined,
-          origin === "valid" ? "reuse" : "create",
-          "not-now",
-        );
-        await f.run("conman.start");
-        expect(f.events).toEqual(
-          origin === "valid" ? ["approve"] : ["create", "navigate", "approve"],
-        );
-        expect(f.creates).toEqual(
-          origin === "valid"
-            ? []
-            : [
-                {
-                  title: "Coordinator",
-                  location: { directory: "/tmp/opencode" },
-                },
-              ],
-        );
-        expect(
-          f.dialogs
-            .find((dialog) => dialog.title === "Canonical home (read only)")
-            ?.options.map((option) => option.title)
-            .join(""),
-        ).toBe("/tmp/opencode");
-        expect(f.dialogs[0]?.options).toContainEqual(
-          expect.objectContaining({
-            title: "Get started",
-            value: "conman:get-started",
-          }),
-        );
-        expect(
-          f.controls.some((control) =>
-            ["create", "adopt", "reserve"].includes(control.operation),
-          ),
-        ).toBe(false);
-      } finally {
-        f.close();
-      }
-    }
-  });
-  it("Keeps approval and arming separate", async () => {
-    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
-      for (const width of [80, 32]) {
-        const native = await captureNativeOverview(
-          [],
-          width,
-          24,
-          true,
-          {},
-          false,
-          "awaiting-rearm",
-          false,
-          undefined,
-          false,
-          "supervision",
-        );
-        expect(native.frame.text).toContain("Start supervision");
-        expect(native.frame.text).toContain("Not now");
-      }
-    }
-    for (const mode of ["cancel", "deny", "not-now", "start"] as const) {
-      const f = startupFixture();
-      try {
-        if (mode === "deny") f.deny();
-        if (mode !== "cancel")
-          f.inputs.push("create", mode === "start" ? "start" : "not-now");
-        await f.run("conman.start");
-        expect(f.events.filter((value) => value === "approve")).toHaveLength(
-          mode === "cancel" ? 0 : 1,
-        );
-        expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(
-          mode === "start",
-        );
-        expect(f.snapshot().observer !== undefined).toBe(
-          mode === "start" || mode === "not-now",
-        );
-        expect(f.controls).toHaveLength(0);
-        if (mode === "deny")
-          expect(f.notices.join("\n")).toContain("Native approval denied");
-        if (mode === "deny") {
-          expect(
-            (
-              await f.context.client.session.get({
-                sessionID: "created-coordinator",
-              })
-            ).id,
-          ).toBe("created-coordinator");
-          f.inputs.length = 0;
-          f.inputs.push("reuse");
-          await f.run("conman.start");
-          expect(f.creates).toHaveLength(1);
-          expect(f.snapshot().observer).toBeUndefined();
-        }
-        if (mode === "cancel") {
-          await f.run("conman.overview");
-          expect(f.dialogs.at(-1)?.options).toContainEqual(
-            expect.objectContaining({
-              title: "No workers available",
-              value: "conman:status",
-              disabled: false,
-            }),
-          );
-        }
-      } finally {
-        f.close();
-      }
-    }
-  });
-  it("Reuses confirmed sessions after interrupted startup", async () => {
-    const queued = startupFixture();
-    try {
-      let entered!: () => void, release!: () => void;
-      const creating = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      const pending = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const create = queued.context.client.session.create;
-      queued.context.client.session.create = async (input) => {
-        entered();
-        await pending;
-        return create(input);
-      };
-      queued.inputs.push("create", "not-now", "not-now");
-      const first = queued.run("conman.start");
-      await creating;
-      const second = queued.run("conman.start");
-      release();
-      await Promise.all([first, second]);
-      expect(queued.creates).toHaveLength(1);
-      expect(queued.events.filter((value) => value === "approve")).toHaveLength(
-        1,
+      const native = await captureNativeOverview(
+        [],
+        80,
+        24,
+        false,
+        {},
+        false,
+        "disconnected",
+        false,
+        undefined,
+        "coordinator",
       );
-      expect(queued.notices.some((value) => value.startsWith("error:"))).toBe(
+      expect(native.entry).toMatchObject({
+        agent: coordinatorAgent.id,
+        sessionAgent: coordinatorAgent.id,
+        instructions: true,
+      });
+      expect(native.entry?.tools.sort()).toEqual([
+        "conman_control",
+        "conman_inspect",
+        "question",
+      ]);
+      expect(native.entry?.attached).toBe(false);
+      expect(native.entry?.userMessages).toEqual([
+        "Inspect the current coordination state.",
+      ]);
+      expect(native.frame.text).not.toContain(
+        "Native TUI location is unavailable",
+      );
+    }
+    for (const role of [
+      coordinatorAgent.id,
+      "engineer",
+      "collision",
+      "agentless",
+    ]) {
+      const f = runtimeFixture();
+      expect(f.commands.some((command) => command.id === "conman.start")).toBe(
         false,
       );
-    } finally {
-      queued.close();
-    }
-    for (const mode of [
-      "attached",
-      "navigation",
-      "unknown",
-      "reconnect",
-    ] as const) {
-      const f = startupFixture();
+      const get = f.context.client.session.get;
+      f.context.client.session.get = async (input) => {
+        const session = { ...(await get(input)) };
+        if (role === "agentless") delete session.agent;
+        else session.agent = role === "collision" ? coordinatorAgent.id : role;
+        return session;
+      };
+      const list = f.context.client.agent.list;
+      f.context.client.agent.list = async (input, options) => ({
+        ...(await list(input, options)),
+        location: { directory: "/tmp/opencode" },
+        data: [
+          {
+            ...coordinatorAgent,
+            system:
+              role === "collision" ? "User role" : coordinatorAgent.system,
+            permissions: coordinatorAgent.permissions.map((rule) => ({
+              ...rule,
+            })),
+            request: { settings: {}, headers: {}, body: {} },
+          },
+        ],
+      });
       try {
-        if (mode === "navigation") f.navigation(true);
-        if (mode === "unknown") f.unknownCreation();
-        f.inputs.push(
-          "create",
-          ...(mode === "navigation" || mode === "unknown" ? [] : ["not-now"]),
-        );
-        await f.run("conman.start");
-        if (mode === "navigation") {
-          f.navigation(false);
-          f.inputs.push("reuse", "not-now");
-        } else if (mode === "unknown") f.inputs.push("create");
-        else if (mode === "reconnect") {
-          f.emit({ id: "connected", type: "server.connected", data: {} });
-          f.inputs.push("reuse", "not-now");
-        } else f.inputs.push("not-now");
-        await f.run("conman.start");
-        expect(f.creates).toHaveLength(1);
-        expect(f.events.filter((value) => value === "approve")).toHaveLength(
-          mode === "unknown" ? 0 : mode === "reconnect" ? 2 : 1,
-        );
-        expect(f.controls).toHaveLength(0);
+        await f.run("conman.attach");
+        expect(!!f.snapshot().observer).toBe(role === coordinatorAgent.id);
+        if (role !== coordinatorAgent.id)
+          expect(f.notices.join("\n")).toContain("Conman Coordinator");
       } finally {
         f.close();
       }
+    }
+  });
+  it("Keeps native supervision explicit", async () => {
+    const f = runtimeFixture();
+    try {
+      const runtime: NativeRuntimeContext = f.context;
+      runtime.location =
+        undefined as unknown as NativeRuntimeContext["location"];
+      f.emit({ id: "connected", type: "server.connected", data: {} });
+      await f.run("conman.detach");
+      expect(
+        f.notices.some((value) => value.includes("location is unavailable")),
+      ).toBe(false);
+      f.context.location = { directory: "/tmp/opencode" };
+      await f.run("conman.overview");
+      expect(f.snapshot().observer).toBeUndefined();
+      expect(f.controls).toEqual([]);
+      expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(false);
+      await f.run("conman.attach");
+      expect(f.snapshot().observer).toBeDefined();
+      expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(false);
+      await f.run("conman.rearm");
+      expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(true);
+    } finally {
+      f.close();
     }
   });
 });
@@ -1330,6 +1140,24 @@ describe("Native project and worker selection", () => {
       "agents:/projects/api",
       "workers:/projects/api",
     ]);
+    for (const bundled of [true, false]) {
+      client.agent.list = async () => ({
+        location: { directory: "/projects/api" },
+        data: [
+          {
+            ...coordinatorAgent,
+            system: bundled ? coordinatorAgent.system : "User-controlled role",
+            request: { settings: {}, headers: {}, body: {} },
+            permissions: coordinatorAgent.permissions.map((rule) => ({
+              ...rule,
+            })),
+          },
+        ],
+      });
+      expect(await discovery.agents("/projects/api")).toEqual(
+        bundled ? [] : [coordinatorAgent.id],
+      );
+    }
     const runtime = runtimeFixture();
     await runtime.run("conman.attach");
     runtime.inputs.push(

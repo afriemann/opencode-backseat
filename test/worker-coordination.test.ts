@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { ConmanRpc } from "../src/rpc.ts";
+import { coordinatorAgent } from "../src/coordinator-agent.ts";
 import * as subprocess from "node:child_process";
 import {
   chmod,
@@ -24,7 +25,7 @@ import {
   fingerprint,
   STATE_BOUNDS,
 } from "../src/state.ts";
-import { creationHost, goal } from "./host.ts";
+import { creationHost, goal, coordinatorDefinition } from "./host.ts";
 import {
   CoordinatorOwnership,
   ObserverAuthority,
@@ -43,6 +44,369 @@ import nativePlugin, {
 } from "../src/server.ts";
 import type { SessionMessageInfo } from "@opencode/client";
 import type { Plugin } from "@opencode/plugin";
+import type { AgentEditor } from "@opencode/plugin/promise/agent";
+import type { SessionContext } from "@opencode/plugin/promise/session";
+
+type NativeAgent = NonNullable<ReturnType<AgentEditor["get"]>>;
+async function registeredCoordinator(
+  passive = false,
+  configured?: NativeAgent,
+) {
+  const root = resolve(".opencode/conman");
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const home = await mkdtemp(`${root}/agent-test-`);
+  const worker = `${home}/worker`;
+  await mkdir(worker);
+  const catalog = new Map<string, NativeAgent>(
+    configured ? [[configured.id, structuredClone(configured)]] : [],
+  );
+  const values = new Map<string, unknown>();
+  const defaults: unknown[] = [];
+  let transforms = 0,
+    disposed = 0;
+  let replay: (() => void) | undefined;
+  let contextHook: ((event: SessionContext) => Promise<void>) | undefined;
+  let failCatalog = false;
+  const registration = { dispose: async () => {} };
+  const context = {
+    app: { version: "2.2.5" },
+    options: { home },
+    location: { directory: passive ? worker : home },
+    session: {
+      hook: async (
+        name: string,
+        callback: (event: SessionContext) => Promise<void>,
+      ) => {
+        if (name === "context") contextHook = callback;
+        return registration;
+      },
+    },
+    storage: {
+      get: async (key: string) => values.get(key),
+      set: async (key: string, value: unknown) => {
+        values.set(key, structuredClone(value));
+      },
+    },
+    event: {
+      async *subscribe({ signal }: { signal: AbortSignal }) {
+        await new Promise<void>((done) =>
+          signal.aborted
+            ? done()
+            : signal.addEventListener("abort", () => done(), { once: true }),
+        );
+      },
+    },
+    permission: { hook: async () => registration },
+    rpc: { register: async () => registration },
+    tool: { transform: async () => registration },
+    agent: {
+      async list() {
+        if (failCatalog) throw new Error("Unavailable catalog");
+        return { location: { directory: home }, data: [...catalog.values()] };
+      },
+      async transform(
+        callback: Parameters<Plugin.Context["agent"]["transform"]>[0],
+      ) {
+        transforms++;
+        const editor: AgentEditor = {
+          list: () => [...catalog.values()],
+          get: (id) => catalog.get(id),
+          default: (id) => {
+            defaults.push(id);
+          },
+          remove: (id) => {
+            catalog.delete(id);
+          },
+          update(id, change) {
+            const value =
+              catalog.get(id) ??
+              ({
+                id,
+                name: id,
+                mode: "primary",
+                hidden: false,
+                permissions: [{ action: "*", resource: "*", effect: "allow" }],
+                request: { settings: {}, headers: {}, body: {} },
+              } as NativeAgent);
+            catalog.set(id, value);
+            change(value);
+            value.id = id as NativeAgent["id"];
+          },
+        };
+        replay = () => callback(editor);
+        replay();
+        return {
+          dispose: async () => {
+            disposed++;
+            catalog.clear();
+          },
+        };
+      },
+    },
+  } as unknown as Plugin.Context;
+  const close = await nativePlugin.setup(context);
+  return {
+    catalog,
+    defaults,
+    replay: () => replay?.(),
+    transforms: () => transforms,
+    disposed: () => disposed,
+    async tools(agent: string, unavailable = false) {
+      failCatalog = unavailable;
+      const event = {
+        agent,
+        tools: Object.fromEntries(
+          [
+            "conman_control",
+            "conman_inspect",
+            "question",
+            "skill",
+            "shell",
+          ].map((name) => [
+            name,
+            { description: name, input: { type: "object" } },
+          ]),
+        ),
+      } as unknown as SessionContext;
+      await contextHook?.(event);
+      return Object.keys(event.tools).sort();
+    },
+    async close() {
+      try {
+        if (typeof close === "function") await close();
+      } finally {
+        await rm(home, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Bundled conversational coordinator", () => {
+  it("Registers the coordinator only at its home", async () => {
+    for (const passive of [false, true]) {
+      const f = await registeredCoordinator(passive);
+      try {
+        expect(f.catalog.has("conman-coordinator")).toBe(!passive);
+        if (!passive) {
+          const agent = structuredClone(f.catalog.get("conman-coordinator"));
+          expect(agent).toMatchObject({
+            id: "conman-coordinator",
+            mode: "primary",
+            hidden: false,
+          });
+          expect(agent).not.toHaveProperty("model");
+          f.replay();
+          expect(f.catalog.get("conman-coordinator")).toEqual(agent);
+          expect(f.defaults).toEqual([]);
+        }
+      } finally {
+        await f.close();
+      }
+      expect(f.disposed()).toBe(passive ? 0 : 1);
+    }
+  });
+  it("Preserves a configured coordinator agent", async () => {
+    const configured = {
+      id: "conman-coordinator",
+      name: "My coordinator",
+      mode: "primary",
+      hidden: false,
+      system: "My instructions",
+      permissions: [{ action: "*", resource: "*", effect: "deny" }],
+      model: { providerID: "provider", id: "model" },
+      request: { settings: {}, headers: {}, body: {} },
+    } as NativeAgent;
+    const f = await registeredCoordinator(false, configured);
+    try {
+      f.replay();
+      expect(f.catalog.get(configured.id)).toEqual(configured);
+      expect(f.defaults).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+  it("Preserves native approval for conversational control", async () => {
+    const f = await registeredCoordinator();
+    try {
+      const permissions =
+        f.catalog.get("conman-coordinator")?.permissions ?? [];
+      const effect = (action: string) =>
+        permissions
+          .filter(
+            (rule) =>
+              rule.action === "*" ||
+              rule.action === action ||
+              (rule.action === "conman.*" && action.startsWith("conman.")),
+          )
+          .at(-1)?.effect;
+      for (const tool of ["conman_inspect", "conman_control", "question"])
+        expect(effect(tool)).toBe("allow");
+      for (const action of [
+        "conman.attach",
+        "conman.create",
+        "conman.recover",
+        "conman.resume",
+      ])
+        expect(effect(action)).toBe("ask");
+      for (const action of [
+        "shell",
+        "read",
+        "edit",
+        "execute",
+        "webfetch",
+        "subagent",
+        "permission.reply",
+        "form.reply",
+      ])
+        expect(effect(action)).toBe("deny");
+      expect(await f.tools(coordinatorAgent.id)).toEqual([
+        "conman_control",
+        "conman_inspect",
+        "question",
+      ]);
+      const unrelated = [
+        "conman_control",
+        "conman_inspect",
+        "question",
+        "shell",
+        "skill",
+      ];
+      expect(await f.tools("engineer")).toEqual(unrelated);
+      const bundled = f.catalog.get(coordinatorAgent.id)!;
+      f.catalog.set(coordinatorAgent.id, {
+        ...bundled,
+        permissions: [
+          ...bundled.permissions,
+          { action: "browser", resource: "*", effect: "deny" },
+        ],
+      });
+      expect(await f.tools(coordinatorAgent.id)).toEqual([
+        "conman_control",
+        "conman_inspect",
+        "question",
+      ]);
+      f.catalog.set(coordinatorAgent.id, {
+        ...bundled,
+        system: "User-defined role",
+      });
+      expect(await f.tools(coordinatorAgent.id)).toEqual(unrelated);
+      f.catalog.set(coordinatorAgent.id, bundled);
+      expect(await f.tools(coordinatorAgent.id, true)).toEqual([]);
+    } finally {
+      await f.close();
+    }
+    for (const role of [
+      "engineer",
+      "collision",
+      "agentless",
+      "drift",
+      "permissions",
+      "extra-allow",
+    ]) {
+      const fixture = await backendFixture();
+      const get = fixture.host.session.get;
+      fixture.host.session.get = async (input) => {
+        const session = { ...(await get(input)) };
+        if (role === "agentless") delete session.agent;
+        else session.agent = role === "engineer" ? role : coordinatorAgent.id;
+        return session;
+      };
+      fixture.host.agent.list = async () => ({
+        location: { directory: "/projects/home" },
+        data:
+          role === "drift"
+            ? []
+            : [
+                {
+                  ...coordinatorDefinition,
+                  ...(role === "permissions"
+                    ? {
+                        permissions: [
+                          {
+                            action: "*",
+                            resource: "*",
+                            effect: "allow" as const,
+                          },
+                        ],
+                      }
+                    : role === "extra-allow"
+                      ? {
+                          permissions: [
+                            ...coordinatorDefinition.permissions,
+                            {
+                              action: "browser",
+                              resource: "*",
+                              effect: "allow" as const,
+                            },
+                          ],
+                        }
+                      : { system: "User role" }),
+                },
+              ],
+      });
+      try {
+        const before = fixture.asks.length;
+        await expect(
+          fixture.backend.attach({
+            coordinatorID: "coordinator",
+            verifier: createObserverCapability().verifier,
+          }),
+        ).rejects.toThrow("Conman Coordinator");
+        expect(fixture.asks).toHaveLength(before);
+      } finally {
+        await fixture.backend.dispose();
+      }
+    }
+  });
+  it("Rejects coordinator worker assignments", async () => {
+    for (const bundled of [true, false]) {
+      for (const operation of ["create", "adopt"] as const) {
+        const f = await backendFixture();
+        const agent = {
+          ...coordinatorAgent,
+          system: bundled ? coordinatorAgent.system : "User-controlled role",
+          request: { settings: {}, headers: {}, body: {} },
+          permissions: coordinatorAgent.permissions.map((rule) => ({
+            ...rule,
+          })),
+        };
+        f.host.agent.list = async (input) => ({
+          location: { directory: input?.location?.directory ?? goal.location },
+          data:
+            input?.location?.directory === "/projects/home"
+              ? [coordinatorDefinition]
+              : [agent],
+        });
+        const get = f.host.session.get;
+        f.host.session.get = async (input) => ({
+          ...(await get(input)),
+          agent:
+            input.sessionID === "coordinator" ? coordinatorAgent.id : agent.id,
+        });
+        const selected = { ...goal, agent: coordinatorAgent.id };
+        try {
+          const action = f.control(
+            operation,
+            goal.id,
+            operation === "create"
+              ? selected
+              : { goal: selected, workerID: "existing-worker" },
+          );
+          if (bundled) {
+            await expect(action).rejects.toThrow("Unavailable target agent");
+            expect(
+              f.effects.filter((e) => ["create", "prompt"].includes(e)),
+            ).toEqual([]);
+            expect((await f.backend.inspect()).bindings).toEqual([]);
+          } else expect((await action).accepted).toBe(true);
+        } finally {
+          await f.backend.dispose();
+        }
+      }
+    }
+  });
+});
 
 async function backendFixture(
   bindings: WorkerBinding[] = [],
@@ -105,7 +469,7 @@ async function backendFixture(
       async get({ sessionID }) {
         return {
           id: sessionID,
-          agent: goal.agent,
+          agent: sessionID === "coordinator" ? coordinatorAgent.id : goal.agent,
           projectID: "project",
           location: {
             directory: sessionID === "coordinator" ? home : directory,
@@ -136,10 +500,13 @@ async function backendFixture(
       },
     },
     agent: {
-      async list() {
+      async list(input) {
         return {
-          location: { directory },
+          location: {
+            directory: input?.location?.directory === home ? home : directory,
+          },
           data: [
+            coordinatorDefinition,
             {
               id: goal.agent,
               name: "Engineer",
@@ -802,7 +1169,7 @@ describe("Explicit control transitions", () => {
           {},
           {
             sessionID: "coordinator",
-            agent: goal.agent,
+            agent: coordinatorAgent.id,
             messageID: "message",
             id: "native-call",
           },
@@ -1261,6 +1628,7 @@ describe("Approved observer generation", () => {
           return registration;
         },
       },
+      agent: { transform: async () => registration },
     } as unknown as Plugin.Context;
     try {
       const cleanup = await nativePlugin.setup(setupContext);

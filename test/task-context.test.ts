@@ -18,6 +18,7 @@ import {
 } from "../src/ownership.ts";
 import { createHash } from "node:crypto";
 import type { DecisionIdentity, NativeEvidenceRef } from "../src/evaluator.ts";
+import { coordinatorDefinition } from "./host.ts";
 import { reasoningPayload, type ValidateInput } from "../src/rpc.ts";
 import type {
   SessionMessageInfo,
@@ -64,7 +65,10 @@ function nativeFixture() {
       async get(input) {
         return {
           id: input.sessionID,
-          agent: "engineer",
+          agent:
+            input.sessionID === "coordinator"
+              ? coordinatorDefinition.id
+              : "engineer",
           location: { directory },
           projectID: "project",
           cost: 0,
@@ -89,8 +93,11 @@ function nativeFixture() {
       },
     },
     agent: {
-      async list() {
-        return { location: { directory }, data: [] };
+      async list(input) {
+        return {
+          location: { directory: input?.location?.directory ?? directory },
+          data: [coordinatorDefinition],
+        };
       },
     },
     permission: {
@@ -241,11 +248,10 @@ async function validationFixture(completion = false) {
     coordinatorID: "coordinator",
     verifier: capability.verifier,
   });
-  // Native target/agent fixture is deliberately not needed for a signed hold;
-  // current active state comes from a native-approved resume below.
-  f.host.agent.list = async () => ({
-    location: { directory: task.location },
+  f.host.agent.list = async (input) => ({
+    location: { directory: input?.location?.directory ?? task.location },
     data: [
+      coordinatorDefinition,
       {
         id: "engineer",
         name: "Engineer",

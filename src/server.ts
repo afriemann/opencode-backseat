@@ -3,6 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { randomUUID, createPublicKey } from "node:crypto";
 import type { EvaluationContext, TaskEvidence } from "./context.ts";
+import { coordinatorAgent, isCoordinatorAgent } from "./coordinator-agent.ts";
 import type { OpenCodeEvent } from "@opencode/client";
 import {
   parseDecisionIdentity,
@@ -374,7 +375,20 @@ export async function createNativeBackend(
       (identity &&
         (identity.sessionID !== session.id || identity.agent !== session.agent))
     )
-      throw new Error("Invalid canonical coordinator session");
+      throw new Error(
+        "Select Conman Coordinator at the canonical home; this session is ineligible",
+      );
+    const agents = await host.agent.list({ location: { directory: home } });
+    alive();
+    if (
+      (await host.canonical(agents.location.directory)) !== home ||
+      !agents.data.some(
+        (agent) => agent.id === session.agent && isCoordinatorAgent(agent),
+      )
+    )
+      throw new Error(
+        "Conman Coordinator is unavailable at the canonical home",
+      );
     alive();
     if (identity?.signal?.aborted) throw new Error("Native operation aborted");
     return session;
@@ -428,7 +442,9 @@ export async function createNativeBackend(
     alive();
     if (
       (await host.canonical(agents.location.directory)) !== goal.location ||
-      !agents.data.some((a) => a.id === goal.agent && !a.hidden)
+      !agents.data.some(
+        (a) => a.id === goal.agent && !a.hidden && !isCoordinatorAgent(a),
+      )
     )
       throw new Error("Unavailable target agent");
     if (workerID) {
@@ -2273,6 +2289,41 @@ export default Plugin.define({
     );
     const registrations = [permission];
     try {
+      const agents = await ctx.agent.transform((editor) => {
+        if (editor.get(coordinatorAgent.id)) return;
+        editor.update(coordinatorAgent.id, (agent) => {
+          Object.assign(agent, coordinatorAgent, {
+            permissions: coordinatorAgent.permissions.map((rule) => ({
+              ...rule,
+            })),
+          });
+        });
+      });
+      registrations.push(agents);
+      const allowedTools = new Set(
+        coordinatorAgent.permissions
+          .filter((rule) => rule.effect === "allow")
+          .map((rule) => rule.action),
+      );
+      const contextTools = await ctx.session.hook("context", async (event) => {
+        if (event.agent !== coordinatorAgent.id) return;
+        try {
+          const catalog = await ctx.agent.list({
+            location: { directory: home },
+          });
+          if (
+            catalog.location.directory !== home ||
+            !catalog.data.some(isCoordinatorAgent)
+          )
+            return;
+          for (const name of Object.keys(event.tools))
+            if (!allowedTools.has(name)) delete event.tools[name];
+        } catch {
+          event.tools = {};
+          log("error", "Coordinator tool catalog unavailable");
+        }
+      });
+      registrations.push(contextTools);
       const rpc = await ctx.rpc.register(ConmanRpc, {
         inspect: async () => backend.inspect(),
         attach: async (input, context) => backend.attach(input, context.signal),
@@ -2373,6 +2424,8 @@ export default Plugin.define({
         runtimeShutdown.abort();
         await backend.dispose();
         await tools.dispose();
+        await contextTools.dispose();
+        await agents.dispose();
         await rpc.dispose();
         await permission.dispose();
         await disposeObserver();
