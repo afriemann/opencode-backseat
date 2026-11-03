@@ -3,7 +3,7 @@
 - [x] 3. Red-green "Fences an unloaded project without releasing other participants" across lease release, pending operations, publication and reacquisition.
 - [x] 4. Red-green "Bootstraps without disclosing task state" and "Rejects unauthorised shared-state reads" through metadata bootstrap and verified full-read paths.
 - [x] 5. Red-green "Native approval binds observer generation" and "Rejects unapproved observer mutations" with separated store, initiating session/location and exact target identities.
-- [x] 6. Red-green "Registers the coordinator only at its home", "Preserves a configured coordinator agent", "Preserves native approval for conversational control" and "Rejects coordinator worker assignments" across enabled projects.
+- [x] 6. Red-green "Registers the coordinator in every enabled project", "Preserves a configured coordinator agent", "Preserves native approval for conversational control" and "Rejects coordinator worker assignments" across enabled projects.
 - [x] 7. Red-green "Starts through the dedicated native agent" and "Keeps native supervision explicit" with bootstrap, approved inventory and native rearm; update README usage.
 - [x] 8. Red-green "Uses the coordinator-project native default" and "Holds unavailable default-model evaluation" for suggestion and validation; document native model reuse.
 - [x] 9. Verify "Exhaustion holds the task" and red-green "Reload preserves consumed limits" across projects; retain task-context isolation, provenance and uncertain-delivery regression coverage.

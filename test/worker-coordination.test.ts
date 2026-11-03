@@ -478,7 +478,7 @@ async function registeredCoordinator(
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Bundled conversational coordinator", () => {
-  it("Registers the coordinator only at its home", async () => {
+  it("Registers the coordinator in every enabled project", async () => {
     for (const passive of [false, true]) {
       const f = await registeredCoordinator(passive);
       try {

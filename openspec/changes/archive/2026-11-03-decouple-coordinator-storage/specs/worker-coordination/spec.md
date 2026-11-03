@@ -80,7 +80,7 @@ The coordinator SHALL authorise native observer mutations only through explicit 
 
 The plugin SHALL provide a selectable primary coordinator agent wherever it is enabled without replacing user definitions or changing the default agent or selected model.
 
-#### Scenario: Registers the coordinator only at its home
+#### Scenario: Registers the coordinator in every enabled project
 
 - **WHEN** the plugin loads in multiple enabled project directories without a conflicting agent definition
 - **THEN** `conman-coordinator` is available as a primary agent with no model override in each project, without requiring a session in the data directory.
