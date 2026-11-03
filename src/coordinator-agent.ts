@@ -55,8 +55,12 @@ export const coordinatorAgent: CoordinatorAgentDefinition = {
   ],
 };
 
+// Semantic match, not origin authentication: suffix rules (inherited global
+// grants) are ignored; the three-tool limit is enforced elsewhere.
 export function isCoordinatorAgent(agent: {
   readonly id: string;
+  readonly mode?: string;
+  readonly hidden?: boolean;
   readonly system?: string;
   readonly permissions?: readonly CoordinatorPermissionRule[];
 }): boolean {
@@ -64,6 +68,8 @@ export function isCoordinatorAgent(agent: {
   const actual = agent.permissions;
   return (
     agent.id === coordinatorAgent.id &&
+    agent.mode === coordinatorAgent.mode &&
+    agent.hidden === coordinatorAgent.hidden &&
     agent.system === coordinatorAgent.system &&
     Array.isArray(actual) &&
     actual.length >= expected.length &&
@@ -75,7 +81,6 @@ export function isCoordinatorAgent(agent: {
         candidate.resource === rule.resource &&
         candidate.effect === rule.effect
       );
-    }) &&
-    actual.slice(expected.length).every((rule) => rule.effect === "deny")
+    })
   );
 }

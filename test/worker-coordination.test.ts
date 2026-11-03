@@ -28,7 +28,12 @@ import {
   fingerprint,
   STATE_BOUNDS,
 } from "../src/state.ts";
-import { creationHost, goal, coordinatorDefinition } from "./host.ts";
+import {
+  creationHost,
+  goal,
+  coordinatorDefinition,
+  inheritedPolicy,
+} from "./host.ts";
 import {
   CoordinatorOwnership,
   acquireCoordinatorCore,
@@ -50,8 +55,13 @@ import type { SessionMessageInfo } from "@opencode/client";
 import type { Plugin } from "@opencode/plugin";
 import type { AgentEditor } from "@opencode/plugin/promise/agent";
 import type { SessionContext } from "@opencode/plugin/promise/session";
+import type { ToolContext } from "@opencode/plugin/promise/tool";
 
 type NativeAgent = NonNullable<ReturnType<AgentEditor["get"]>>;
+type NativeExecutionEvent = Pick<
+  ToolContext,
+  "sessionID" | "agent" | "messageID" | "id"
+> & { tool: string; input: unknown };
 const observerScope = {
   dataDir: "/projects/home",
   coordinatorLocation: "/projects/home",
@@ -291,6 +301,10 @@ async function registeredCoordinator(
     disposed = 0;
   let replay: (() => void) | undefined;
   let contextHook: ((event: SessionContext) => Promise<void>) | undefined;
+  let executionHook:
+    ((event: NativeExecutionEvent) => Promise<void>) | undefined;
+  let sessionAgent: string | undefined = coordinatorAgent.id;
+  const dispatched: string[] = [];
   let failCatalog = false;
   let nativeRpc:
     | {
@@ -323,7 +337,7 @@ async function registeredCoordinator(
         return {
           id: sessionID,
           projectID: sessions.get(sessionID) ?? home,
-          agent: coordinatorAgent.id,
+          ...(sessionAgent ? { agent: sessionAgent } : {}),
           location: {
             directory: sessions.get(sessionID) ?? (passive ? worker : home),
           },
@@ -375,7 +389,20 @@ async function registeredCoordinator(
         return registration;
       },
     },
-    tool: { transform: async () => registration },
+    tool: {
+      transform: async () => registration,
+      hook: async (
+        name: string,
+        callback: (event: NativeExecutionEvent) => Promise<void>,
+      ) => {
+        if (name === "execute.before") executionHook = callback;
+        return {
+          dispose: async () => {
+            disposedHooks.push(`tool.${name}`);
+          },
+        };
+      },
+    },
     agent: {
       async list(input?: { location?: { directory?: string } }) {
         await faults.catalog?.();
@@ -439,6 +466,23 @@ async function registeredCoordinator(
     setupError,
     defaults,
     disposedHooks,
+    dispatched,
+    setAgent: (agent: string | undefined) => {
+      sessionAgent = agent;
+    },
+    async execute(tool: string, overrides: Partial<NativeExecutionEvent> = {}) {
+      const event = {
+        tool,
+        sessionID: home,
+        agent: sessionAgent,
+        messageID: "coordinator-message",
+        id: "tool-call",
+        input: {},
+        ...overrides,
+      } as NativeExecutionEvent;
+      await executionHook?.(event);
+      dispatched.push(tool);
+    },
     replay: () => replay?.(),
     transforms: () => transforms,
     disposed: () => disposed,
@@ -446,21 +490,18 @@ async function registeredCoordinator(
       if (!nativeRpc) throw new Error("Native handlers not registered");
       return nativeRpc;
     },
-    async tools(agent: string, unavailable = false) {
+    async tools(agent: string, unavailable = false, denied: string[] = []) {
       failCatalog = unavailable;
       const event = {
         agent,
+        sessionID: home,
         tools: Object.fromEntries(
-          [
-            "conman_control",
-            "conman_inspect",
-            "question",
-            "skill",
-            "shell",
-          ].map((name) => [
-            name,
-            { description: name, input: { type: "object" } },
-          ]),
+          ["conman_control", "conman_inspect", "question", "skill", "shell"]
+            .filter((name) => !denied.includes(name))
+            .map((name) => [
+              name,
+              { description: name, input: { type: "object" } },
+            ]),
         ),
       } as unknown as SessionContext;
       await contextHook?.(event);
@@ -478,6 +519,138 @@ async function registeredCoordinator(
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Bundled conversational coordinator", () => {
+  it("Rejects disallowed coordinator tool execution", async () => {
+    const f = await registeredCoordinator();
+    try {
+      f.catalog.get(coordinatorAgent.id)!.permissions.push(...inheritedPolicy);
+      for (const tool of [
+        "shell",
+        "read",
+        "edit",
+        "execute",
+        "skill",
+        "permission.reply",
+        "form.reply",
+        "webfetch",
+        "subagent",
+      ])
+        await expect(f.execute(tool)).rejects.toThrow("Coordinator tool");
+      await expect(
+        f.execute("shell", {
+          input: { tool: "conman_inspect", agent: "engineer" },
+        }),
+      ).rejects.toThrow("Coordinator tool");
+      expect(f.dispatched).toEqual([]);
+      for (const tool of ["conman_inspect", "conman_control", "question"])
+        await f.execute(tool);
+      expect(f.dispatched).toEqual([
+        "conman_inspect",
+        "conman_control",
+        "question",
+      ]);
+      await f.execute("read", {
+        agent: "engineer" as NativeExecutionEvent["agent"],
+      });
+      f.setAgent("engineer");
+      await expect(
+        f.execute("conman_inspect", {
+          agent: coordinatorAgent.id as NativeExecutionEvent["agent"],
+        }),
+      ).rejects.toThrow("Coordinator");
+      f.setAgent(coordinatorAgent.id);
+      await expect(
+        f.execute("conman_inspect", {
+          sessionID: "" as NativeExecutionEvent["sessionID"],
+        }),
+      ).rejects.toThrow("Coordinator");
+      await f.tools(coordinatorAgent.id, true);
+      await expect(f.execute("conman_inspect")).rejects.toThrow("Coordinator");
+      await f.execute("read", {
+        agent: "engineer" as NativeExecutionEvent["agent"],
+      });
+      await f.tools(coordinatorAgent.id, false);
+      f.catalog.delete(coordinatorAgent.id);
+      await expect(f.execute("question")).rejects.toThrow("Coordinator");
+      f.catalog.set(coordinatorAgent.id, {
+        ...coordinatorDefinition,
+      } as NativeAgent);
+      f.catalog.get(coordinatorAgent.id)!.system = "User-controlled role";
+      await f.execute("shell");
+      f.setAgent("engineer");
+      await f.execute("read");
+      expect(f.dispatched.slice(-2)).toEqual(["shell", "read"]);
+    } finally {
+      await f.close();
+    }
+    expect(f.disposedHooks).toContain("tool.execute.before");
+    await expect(
+      f.execute("conman_inspect", {
+        agent: coordinatorAgent.id as NativeExecutionEvent["agent"],
+      }),
+    ).rejects.toThrow("Coordinator");
+    let lookups = 0;
+    const unrelated = await registeredCoordinator(
+      false,
+      undefined,
+      undefined,
+      new Map(),
+      {
+        get: async () => {
+          lookups++;
+          throw new Error("Unrelated session lookup is unavailable");
+        },
+      },
+    );
+    try {
+      await unrelated.execute("read", {
+        agent: "engineer" as NativeExecutionEvent["agent"],
+      });
+      expect(unrelated.dispatched).toEqual(["read"]);
+      expect(lookups).toBe(0);
+      await expect(
+        unrelated.execute("read", {
+          agent: "" as NativeExecutionEvent["agent"],
+        }),
+      ).rejects.toThrow("Coordinator");
+    } finally {
+      await unrelated.close();
+    }
+    const sessions = new Map<string, string>();
+    let pause = false;
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>((done) => {
+      entered = done;
+    });
+    const waiting = new Promise<void>((done) => {
+      release = done;
+    });
+    const moved = await registeredCoordinator(
+      false,
+      undefined,
+      undefined,
+      sessions,
+      {
+        catalog: async () => {
+          if (pause) {
+            entered();
+            await waiting;
+          }
+        },
+      },
+    );
+    try {
+      pause = true;
+      const execution = moved.execute("conman_inspect");
+      await ready;
+      sessions.set(moved.coordinatorID, `${moved.coordinatorID}/worker`);
+      release();
+      await expect(execution).rejects.toThrow("Coordinator");
+      expect(moved.dispatched).toEqual([]);
+    } finally {
+      release();
+      await moved.close();
+    }
+  });
   it("Registers the coordinator in every enabled project", async () => {
     for (const passive of [false, true]) {
       const f = await registeredCoordinator(passive);
@@ -494,6 +667,14 @@ describe("Bundled conversational coordinator", () => {
           f.replay();
           expect(f.catalog.get("conman-coordinator")).toEqual(agent);
           expect(f.defaults).toEqual([]);
+          f.catalog
+            .get(coordinatorAgent.id)!
+            .permissions.push(...inheritedPolicy);
+          expect(await f.tools(coordinatorAgent.id)).toEqual([
+            "conman_control",
+            "conman_inspect",
+            "question",
+          ]);
         }
       } finally {
         await f.close();
@@ -512,13 +693,55 @@ describe("Bundled conversational coordinator", () => {
       model: { providerID: "provider", id: "model" },
       request: { settings: {}, headers: {}, body: {} },
     } as NativeAgent;
-    const f = await registeredCoordinator(false, configured);
-    try {
-      f.replay();
-      expect(f.catalog.get(configured.id)).toEqual(configured);
-      expect(f.defaults).toEqual([]);
-    } finally {
-      await f.close();
+    const definitions = [
+      { definition: configured, exact: false },
+      { definition: { ...coordinatorDefinition, mode: "all" }, exact: false },
+      { definition: { ...coordinatorDefinition, hidden: true }, exact: false },
+      {
+        definition: {
+          ...coordinatorDefinition,
+          permissions: coordinatorDefinition.permissions.toReversed(),
+        },
+        exact: false,
+      },
+      {
+        definition: {
+          ...coordinatorDefinition,
+          permissions: coordinatorDefinition.permissions.slice(1),
+        },
+        exact: false,
+      },
+      {
+        definition: {
+          ...coordinatorDefinition,
+          permissions: [
+            ...coordinatorDefinition.permissions,
+            ...inheritedPolicy,
+          ],
+        },
+        exact: true,
+      },
+    ];
+    for (const { definition, exact } of definitions) {
+      const f = await registeredCoordinator(false, definition as NativeAgent);
+      try {
+        f.replay();
+        expect(f.catalog.get(definition.id)).toEqual(definition as NativeAgent);
+        expect(f.defaults).toEqual([]);
+        expect(await f.tools(definition.id)).toEqual(
+          exact
+            ? ["conman_control", "conman_inspect", "question"]
+            : [
+                "conman_control",
+                "conman_inspect",
+                "question",
+                "shell",
+                "skill",
+              ],
+        );
+      } finally {
+        await f.close();
+      }
     }
   });
   it("Preserves native approval for conversational control", async () => {
@@ -571,16 +794,16 @@ describe("Bundled conversational coordinator", () => {
       const bundled = f.catalog.get(coordinatorAgent.id)!;
       f.catalog.set(coordinatorAgent.id, {
         ...bundled,
-        permissions: [
-          ...bundled.permissions,
-          { action: "browser", resource: "*", effect: "deny" },
-        ],
+        permissions: [...bundled.permissions, ...inheritedPolicy],
       });
       expect(await f.tools(coordinatorAgent.id)).toEqual([
         "conman_control",
         "conman_inspect",
         "question",
       ]);
+      expect(
+        await f.tools(coordinatorAgent.id, false, ["conman_control"]),
+      ).toEqual(["conman_inspect", "question"]);
       f.catalog.set(coordinatorAgent.id, {
         ...bundled,
         system: "User-defined role",
@@ -597,7 +820,8 @@ describe("Bundled conversational coordinator", () => {
       "agentless",
       "drift",
       "permissions",
-      "extra-allow",
+      "mode",
+      "hidden",
     ]) {
       const fixture = await backendFixture();
       const get = fixture.host.session.get;
@@ -625,18 +849,11 @@ describe("Bundled conversational coordinator", () => {
                           },
                         ],
                       }
-                    : role === "extra-allow"
-                      ? {
-                          permissions: [
-                            ...coordinatorDefinition.permissions,
-                            {
-                              action: "browser",
-                              resource: "*",
-                              effect: "allow" as const,
-                            },
-                          ],
-                        }
-                      : { system: "User role" }),
+                    : role === "mode"
+                      ? { mode: "all" as const }
+                      : role === "hidden"
+                        ? { hidden: true }
+                        : { system: "User role" }),
                 },
               ],
       });
@@ -662,9 +879,11 @@ describe("Bundled conversational coordinator", () => {
           ...coordinatorAgent,
           system: bundled ? coordinatorAgent.system : "User-controlled role",
           request: { settings: {}, headers: {}, body: {} },
-          permissions: coordinatorAgent.permissions.map((rule) => ({
-            ...rule,
-          })),
+          permissions: coordinatorAgent.permissions
+            .map((rule) => ({
+              ...rule,
+            }))
+            .concat(inheritedPolicy),
         };
         f.host.agent.list = async (input) => ({
           location: { directory: input?.location?.directory ?? goal.location },
@@ -1627,7 +1846,7 @@ describe("Filesystem coordinator authority", () => {
           const core={projects:new Map(),backend:{bootstrap:()=>({dataDir:directory,authority:"owned"}),fenceProject:async()=>{}},storage:{get:async key=>values.get(key),set:async(key,value)=>{if(failing)throw new Error("Injected observer invalidation failure");values.set(key,value);}},dispose:async()=>{}};
           const acquisition=spyOn(ownership,"acquireCoordinatorCore").mockResolvedValue({core,release:async()=>{releases++;}});
           process.on("unhandledRejection",()=>{unhandled++;});
-          const close=await nativePlugin.setup({app:{version:"2.2.5"},options:{dataDir:directory},location:{directory},session:{hook:async()=>registration},event:{async *subscribe(){await ended;}},permission:{hook:async()=>registration},agent:{transform:async()=>registration},rpc:{register:async()=>registration},tool:{transform:async()=>registration}});
+          const close=await nativePlugin.setup({app:{version:"2.2.5"},options:{dataDir:directory},location:{directory},session:{hook:async()=>registration},event:{async *subscribe(){await ended;}},permission:{hook:async()=>registration},agent:{transform:async()=>registration},rpc:{register:async()=>registration},tool:{transform:async()=>registration,hook:async()=>registration}});
           failing=true;finish();
           await new Promise(resolve=>setImmediate(resolve));
           await new Promise(resolve=>setImmediate(resolve));
@@ -3043,6 +3262,7 @@ describe("Approved observer generation", () => {
         },
       },
       tool: {
+        hook: async () => registration,
         async transform() {
           return registration;
         },

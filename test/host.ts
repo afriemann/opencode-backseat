@@ -1,5 +1,8 @@
 import type { CreationHost, TaskGoal, WorkerBinding } from "../src/state.ts";
-import { coordinatorAgent } from "../src/coordinator-agent.ts";
+import {
+  coordinatorAgent,
+  type CoordinatorPermissionRule,
+} from "../src/coordinator-agent.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
   mkdir,
@@ -22,6 +25,16 @@ export const coordinatorDefinition = {
   permissions: coordinatorAgent.permissions.map((rule) => ({ ...rule })),
   request: { settings: {}, headers: {}, body: {} },
 };
+
+export const inheritedPolicy: CoordinatorPermissionRule[] = [
+  { action: "question", resource: "*", effect: "allow" },
+  { action: "shell", resource: "*", effect: "ask" },
+  { action: "shell", resource: "git *", effect: "allow" },
+  { action: "read", resource: "*", effect: "allow" },
+  { action: "edit", resource: "*", effect: "ask" },
+  { action: "execute", resource: "*", effect: "allow" },
+  { action: "browser", resource: "*", effect: "deny" },
+];
 
 /** A scoped approval boundary, not an unconditional permission fake. */
 export function fixtureApproval(
@@ -184,17 +197,34 @@ export interface NativeCoordinatorProof {
   snapshot?: unknown;
   validation?: unknown;
   admission?: unknown;
+  coordinatorTools?: Array<{ name: string; status: string }>;
+  policyApproved?: boolean;
+  guardErrors?: Array<{ name: string; message: string }>;
+  forbiddenDispatched?: boolean;
   requests: Array<{ kind: string; tools?: string[] }>;
 }
 
-// This plugin guards transport only. Product server owns observation, RPC,
-// permissions, validation and persistence; no fixture publishes observations.
-const nativeFlowGuard = (home: string, endpoint: string) => `
+// Product server owns observation, RPC, permissions, validation and persistence.
+// The fixture confines transport and injects declarations to exercise its guard.
+const nativeFlowGuard = (home: string, endpoint: string, policy: boolean) => `
 import { Plugin } from "@opencode/plugin";
 import { appendFileSync } from "node:fs";
 export default Plugin.define({id:"conman.native-flow-driver",async setup(ctx){
   const endpoint=${JSON.stringify(endpoint)},home=${JSON.stringify(home)};
   await ctx.session.hook("title",event=>{event.result="Owned coordinator flow"});
+  if(${JSON.stringify(policy)}){
+    const probe={description:"Owned forbidden execution probe",input:{type:"object",properties:{}}};
+    await ctx.tool.transform(editor=>editor.add({name:"policy_probe",...probe,options:{codemode:false},async execute(){appendFileSync(home+"/policy-probe-dispatched","executed");return "Forbidden body executed";}}));
+    // Re-expose declarations only in owned fault-injection turns so rejection
+    // must come from the independent native execution hook, not catalog removal.
+    await ctx.session.hook("context",event=>{
+      if(event.agent!=="conman-coordinator")return;
+      const user=event.messages.findLast(message=>message.role==="user");
+      const text=JSON.stringify(user?.content);
+      if(text?.includes("Probe the ordinary execution guard"))event.tools.policy_probe=probe;
+      if(text?.includes("Probe the Code Mode execution guard"))event.tools.execute={description:"Owned Code Mode probe",input:{type:"object",properties:{code:{type:"string"}},required:["code"]}};
+    });
+  }
   await ctx.session.hook("http.request",event=>{
     if(event.model.providerID!=="conman-fixture"||event.model.id!=="local"||
       !["primary","generate"].includes(event.kind)||event.request.url!==endpoint||event.request.method!=="POST")
@@ -209,7 +239,7 @@ export default Plugin.define({id:"conman.native-flow-driver",async setup(ctx){
 
 const nativeFlowDriver = (options: Record<string, unknown>) => `
 import { Plugin } from "@opencode/plugin/tui";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, existsSync } from "node:fs";
 import { ConmanRpc, reasoningPayload } from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
 import { createObserverCapability } from ${JSON.stringify(new URL("../src/ownership.ts", import.meta.url).href)};
 import { readNativeObservation } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
@@ -249,6 +279,17 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
     const completed=new Promise((resolve,reject)=>{terminal={sessionID,resolve};signal.addEventListener("abort",()=>reject(new Error("Native terminal event unavailable")),{once:true})});
     const admitted=await client.session.prompt({sessionID,text,resume:true,...(id?{id}: {})},{signal});
     await completed;return admitted;
+  };
+  const history=async sessionID=>{
+    let page=await client.message.list({sessionID,order:"asc",limit:200},{signal});
+    const messages=[],cursors=new Set();
+    for(;;){
+      messages.push(...page.data);if(messages.length>200)throw new Error("Owned history exceeds fixture bound");
+      const cursor=page.cursor.next;if(!cursor)break;
+      if(cursors.has(cursor))throw new Error("Owned history cursor repeated");cursors.add(cursor);
+      page=await client.message.list({sessionID,limit:200,cursor},{signal});
+    }
+    return messages;
   };
   queueMicrotask(async()=>{try{
      proof.workerBootstrap=await rpc.bootstrap({},{location:{directory:o.workerHome},signal});
@@ -298,7 +339,21 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
     binding=adopted.snapshot.bindings[0];
      if(!adoption.asked||!adopted.accepted||binding.workerID!==worker.id||binding.location!==o.workerHome)throw new Error("Approved native adoption did not bind owned worker");
      const shared=await inspect();
-     if(shared.dataDir!==o.dataDir||JSON.stringify(shared.bindings[0])!==JSON.stringify(binding))throw new Error("Projects did not share the approved store");
+      if(shared.dataDir!==o.dataDir||JSON.stringify(shared.bindings[0])!==JSON.stringify(binding))throw new Error("Projects did not share the approved store");
+     if(o.action==="policy"){
+       record("coordinator-inspect");await run(coordinator.id,"Inspect the coordinated tasks with conman_inspect.");
+       record("coordinator-hold");
+       const holding={sessionID:coordinator.id,action:"conman.hold",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,{}])],decision:"once"};expected=holding;
+       await run(coordinator.id,"Hold only owned-seed-task with conman_control.");
+       proof.policyApproved=holding.asked===true;
+       record("ordinary-guard");await run(coordinator.id,"Probe the ordinary execution guard.");
+       record("codemode-guard");await run(coordinator.id,"Probe the Code Mode execution guard.");
+       const calls=(await history(coordinator.id)).flatMap(message=>message.type==="assistant"?message.content.filter(part=>part.type==="tool"):[]);
+       proof.coordinatorTools=calls.map(part=>({name:part.name,status:part.state.status}));
+        proof.guardErrors=calls.filter(part=>part.state.status==="error").map(part=>({name:part.name,message:part.state.error.message}));
+       proof.forbiddenDispatched=existsSync(o.home+"/policy-probe-dispatched");
+       proof.snapshot=await inspect();record("done");return;
+     }
     record("worker-read");await run(worker.id,"Read only this owned seed file: "+o.seed);
     record("observe");
       let observed=await observe();
@@ -379,16 +434,7 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
       const stored=reserved.snapshot.intents[0].intent;
        record("follow-up");proof.admission=await run(worker.id,stored.text,stored.id);
        if(proof.admission.id!==stored.id)throw new Error("Native prompt changed persisted original ID");
-       const delivered=await client.message.list({sessionID:worker.id,order:"asc",limit:200},{signal});
-       let deliveryPage=delivered,deliveryFound=false,deliveryCount=0;
-       const deliveryCursors=new Set();
-       for(;;){
-         deliveryCount+=deliveryPage.data.length;if(deliveryCount>200)throw new Error("Native delivery history exceeds bound");
-         deliveryFound ||= deliveryPage.data.some(message=>message.type==="user"&&message.id===stored.id);
-         const cursor=deliveryPage.cursor.next;if(!cursor)break;
-         if(deliveryCursors.has(cursor))throw new Error("Native delivery cursor repeated");deliveryCursors.add(cursor);
-         deliveryPage=await client.message.list({sessionID:worker.id,limit:200,cursor},{signal});
-       }
+        const deliveryFound=(await history(worker.id)).some(message=>message.type==="user"&&message.id===stored.id);
        if(!deliveryFound)throw new Error("Original persisted prompt ID absent from native delivered user history");
        proof.deliveryIdentity={sessionID:worker.id,callerID:stored.id,deliveredUserID:stored.id};
       proof.snapshot=(await control("finish",{intentID:stored.id,status:"admitted"})).snapshot;
@@ -404,7 +450,7 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
 `;
 
 export async function captureNativeCoordinator(
-  action: "continue" | "complete",
+  action: "continue" | "complete" | "policy",
 ): Promise<NativeCoordinatorProof> {
   const root = resolve(import.meta.dir, "../.opencode/conman/native-fixtures");
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -420,6 +466,7 @@ export async function captureNativeCoordinator(
   await writeFile(seed, seedContent);
   const requests: NativeCoordinatorProof["requests"] = [];
   let reads = 0;
+  const coordinatorCalls = new Set<string>();
   const server = createServer(async (request, response) => {
     try {
       if (
@@ -546,6 +593,65 @@ export async function captureNativeCoordinator(
                 }),
           }),
         };
+      } else if (action === "policy") {
+        const tools =
+          input.tools?.flatMap((tool) =>
+            tool.function ? [tool.function.name] : [],
+          ) ?? [];
+        const user = JSON.stringify(
+          input.messages.findLast((message) => message.role === "user")
+            ?.content,
+        );
+        const name = user?.includes("Probe the ordinary execution guard")
+          ? "policy_probe"
+          : user?.includes("Probe the Code Mode execution guard")
+            ? "execute"
+            : user?.includes("Hold only owned-seed-task")
+              ? "conman_control"
+              : "conman_inspect";
+        const probe = name === "policy_probe" || name === "execute";
+        if (
+          tools.length !== (probe ? 4 : 3) ||
+          ![
+            "conman_inspect",
+            "conman_control",
+            "question",
+            ...(probe ? [name] : []),
+          ].every((name) => tools.includes(name))
+        )
+          throw new Error(
+            "Merged-policy coordinator exposed an unexpected tool catalog",
+          );
+        requests.push({ kind: `coordinator-${name}`, tools });
+        if (coordinatorCalls.has(name))
+          delta = { content: "Owned coordinator operation finished." };
+        else {
+          coordinatorCalls.add(name);
+          delta = {
+            tool_calls: [
+              {
+                index: 0,
+                id: `owned-${name}`,
+                type: "function",
+                function: {
+                  name,
+                  arguments: JSON.stringify(
+                    name === "conman_control"
+                      ? {
+                          operation: "hold",
+                          taskID: "owned-seed-task",
+                          body: {},
+                        }
+                      : name === "execute"
+                        ? { code: "await tools.policy_probe({})" }
+                        : {},
+                  ),
+                },
+              },
+            ],
+          };
+          finish = "tool_calls";
+        }
       } else if (reads === 0) {
         const tools =
           input.tools?.flatMap((tool) =>
@@ -632,7 +738,10 @@ export async function captureNativeCoordinator(
         exports: { ".": "./server.js", "./tui": "./tui.js" },
       }),
     );
-    await writeFile(join(probe, "server.js"), nativeFlowGuard(home, endpoint));
+    await writeFile(
+      join(probe, "server.js"),
+      nativeFlowGuard(home, endpoint, action === "policy"),
+    );
     await writeFile(
       join(probe, "tui.js"),
       nativeFlowDriver({
@@ -648,6 +757,12 @@ export async function captureNativeCoordinator(
     );
     const config = {
       model: "conman-fixture/local",
+      permissions: [
+        ...inheritedPolicy,
+        ...(action === "policy"
+          ? [{ action: "policy_probe", resource: "*", effect: "allow" }]
+          : []),
+      ],
       providers: {
         "conman-fixture": {
           package: "@opencode/ai/providers/openai-compatible",
@@ -764,13 +879,13 @@ import { writeFileSync } from "node:fs";
 import { applyNativeNoColor, coordinationStatusDetails, overview, sharedVersionDetails } from ${JSON.stringify(new URL("../src/ui.ts", import.meta.url).href)};
 import { setupNativeTui } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
 import { FixtureRpc } from "./rpc.js";
-export default Plugin.define({ id: ${JSON.stringify(options.modelTurn || options.discovery === "coordinator" ? "conman" : "conman.native-frame-probe")}, setup(context) {
+export default Plugin.define({ id: ${JSON.stringify(options.modelTurn || typeof options.discovery === "string" ? "conman" : "conman.native-frame-probe")}, setup(context) {
   const o = ${JSON.stringify(options)};
   writeFileSync(o.optionsLog, JSON.stringify({ pid: process.pid, keys: Object.keys(context.options), widthType: typeof context.options.width, bun: globalThis.Bun?.version }));
   context.renderer.resize(o.width, o.height);
   const restore = applyNativeNoColor(context.renderer);
   const pages = [];
-  let openAgentPicker = o.discovery === "coordinator";
+  let openAgentPicker = typeof o.discovery === "string";
   const capture = buffer => {
     if (buffer.width !== o.width || buffer.height !== o.height) return;
     const text = new TextDecoder().decode(buffer.getRealCharBytes(true));
@@ -786,7 +901,7 @@ export default Plugin.define({ id: ${JSON.stringify(options.modelTurn || options
   context.renderer.addPostProcessFn(capture);
   if(o.discovery){
     const close=setupNativeTui(context);
-    if(o.discovery !== "coordinator") queueMicrotask(()=>context.keymap.dispatch("command.palette.show"));
+    if(typeof o.discovery !== "string") queueMicrotask(()=>context.keymap.dispatch("command.palette.show"));
     return ()=>{close();context.renderer.removePostProcessFn(capture);restore()};
   }
   let action;
@@ -880,7 +995,7 @@ export async function captureNativeOverview(
   state: import("../src/ui.ts").UiState = "ready",
   versions = false,
   statusReason?: string,
-  discovery: boolean | "coordinator" = false,
+  discovery: boolean | "coordinator" | "coordinator-denied" = false,
 ) {
   const root = resolve(import.meta.dir, "../.opencode/conman/native-fixtures");
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -888,7 +1003,7 @@ export async function captureNativeOverview(
   const probe = join(home, "probe");
   await mkdir(probe, { mode: 0o700 });
   const modelServer =
-    modelTurn || discovery === "coordinator"
+    modelTurn || typeof discovery === "string"
       ? await localModelServer()
       : undefined;
   let nativeStopped = true;
@@ -911,7 +1026,7 @@ export async function captureNativeOverview(
     await writeFile(join(probe, "rpc.js"), fixtureRpc);
     await writeFile(
       join(probe, "server.js"),
-      discovery === "coordinator"
+      typeof discovery === "string"
         ? `
 import {Plugin} from "@opencode/plugin";
 import {writeFileSync} from "node:fs";
@@ -964,6 +1079,22 @@ export default Plugin.define({id:"conman",async setup(ctx){
     await writeFile(
       join(home, "opencode.json"),
       JSON.stringify({
+        ...(typeof discovery === "string"
+          ? {
+              permissions: [
+                ...inheritedPolicy,
+                ...(discovery === "coordinator-denied"
+                  ? [
+                      {
+                        action: "conman_control",
+                        resource: "*",
+                        effect: "deny",
+                      },
+                    ]
+                  : []),
+              ],
+            }
+          : {}),
         ...(modelServer
           ? {
               model: "conman-fixture/local",
@@ -1035,13 +1166,15 @@ export default Plugin.define({id:"conman",async setup(ctx){
       terminal = (terminal + String(bytes)).slice(-200000);
     });
     try {
-      if (discovery === "coordinator") {
+      if (typeof discovery === "string") {
         await readCapture<NativeFrame>(framePath, (value) =>
           value.text.includes("Select agent"),
         );
         child.stdin?.write("Conman Coordinator");
         frame = await readCapture<NativeFrame>(framePath, (value) =>
-          value.text.includes("Conman Coordinator"),
+          value.text
+            .split("\n")
+            .some((line) => line.trim() === "Conman Coordinator"),
         );
         await writeFile(
           `/tmp/opencode/conman-dedicated-picker-${width}.json`,

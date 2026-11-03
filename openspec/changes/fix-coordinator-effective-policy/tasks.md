@@ -1,0 +1,5 @@
+- [x] 1. Red-green "Registers the coordinator in every enabled project" and "Preserves a configured coordinator agent"; have agent-engineer update the shared matcher after RED and document semantic equivalence in README.
+- [x] 2. Red-green "Rejects disallowed coordinator tool execution"; implement the design's native identity, execution-boundary and cleanup decisions with inherited-policy fixtures.
+- [x] 3. Red-green "Preserves native approval for conversational control" and "Rejects coordinator worker assignments" under inherited grants and configured denials, retaining exact tool filtering and foreign-definition behavior.
+- [x] 4. Red-green "Preserves cross-project control under inherited policy" through the private native host; align TUI supporting checks and README without per-project setup or live activation.
+- [x] 5. Run regular/native coverage, types, lint, hooks and simplification self-review; resolve focused code, definition and security findings against one frozen revision.

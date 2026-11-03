@@ -47,6 +47,8 @@ import {
   captureNativeOverview,
   fixtureApproval,
   coordinatorDefinition,
+  inheritedPolicy,
+  captureNativeCoordinator,
 } from "./host.ts";
 import {
   createNativeBackend,
@@ -482,9 +484,11 @@ describe("Dedicated coordinator entry", () => {
             ...coordinatorAgent,
             system:
               role === "collision" ? "User role" : coordinatorAgent.system,
-            permissions: coordinatorAgent.permissions.map((rule) => ({
-              ...rule,
-            })),
+            permissions: coordinatorAgent.permissions
+              .map((rule) => ({
+                ...rule,
+              }))
+              .concat(inheritedPolicy),
             request: { settings: {}, headers: {}, body: {} },
           },
         ],
@@ -597,6 +601,80 @@ describe("Dedicated coordinator entry", () => {
       expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(true);
     } finally {
       f.close();
+    }
+  });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Inherited coordinator policy", () => {
+  it("Preserves cross-project control under inherited policy", async () => {
+    const f = runtimeFixture();
+    const list = f.context.client.agent.list;
+    f.context.client.agent.list = async (...args) => {
+      const catalog = await list(...args);
+      return {
+        ...catalog,
+        data: catalog.data.map((agent) => ({
+          ...agent,
+          permissions: [...agent.permissions, ...inheritedPolicy],
+        })),
+      };
+    };
+    try {
+      await f.run("conman.attach");
+      await f.run("conman.hold", task.workerID);
+      expect(f.controls.at(-1)?.operation).toBe("hold");
+      expect(f.controls.at(-1)?.taskID).toBe(task.id);
+      expect(f.snapshot().bindings[0]?.location).toBe(task.location);
+      expect(f.controls.at(-1)?.proof.coordinatorLocation).toBe(
+        "/tmp/opencode",
+      );
+      expect(
+        f.requests.every(
+          (request) => request.location?.directory === "/tmp/opencode",
+        ),
+      ).toBe(true);
+    } finally {
+      f.close();
+    }
+    // The Makefile native target runs the owned-host integration alongside this unit path.
+    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+      const proof = await captureNativeCoordinator("policy");
+      expect(proof.error).toBeUndefined();
+      expect(proof.stage).toBe("done");
+      expect(proof.policyApproved).toBe(true);
+      expect(proof.coordinatorTools).toEqual([
+        { name: "conman_inspect", status: "completed" },
+        { name: "conman_control", status: "completed" },
+        { name: "policy_probe", status: "error" },
+        { name: "execute", status: "error" },
+      ]);
+      expect(proof.guardErrors).toEqual([
+        { name: "policy_probe", message: "Coordinator tool is not permitted" },
+        { name: "execute", message: "Coordinator tool is not permitted" },
+      ]);
+      // The marker checks the ordinary probe body; execute's own error proves Code Mode entry rejection.
+      expect(proof.forbiddenDispatched).toBe(false);
+      const snapshot = proof.snapshot as CoordinatorSnapshot;
+      expect(snapshot.bindings[0]?.location).toBe(proof.workerHome);
+      expect(snapshot.bindings[0]?.epoch).toBe(2);
+      expect(snapshot.dataDir).not.toBe(proof.home);
+      const denied = await captureNativeOverview(
+        [],
+        80,
+        24,
+        false,
+        {},
+        false,
+        "ready",
+        false,
+        undefined,
+        "coordinator-denied",
+      );
+      expect([...(denied.entry?.tools ?? [])].sort()).toEqual([
+        "conman_inspect",
+        "question",
+      ]);
     }
   });
 });

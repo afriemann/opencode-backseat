@@ -2842,16 +2842,47 @@ export default Plugin.define({
           .filter((rule) => rule.effect === "allow")
           .map((rule) => rule.action),
       );
+      const matchesExecutionRole = async (sessionID: string, agent: string) => {
+        if (agent && agent !== coordinatorAgent.id) return false;
+        if (adapter.abort.signal.aborted || !sessionID || !agent)
+          throw new Error("Coordinator tool identity is unavailable");
+        const session = await ctx.session.get({ sessionID });
+        if (
+          session.id !== sessionID ||
+          session.agent !== agent ||
+          session.time.archived !== undefined
+        )
+          throw new Error("Coordinator tool session identity changed");
+        const directory = await canonical(session.location.directory);
+        const project = core.projects.get(directory);
+        if (
+          directory !== session.location.directory ||
+          !project ||
+          project.abort.signal.aborted
+        )
+          throw new Error("Coordinator tool project is unavailable");
+        const catalog = await ctx.agent.list({ location: { directory } });
+        const definition = catalog.data.find((entry) => entry.id === agent);
+        if (catalog.location.directory !== directory || !definition)
+          throw new Error("Coordinator tool catalog is unavailable");
+        const current = await ctx.session.get({ sessionID });
+        if (
+          adapter.abort.signal.aborted ||
+          project.abort.signal.aborted ||
+          core.projects.get(directory) !== project ||
+          current.id !== sessionID ||
+          current.agent !== agent ||
+          current.projectID !== session.projectID ||
+          current.time.archived !== undefined ||
+          fingerprint(current.location) !== fingerprint(session.location)
+        )
+          throw new Error("Coordinator tool identity changed during lookup");
+        return isCoordinatorAgent(definition);
+      };
       const contextTools = await ctx.session.hook("context", async (event) => {
         if (event.agent !== coordinatorAgent.id) return;
         try {
-          const catalog = await ctx.agent.list({
-            location: { directory: location },
-          });
-          if (
-            catalog.location.directory !== location ||
-            !catalog.data.some(isCoordinatorAgent)
-          )
+          if (!(await matchesExecutionRole(event.sessionID, event.agent)))
             return;
           for (const name of Object.keys(event.tools))
             if (!allowedTools.has(name)) delete event.tools[name];
@@ -2861,6 +2892,22 @@ export default Plugin.define({
         }
       });
       cleanupSteps.push(() => contextTools.dispose());
+      const executionTools = await ctx.tool.hook(
+        "execute.before",
+        async (event) => {
+          let matches: boolean;
+          try {
+            matches = await matchesExecutionRole(event.sessionID, event.agent);
+          } catch {
+            throw new Error(
+              "Coordinator tool identity is unavailable or changed",
+            );
+          }
+          if (matches && !allowedTools.has(event.tool))
+            throw new Error("Coordinator tool is not permitted");
+        },
+      );
+      cleanupSteps.push(() => executionTools.dispose());
       const serve = async <T>(work: () => Promise<T>): Promise<T> => {
         if (adapter.abort.signal.aborted)
           throw new Error("Project adapter is unavailable");
