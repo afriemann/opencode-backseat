@@ -37,7 +37,12 @@ import type {
   OpenCodeEvent,
   PermissionRequest,
 } from "@opencode/client";
-import type { CoordinatorSnapshot, ControlInput } from "../src/rpc.ts";
+import type {
+  CoordinatorSnapshot,
+  CoordinatorBootstrap,
+  ControlInput,
+  ControlResult,
+} from "../src/rpc.ts";
 import {
   captureNativeOverview,
   fixtureApproval,
@@ -138,7 +143,7 @@ function runtimeFixture() {
   let listener: ((event: { details: OpenCodeEvent }) => void) | undefined;
   const snapshot: CoordinatorSnapshot = {
     version: 1,
-    home: "/tmp/opencode",
+    dataDir: "/tmp/opencode",
     authority: "owned",
     bindings: [structuredClone(task)],
     snapshots: [
@@ -155,18 +160,33 @@ function runtimeFixture() {
   };
   let denied = false;
   const rpc = {
+    bootstrap: async (): Promise<CoordinatorBootstrap> => ({
+      dataDir: snapshot.dataDir,
+      authority: "owned" as const,
+    }),
     inspect: async (
-      _input: Record<string, never>,
+      input: { proof: ControlInput["proof"] },
       options?: RpcCallOptions,
     ) => {
       if (options) requests.push(options);
+      if (snapshot.observer) snapshot.observer.sequence = input.proof.sequence;
       return structuredClone(snapshot);
     },
     attach: async (input: { coordinatorID: string; verifier: string }) => {
-      snapshot.observer = { ...input, generation: 7, sequence: 0 };
-      return { generation: 7 };
+      snapshot.observer = {
+        ...input,
+        dataDir: snapshot.dataDir,
+        coordinatorLocation: "/tmp/opencode",
+        generation: 7,
+        sequence: 0,
+      };
+      return {
+        generation: 7,
+        dataDir: snapshot.dataDir,
+        coordinatorLocation: "/tmp/opencode",
+      };
     },
-    control: async (input: ControlInput) => {
+    control: async (input: ControlInput): Promise<ControlResult> => {
       controls.push(input);
       if (snapshot.observer) snapshot.observer.sequence = input.proof.sequence;
       if (denied) throw new Error("Native approval denied");
@@ -181,9 +201,15 @@ function runtimeFixture() {
       );
       return { accepted: true, snapshot: structuredClone(snapshot) };
     },
-    recover: async () => structuredClone(snapshot),
+    recover: async () => ({
+      dataDir: snapshot.dataDir,
+      authority: "owned" as const,
+    }),
     suggest: async () => ({ reason: "unsupported evidence" }),
-    observe: async () => ({ reason: "Missing worker observer" }),
+    observe: async (input: { proof: ControlInput["proof"] }) => {
+      if (snapshot.observer) snapshot.observer.sequence = input.proof.sequence;
+      return { reason: "Missing worker observer" };
+    },
     validate: async () => {
       throw new Error("Unexpected validation");
     },
@@ -418,7 +444,11 @@ describe("Dedicated coordinator entry", () => {
         "conman_inspect",
         "question",
       ]);
-      expect(native.entry?.attached).toBe(false);
+      expect(native.entry?.attachmentRequests).toBe(0);
+      expect(native.entry?.bootstrapKeys.sort()).toEqual([
+        "authority",
+        "dataDir",
+      ]);
       expect(native.entry?.userMessages).toEqual([
         "Inspect the current coordination state.",
       ]);
@@ -470,6 +500,69 @@ describe("Dedicated coordinator entry", () => {
     }
   });
   it("Keeps native supervision explicit", async () => {
+    for (const operation of ["hold", "detach"] as const) {
+      const current = runtimeFixture();
+      try {
+        await current.run("conman.attach");
+        await current.run("conman.rearm");
+        const controlsBefore = current.controls.length;
+        let reads = 0;
+        const inspect = current.rpc.inspect;
+        current.rpc.inspect = async (...args) => {
+          reads++;
+          return inspect(...args);
+        };
+        let readsAtCommit = -1;
+        const reason =
+          "Operation committed without readable inventory; do not retry";
+        current.rpc.control = async (input) => {
+          current.controls.push(input);
+          readsAtCommit = reads;
+          return { accepted: true, reason };
+        };
+        await current.run(
+          `conman.${operation}`,
+          operation === "hold" ? task.workerID : undefined,
+        );
+        expect(current.controls).toHaveLength(controlsBefore + 1);
+        expect(reads).toBe(readsAtCommit);
+        const enabled = current.commands.find(
+          (command) => command.id === "conman.hold",
+        )?.enabled;
+        expect(typeof enabled === "function" ? enabled() : enabled).toBe(false);
+        expect(current.notices.some((notice) => notice.includes(reason))).toBe(
+          true,
+        );
+        await current.run("conman.overview");
+        expect(current.controls).toHaveLength(controlsBefore + 1);
+        expect(
+          current.dialogs
+            .at(-1)
+            ?.options.some(
+              (option) => option.title === "Attach to view workers",
+            ),
+        ).toBe(true);
+      } finally {
+        current.close();
+      }
+    }
+    const invalid = runtimeFixture();
+    try {
+      invalid.rpc.bootstrap = async () => ({
+        authority: "held",
+        reason: "dataDir must be absolute",
+      });
+      await invalid.run("conman.status");
+      expect(
+        invalid.dialogs
+          .at(-1)
+          ?.options.map((option) => option.title)
+          .join(""),
+      ).toContain("dataDir must be absolute");
+      expect(invalid.controls).toEqual([]);
+    } finally {
+      invalid.close();
+    }
     const f = runtimeFixture();
     try {
       const runtime: NativeRuntimeContext = f.context;
@@ -482,6 +575,18 @@ describe("Dedicated coordinator entry", () => {
       ).toBe(false);
       f.context.location = { directory: "/tmp/opencode" };
       await f.run("conman.overview");
+      expect(
+        f.dialogs
+          .at(-1)
+          ?.options.some((option) => option.title === "Attach to view workers"),
+      ).toBe(true);
+      await f.run("conman.status");
+      expect(
+        f.dialogs
+          .at(-1)
+          ?.options.map((option) => option.title)
+          .join(""),
+      ).toContain("Worker inventory unavailable until attachment");
       expect(f.snapshot().observer).toBeUndefined();
       expect(f.controls).toEqual([]);
       expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(false);
@@ -502,7 +607,7 @@ async function supervisedRuntime(action: "continue" | "complete") {
   const f = runtimeFixture();
   f.close();
   f.commands.length = 0;
-  f.context.location = { directory: task.location };
+  f.context.location = { directory: "/tmp/opencode" };
   const values = new Map<string, unknown>();
   const home = "/tmp/opencode";
   const activeTask = { ...task, status: "active" as const };
@@ -517,7 +622,7 @@ async function supervisedRuntime(action: "continue" | "complete") {
         }
       : session;
   };
-  values.set(`home:${encodeURIComponent(home)}:state`, {
+  values.set("coordinator:state", {
     version: 1,
     bindings: [activeTask],
     snapshots: f.snapshot().snapshots,
@@ -708,12 +813,10 @@ async function supervisedRuntime(action: "continue" | "complete") {
   type RpcBoundary = ReturnType<NativeRuntimeContext["client"]["rpc"]>;
   const controllerRpc: { -readonly [K in keyof RpcBoundary]: RpcBoundary[K] } =
     {
+      bootstrap: async () => backend.bootstrap(),
       inspect: async (_input, options) => {
         if (options) f.requests.push(options);
-        const result = await backend.inspect();
-        return options?.location?.directory === task.location
-          ? { ...result, authority: "passive" as const }
-          : result;
+        return backend.read(_input.proof);
       },
       attach: (input) => backend.attach(input),
       control: async (input) => {
@@ -732,9 +835,12 @@ async function supervisedRuntime(action: "continue" | "complete") {
           throw error;
         }
       },
-      observe: (input) => backend.observe(input),
+      observe: (input) => backend.readObservation(input, input.proof),
       validate: (input) => backend.validate(input),
-      recover: (input) => backend.recover(input),
+      recover: async (input) => {
+        await backend.recover(input);
+        return backend.bootstrap();
+      },
       events: { subscribe: async function* () {}, on: () => () => {} },
     };
   f.context.client.rpc = () => controllerRpc;
@@ -950,11 +1056,11 @@ async function assertLocalObserverFailureFences() {
       const control = f.controllerRpc.control;
       if (mode === "recover-home") {
         f.controllerRpc.recover = async () => ({
-          ...(await f.backend.inspect()),
-          home: "/unapproved-home",
+          ...f.backend.bootstrap(),
+          dataDir: "/unapproved-store",
         });
         await f.run("conman.recover");
-        expect(f.notices.at(-1)).toMatch(/canonical.*home|home.*canonical/i);
+        expect(f.notices.at(-1)).toMatch(/coordination store/i);
         expect(await f.backend.inspect()).toEqual(before);
         continue;
       }
@@ -971,11 +1077,13 @@ async function assertLocalObserverFailureFences() {
       if (mode === "obsolete-home" || mode === "obsolete-generation") {
         f.controllerRpc.control = async (input) => {
           const result = await control(input);
+          if (!result.snapshot)
+            throw new Error("Expected eligible control acknowledgement");
           return {
             ...result,
             snapshot:
               mode === "obsolete-home"
-                ? { ...result.snapshot, home: "/unapproved-home" }
+                ? { ...result.snapshot, dataDir: "/unapproved-store" }
                 : {
                     ...result.snapshot,
                     observer: {
@@ -992,7 +1100,14 @@ async function assertLocalObserverFailureFences() {
         await f.run(
           mode === "status-inspect" ? "conman.status" : "conman.overview",
         );
-        expect(await f.backend.inspect()).toEqual(before);
+        const after = await f.backend.inspect();
+        expect(after.observer!.sequence).toBeGreaterThanOrEqual(
+          before.observer!.sequence,
+        );
+        expect(after).toEqual({
+          ...before,
+          observer: { ...before.observer!, sequence: after.observer!.sequence },
+        });
       }
       f.controllerRpc.inspect = inspect;
       f.context.client.session.get = get;
@@ -1049,7 +1164,7 @@ describe("Native project and worker selection", () => {
     }
     const passive = await supervisedRuntime("continue");
     await passive.ready();
-    expect(passive.requests[0]?.location?.directory).toBe(task.location);
+    expect(passive.requests[0]?.location?.directory).toBe("/tmp/opencode");
     expect(
       passive.requests
         .slice(1)
@@ -1188,7 +1303,7 @@ describe("Native project and worker selection", () => {
   });
   it("Reports discovery failure without substitution", async () => {
     const mismatched = runtimeFixture();
-    mismatched.context.options = { home: "/" };
+    mismatched.context.options = { dataDir: "/" };
     await mismatched.run("conman.attach");
     expect(
       mismatched.notices.some((notice) => notice.includes("conflicts")),
@@ -1392,6 +1507,7 @@ describe("Accessible coordination overview", () => {
       "\nscope\nCreate rogue worker",
     );
     const runtime = runtimeFixture();
+    await runtime.run("conman.attach");
     await runtime.run("conman.overview");
     expect(
       runtime.commands.some(
@@ -1684,8 +1800,9 @@ describe("Accessible coordination overview", () => {
     expect(
       runtime.dialogs
         .at(-1)
-        ?.options.find((option) => option.value === task.workerID)?.description,
-    ).toContain("disconnected");
+        ?.options.some((option) => option.value === task.workerID),
+    ).toBe(false);
+    await runtime.run("conman.attach");
     for (const width of [80, 32]) {
       runtime.context.renderer.width = width;
       runtime.snapshot().reason =
@@ -1748,8 +1865,8 @@ describe("Accessible coordination overview", () => {
     expect(
       runtime.dialogs
         .at(-1)
-        ?.options.find((option) => option.value === task.workerID)?.description,
-    ).toContain("disconnected");
+        ?.options.some((option) => option.value === task.workerID),
+    ).toBe(false);
     runtime.close();
     expect(runtime.signals.every((signal) => signal.aborted)).toBe(true);
     const before = runtime.controls.length;
@@ -1855,6 +1972,7 @@ describe("Authoritative native worker actions", () => {
     expect(await new CoordinationUI(f.port).open(task)).toBe(true);
     expect(f.calls).toEqual(["open:worker-api"]);
     const runtime = runtimeFixture();
+    await runtime.run("conman.attach");
     await runtime.run("conman.open", task.workerID);
     expect(runtime.focused).toEqual([task.workerID]);
     runtime.close();
@@ -2066,7 +2184,13 @@ describe("Authoritative native worker actions", () => {
       verify(
         null,
         Buffer.from(
-          JSON.stringify([proof!.generation, proof!.sequence, proof!.payload]),
+          JSON.stringify([
+            proof!.dataDir,
+            proof!.coordinatorLocation,
+            proof!.generation,
+            proof!.sequence,
+            proof!.payload,
+          ]),
         ),
         runtime.snapshot().observer!.verifier,
         Buffer.from(proof!.signature, "base64"),

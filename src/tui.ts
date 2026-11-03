@@ -13,7 +13,12 @@ import {
   type WorkerChoice,
   type UiState,
 } from "./ui.ts";
-import { parseGoal, type WorkerBinding, type WorkerSnapshot } from "./state.ts";
+import {
+  parseGoal,
+  parseCoordinatorState,
+  type WorkerBinding,
+  type WorkerSnapshot,
+} from "./state.ts";
 import {
   ConmanRpc,
   reasoningPayload,
@@ -614,9 +619,11 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
   const abort = new AbortController();
   const rpc = context.client.rpc(ConmanRpc);
   const discovery = new NativeDiscovery(context.client, abort.signal);
-  let home: string | undefined;
+  let dataDir: string | undefined;
   let snapshot: CoordinatorSnapshot | undefined;
   let generation: number | undefined;
+  let observerScope:
+    { dataDir: string; coordinatorLocation: string } | undefined;
   let coordinatorID: string | undefined;
   let sequence = 0;
   let state: UiState = "disconnected";
@@ -655,37 +662,55 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
   const options = async () => {
     if (closed || abort.signal.aborted)
       throw new Error("Observer disconnected");
-    if (!home) {
+    if (!dataDir) {
       const location = context.location;
       if (!location?.directory?.startsWith("/"))
         throw new Error("Native TUI location is unavailable");
-      const bootstrap = await rpc.inspect(
+      const bootstrap = await rpc.bootstrap(
         {},
         { location, signal: abort.signal },
       );
-      if (!bootstrap.home.startsWith("/") || closed)
-        throw new Error("Canonical coordinator home is unavailable");
-      const canonical = await realpath(bootstrap.home);
-      if (
-        canonical !== bootstrap.home ||
-        (context.options.home !== undefined &&
-          (typeof context.options.home !== "string" ||
-            (await realpath(context.options.home)) !== canonical))
-      )
+      if (!bootstrap.dataDir?.startsWith("/") || closed)
         throw new Error(
-          "Explicit home conflicts with server canonical authority",
+          bootstrap.reason ?? "Coordination store is unavailable",
         );
-      home = canonical;
+      const canonical = await realpath(bootstrap.dataDir);
+      if (
+        canonical !== bootstrap.dataDir ||
+        (context.options.dataDir !== undefined &&
+          (typeof context.options.dataDir !== "string" ||
+            (await realpath(context.options.dataDir)) !== canonical))
+      )
+        throw new Error("Explicit dataDir conflicts with server authority");
+      dataDir = canonical;
     }
-    return { location: { directory: home }, signal: abort.signal };
+    if (!context.location?.directory?.startsWith("/"))
+      throw new Error("Native TUI location is unavailable");
+    return { location: context.location, signal: abort.signal };
   };
-  const refresh = async () => {
+  const readSnapshot = async () => {
     const request = await options();
-    const next = await rpc.inspect({}, request);
-    if (closed || next.home !== request.location.directory)
-      throw new Error(
-        "Canonical coordinator home does not match RPC authority",
-      );
+    if (generation === undefined || !observerScope || !coordinatorID) {
+      const metadata = await rpc.bootstrap({}, request);
+      if (closed || !metadata.dataDir || metadata.dataDir !== dataDir)
+        throw new Error("Coordination store changed");
+      snapshot = {
+        ...parseCoordinatorState(undefined),
+        dataDir: metadata.dataDir,
+        authority: metadata.authority,
+        ...(metadata.reason ? { reason: metadata.reason } : {}),
+      };
+      return snapshot;
+    }
+    const proof = capability.sign(
+      generation,
+      ++sequence,
+      { operation: "inspect", taskID: coordinatorID, revision: 0, epoch: 0 },
+      observerScope,
+    );
+    const next = await rpc.inspect({ proof }, request);
+    if (closed || next.dataDir !== dataDir)
+      throw new Error("Coordination store does not match RPC authority");
     snapshot = next;
     if (
       generation !== undefined &&
@@ -700,6 +725,11 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     }
     return next;
   };
+  const refresh = () => {
+    const pending = signedSerial.then(readSnapshot);
+    signedSerial = pending.catch(() => undefined);
+    return pending;
+  };
   const isCurrent = (next: CoordinatorSnapshot) =>
     !closed &&
     generation !== undefined &&
@@ -712,10 +742,9 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     taskID: string,
     body: ControlBody = {},
     expected?: WorkerBinding,
-    verify?: () => Promise<void>,
     fence?: () => string | undefined,
   ) => {
-    const next = await refresh();
+    const next = await readSnapshot();
     const request = await options();
     if (!isCurrent(next))
       throw new Error("Native-approved current observer attachment required");
@@ -737,7 +766,6 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     )
       throw new Error("Task changed before control admission");
     const zero = ["create", "adopt", "detach"].includes(operation);
-    await verify?.();
     if (
       fence?.() ||
       closed ||
@@ -745,17 +773,43 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       snapshot?.observer?.sequence !== sequence
     )
       throw new Error("Observer changed before signed control");
-    const proof = capability.sign(generation!, ++sequence, {
-      operation,
-      taskID,
-      revision: zero ? 0 : (binding?.revision ?? 0),
-      epoch: zero ? 0 : (binding?.epoch ?? 0),
-      body,
-    });
+    const proof = capability.sign(
+      generation!,
+      ++sequence,
+      {
+        operation,
+        taskID,
+        revision: zero ? 0 : (binding?.revision ?? 0),
+        epoch: zero ? 0 : (binding?.epoch ?? 0),
+        body,
+      },
+      snapshot!.observer!,
+    );
     const result = await rpc.control({ operation, taskID, proof }, request);
+    if (!result.snapshot) {
+      const metadata = {
+        dataDir: next.dataDir,
+        authority: next.authority,
+      };
+      snapshot = undefined;
+      fenceObserver();
+      state = "disconnected";
+      if (operation === "detach" && result.accepted) {
+        await notice(
+          state,
+          result.reason ??
+            "Detach committed; observer authority revoked. Do not retry.",
+        );
+        return { ...parseCoordinatorState(undefined), ...metadata };
+      }
+      throw new Error(
+        result.reason ??
+          "Control committed without readable inventory; do not retry. Attach and reconcile explicitly.",
+      );
+    }
     if (
       closed ||
-      result.snapshot.home !== home ||
+      result.snapshot.dataDir !== dataDir ||
       (!isCurrent(result.snapshot) && operation !== "detach")
     ) {
       fenceObserver();
@@ -776,11 +830,14 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     verify?: () => Promise<void>,
     fence?: () => string | undefined,
   ) => {
-    const pending = signedSerial.then(() =>
-      performControl(operation, taskID, body, expected, verify, fence),
-    );
-    signedSerial = pending.catch(() => undefined);
-    return pending;
+    return (async () => {
+      await verify?.();
+      const pending = signedSerial.then(() =>
+        performControl(operation, taskID, body, expected, fence),
+      );
+      signedSerial = pending.catch(() => undefined);
+      return pending;
+    })();
   };
   const reasoning = <T>(
     payload: ControlPayload,
@@ -788,7 +845,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     request: (proof: SignedControl) => Promise<T>,
   ): Promise<T> => {
     const pending = signedSerial.then(async () => {
-      const next = await refresh();
+      const next = await readSnapshot();
       const current = next.bindings.find((task) => task.id === payload.taskID);
       if (
         !isCurrent(next) ||
@@ -803,7 +860,12 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         );
       // Signing and the complete RPC request occupy the same private queue as
       // controls. Consume this sequence even if the acknowledgement is lost.
-      const proof = capability.sign(expectedGeneration, ++sequence, payload);
+      const proof = capability.sign(
+        expectedGeneration,
+        ++sequence,
+        payload,
+        next.observer!,
+      );
       return request(proof);
     });
     signedSerial = pending.catch(() => undefined);
@@ -818,10 +880,31 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
   const observe = async (binding: WorkerBinding) => {
     const next = await refresh();
     const request = await options();
-    const before = await rpc.observe(
-      { taskID: binding.id, workerID: binding.workerID },
-      request,
-    );
+    const evidenceRead = () => {
+      const pending = signedSerial.then(async () => {
+        if (!generation || !observerScope || !isCurrent(snapshot!))
+          throw new Error("Approved observer required for evidence");
+        const proof = capability.sign(
+          generation,
+          ++sequence,
+          {
+            operation: "observe",
+            taskID: binding.id,
+            revision: binding.revision,
+            epoch: binding.epoch,
+            body: { workerID: binding.workerID },
+          },
+          observerScope,
+        );
+        return rpc.observe(
+          { taskID: binding.id, workerID: binding.workerID, proof },
+          request,
+        );
+      });
+      signedSerial = pending.catch(() => undefined);
+      return pending;
+    };
+    const before = await evidenceRead();
     const observation = await readNativeObservation(
       context.client,
       binding,
@@ -829,10 +912,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       abort.signal,
       before.snapshot,
     );
-    const after = await rpc.observe(
-      { taskID: binding.id, workerID: binding.workerID },
-      request,
-    );
+    const after = await evidenceRead();
     if (fingerprint(before) !== fingerprint(after))
       throw new Error("Worker observation invalidated during native reads");
     observations.set(binding.id, {
@@ -1316,6 +1396,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         [snapshot?.reason, statusReason].filter(Boolean).join("; "),
         context.renderer.width,
         nativeStatus,
+        !!snapshot && isCurrent(snapshot),
       ),
     );
   };
@@ -1354,26 +1435,29 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       route.type !== "session" ||
       next.bindings.some((task) => task.workerID === route.sessionID)
     )
-      throw new Error("Open the canonical coordinator session, not a worker");
+      throw new Error(
+        "Open a Conman Coordinator session in this project, not a worker",
+      );
     const session = await context.client.session.get(
       { sessionID: route.sessionID },
       { signal: abort.signal },
     );
     const agents = await context.client.agent.list(
-      { location: { directory: home! } },
+      { location: { directory: session.location.directory } },
       { signal: abort.signal },
     );
     if (
       session.id !== route.sessionID ||
-      agents.location.directory !== home ||
+      agents.location.directory !== session.location.directory ||
       !agents.data.some(
         (agent) => agent.id === session.agent && isCoordinatorAgent(agent),
       ) ||
-      (await realpath(session.location.directory)) !== home ||
+      (await realpath(session.location.directory)) !==
+        context.location?.directory ||
       session.time.archived
     )
       throw new Error(
-        "Select Conman Coordinator at the canonical home; the dedicated role is unavailable or this session is ineligible",
+        "Select Conman Coordinator in this project; the dedicated role is unavailable or this session is ineligible",
       );
     return session.id;
   };
@@ -1388,6 +1472,10 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     );
     if (closed) return;
     generation = result.generation;
+    observerScope = {
+      dataDir: result.dataDir,
+      coordinatorLocation: result.coordinatorLocation,
+    };
     sequence = 0;
     if (!isCurrent(await refresh())) {
       generation = undefined;
@@ -1514,7 +1602,9 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
           !next.bindings.length && state !== "ready"
             ? {
                 ...option,
-                title: "No workers available",
+                title: isCurrent(next)
+                  ? "No workers available"
+                  : "Attach to view workers",
                 value: "conman:status",
                 disabled: false,
                 description: "Inspect status without creating workers",
@@ -1642,11 +1732,11 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
               { coordinatorID: await currentCoordinator() },
               await options(),
             );
-            if (recovered.home !== home)
+            if (recovered.dataDir !== dataDir)
               throw new Error(
-                "Recovery snapshot does not match canonical home",
+                "Recovery metadata does not match coordination store",
               );
-            snapshot = recovered;
+            snapshot = undefined;
             await notice(
               state,
               "Recovery requires a separate approved attachment and explicit rearm",

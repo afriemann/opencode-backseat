@@ -11,13 +11,21 @@ import {
   type WorkerBinding,
 } from "../src/state.ts";
 import { goal } from "./host.ts";
-import { createNativeBackend, type NativeBackendHost } from "../src/server.ts";
+import {
+  createNativeBackend,
+  generateTaskJudgment,
+  type NativeBackendHost,
+} from "../src/server.ts";
 import {
   CoordinatorOwnership,
   createObserverCapability,
 } from "../src/ownership.ts";
 import { createHash } from "node:crypto";
-import type { DecisionIdentity, NativeEvidenceRef } from "../src/evaluator.ts";
+import type {
+  DecisionIdentity,
+  NativeEvidenceRef,
+  StrictValidationResult,
+} from "../src/evaluator.ts";
 import { coordinatorDefinition } from "./host.ts";
 import { reasoningPayload, type ValidateInput } from "../src/rpc.ts";
 import type {
@@ -25,6 +33,10 @@ import type {
   SessionMessageToolStateCompleted,
 } from "@opencode/client";
 
+const observerScope = {
+  dataDir: "/projects/coordinator",
+  coordinatorLocation: "/projects/coordinator",
+};
 function nativeFixture() {
   const inputs: unknown[] = [];
   const asks: unknown[] = [];
@@ -225,9 +237,9 @@ async function validationFixture(completion = false) {
   const f = nativeFixture();
   if (completion) {
     const generate = f.host.generate;
-    f.host.generate = async (context, request) =>
+    f.host.generate = async (context, request, location) =>
       request
-        ? generate(context, request)
+        ? generate(context, request, location)
         : {
             taskID: task.id,
             workerID: task.workerID,
@@ -276,7 +288,7 @@ async function validationFixture(completion = false) {
     };
   };
   const observed = {
-    home: "/projects/coordinator",
+    dataDir: "/projects/coordinator",
     location: task.location,
     sessionID: task.workerID,
     incarnation: "worker-incarnation",
@@ -289,34 +301,39 @@ async function validationFixture(completion = false) {
     publishedAt: Date.now(),
   };
   f.extras.set(
-    `home:${encodeURIComponent(observed.home)}:worker:${encodeURIComponent(task.location)}:observer`,
+    `store:${encodeURIComponent(observed.dataDir)}:worker:${encodeURIComponent(task.location)}:observer`,
     { incarnation: observed.incarnation, usable: true },
   );
   f.extras.set(
-    `home:${encodeURIComponent(observed.home)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:snapshot`,
+    `store:${encodeURIComponent(observed.dataDir)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:snapshot`,
     observed,
   );
   await backend.control({
     operation: "resume",
     taskID: task.id,
-    proof: capability.sign(attached.generation, 1, {
-      operation: "resume",
-      taskID: task.id,
-      revision: 1,
-      epoch: 1,
-      body: {
-        reconciliation: {
-          generation: attached.generation,
-          workerID: task.workerID,
-          revision: 1,
-          epoch: 1,
-          snapshotFingerprint: hash(observed),
-          observedAt: Date.now(),
-          state: "settled",
-          asks: [],
+    proof: capability.sign(
+      attached.generation,
+      1,
+      {
+        operation: "resume",
+        taskID: task.id,
+        revision: 1,
+        epoch: 1,
+        body: {
+          reconciliation: {
+            generation: attached.generation,
+            workerID: task.workerID,
+            revision: 1,
+            epoch: 1,
+            snapshotFingerprint: hash(observed),
+            observedAt: Date.now(),
+            state: "settled",
+            asks: [],
+          },
         },
       },
-    }),
+      observerScope,
+    ),
   });
   const suggestInput = {
     taskID: task.id,
@@ -331,6 +348,7 @@ async function validationFixture(completion = false) {
       attached.generation,
       2,
       reasoningPayload("suggest", suggestInput),
+      observerScope,
     ),
   });
   const suggestion = result.suggestion!;
@@ -366,6 +384,7 @@ async function validationFixture(completion = false) {
           attached.generation,
           ++sequence,
           reasoningPayload("validate", input),
+          observerScope,
         ),
       };
     },
@@ -405,6 +424,159 @@ const snapshot: SharedSnapshot = {
 const maxChars = 10_000;
 const ready = (result: ContextResult | undefined) =>
   result?.status === "ready" ? result.context : undefined;
+
+// spec: openspec/specs/worker-supervision/spec.md
+describe("Native-default background evaluation", () => {
+  const judgmentFixture = (
+    failure?: "missing" | "mismatched" | "lookup" | "generation",
+  ) => {
+    const calls: unknown[] = [];
+    const host = {
+      model: {
+        async default(input: unknown) {
+          calls.push({ lookup: input });
+          if (failure === "lookup")
+            throw new Error("Default lookup unavailable");
+          return {
+            location: {
+              directory:
+                failure === "mismatched"
+                  ? "/other/project"
+                  : "/projects/conversation",
+            },
+            data:
+              failure === "missing"
+                ? null
+                : { providerID: "native-provider", id: "configured-default" },
+          };
+        },
+      },
+      experimental: {
+        generate: {
+          async text(input: unknown) {
+            calls.push({ generation: input });
+            if (failure === "generation")
+              throw new Error("Generation unavailable");
+            return {
+              text: JSON.stringify({
+                status: "unknown",
+                rationale: "No evidence",
+              }),
+            };
+          },
+        },
+      },
+    } as unknown as Parameters<typeof generateTaskJudgment>[0];
+    return { host, calls };
+  };
+
+  it("Uses the coordinator-project native default", async () => {
+    const context = ready(buildContext(task, evidence, [], maxChars));
+    if (!context) throw new Error("Expected task-only context");
+    const f = judgmentFixture();
+    expect(
+      await generateTaskJudgment(f.host, "/projects/conversation", context),
+    ).toEqual({ status: "unknown", rationale: "No evidence" });
+    expect(f.calls).toEqual([
+      { lookup: { location: { directory: "/projects/conversation" } } },
+      {
+        generation: {
+          model: { providerID: "native-provider", id: "configured-default" },
+          prompt: expect.stringContaining(task.goal),
+        },
+      },
+    ]);
+    expect(JSON.stringify(f.calls)).not.toContain("Unrelated billing details");
+  });
+
+  it("Holds unavailable default-model evaluation", async () => {
+    const context = ready(buildContext(task, evidence, [], maxChars));
+    if (!context) throw new Error("Expected task-only context");
+    for (const failure of [
+      "missing",
+      "mismatched",
+      "lookup",
+      "generation",
+    ] as const) {
+      const f = judgmentFixture(failure);
+      await expect(
+        generateTaskJudgment(f.host, "/projects/conversation", context),
+      ).rejects.toThrow();
+      expect(f.calls).toHaveLength(failure === "generation" ? 2 : 1);
+    }
+    const judgments: string[] = [];
+    for (const operation of ["suggest", "validate"] as const) {
+      const f = await validationFixture();
+      try {
+        const get = f.host.session.get;
+        let directory = observerScope.coordinatorLocation;
+        f.host.session.get = async (input) => ({
+          ...(await get(input)),
+          ...(input.sessionID === "coordinator"
+            ? { location: { directory } }
+            : {}),
+        });
+        const generate = f.host.generate;
+        let entered!: () => void, release!: () => void;
+        const ready = new Promise<void>((done) => {
+          entered = done;
+        });
+        const wait = new Promise<void>((done) => {
+          release = done;
+        });
+        f.host.generate = async (context, validation, location) => {
+          entered();
+          await wait;
+          return generate(context, validation, location);
+        };
+        const suggestionInput = {
+          taskID: task.id,
+          revision: 1,
+          epoch: 2,
+          generation: f.generation,
+          evidence: { ...nativeEvidence, turn: 8 },
+        };
+        const pending =
+          operation === "validate"
+            ? f.backend.validate(
+                f.signValidation({
+                  generation: f.generation,
+                  identity: f.identity,
+                  evidence: nativeEvidence,
+                  suggestion: f.suggestion,
+                }),
+              )
+            : f.backend.suggest({
+                ...suggestionInput,
+                proof: f.capability.sign(
+                  f.generation,
+                  3,
+                  reasoningPayload("suggest", suggestionInput),
+                  observerScope,
+                ),
+              });
+        await ready;
+        directory = "/projects/relocated-during-generation";
+        release();
+        if (operation === "validate")
+          judgments.push(((await pending) as StrictValidationResult).status);
+        else
+          judgments.push(
+            await pending.then(
+              () => "published",
+              (error) =>
+                String(error).includes("Observer authority")
+                  ? "held"
+                  : String(error),
+            ),
+          );
+      } finally {
+        await f.backend.dispose();
+      }
+    }
+    expect(judgments).toEqual(["held", "unknown"]);
+  });
+});
 
 // spec: openspec/specs/task-context/spec.md
 describe("Task-scoped evaluation inputs", () => {
@@ -482,17 +654,25 @@ describe("Task-scoped evaluation inputs", () => {
       await completed.backend.control({
         operation: "record",
         taskID: task.id,
-        proof: completed.capability.sign(completed.generation, 4, {
-          operation: "record",
-          taskID: task.id,
-          revision: 1,
-          epoch: 2,
-          body: {
-            result: { status: "complete", reason: "Native criteria accepted" },
-            receiptID: receipt.receiptID,
-            identity: receipt.identity,
+        proof: completed.capability.sign(
+          completed.generation,
+          4,
+          {
+            operation: "record",
+            taskID: task.id,
+            revision: 1,
+            epoch: 2,
+            body: {
+              result: {
+                status: "complete",
+                reason: "Native criteria accepted",
+              },
+              receiptID: receipt.receiptID,
+              identity: receipt.identity,
+            },
           },
-        }),
+          observerScope,
+        ),
       });
       const durable = parseCoordinatorState(completed.root());
       expect(durable.completions[0]?.evidence.native).toEqual([nativeRef]);
@@ -573,14 +753,21 @@ describe("Task-scoped evaluation inputs", () => {
     const unknownIntent = JSON.parse(JSON.stringify(root));
     unknownIntent.intents[0].unexpected = "Not part of the stored wrapper";
     expect(() => parseCoordinatorState(unknownIntent)).toThrow();
+    const storedObserver = {
+      ...observerScope,
+      coordinatorID: "coordinator",
+      verifier: createObserverCapability().verifier,
+      generation: 1,
+      sequence: 0,
+    };
+    expect(
+      parseCoordinatorState({ ...root, observer: storedObserver }).observer,
+    ).toEqual(storedObserver);
     expect(() =>
       parseCoordinatorState({
         ...root,
         observer: {
-          coordinatorID: "coordinator",
-          verifier: createObserverCapability().verifier,
-          generation: 1,
-          sequence: 0,
+          ...storedObserver,
           unexpected: "Not part of the observer schema",
         },
       }),
@@ -672,6 +859,7 @@ describe("Task-scoped evaluation inputs", () => {
           budget.generation,
           n + 4,
           reasoningPayload("suggest", input),
+          observerScope,
         ),
       });
     });
@@ -719,6 +907,7 @@ describe("Task-scoped evaluation inputs", () => {
         possession.generation,
         3,
         reasoningPayload("suggest", input),
+        observerScope,
       );
       await expect(
         possession.backend.suggest({ ...input, proof }),
@@ -736,6 +925,7 @@ describe("Task-scoped evaluation inputs", () => {
           possession.generation,
           3,
           reasoningPayload("validate", validation),
+          observerScope,
         ),
       });
       expect(denied.status).toBe("unknown");
@@ -747,7 +937,7 @@ describe("Task-scoped evaluation inputs", () => {
     try {
       stale.host.generate = async () => {
         stale.extras.set(
-          `home:${encodeURIComponent(stale.observed.home)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:invalidation`,
+          `store:${encodeURIComponent(stale.observed.dataDir)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:invalidation`,
           1,
         );
         return stale.suggestion;
@@ -765,6 +955,7 @@ describe("Task-scoped evaluation inputs", () => {
           stale.generation,
           3,
           reasoningPayload("suggest", input),
+          observerScope,
         ),
       });
       expect(result.suggestion).toBeUndefined();
@@ -828,7 +1019,7 @@ async function assertNativeWorkerTextProvenance() {
     assistant.content.push({ type: "text", text });
     f.host.session.context = async () => structuredClone(messages);
     f.extras.set(
-      `home:${encodeURIComponent(f.observed.home)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:snapshot`,
+      `store:${encodeURIComponent(f.observed.dataDir)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:snapshot`,
       { ...f.observed, contextFingerprint: hash(messages) },
     );
     const entry = { id: "message-7:text:1", kind: "worker" as const, text };
@@ -850,6 +1041,7 @@ async function assertNativeWorkerTextProvenance() {
           f.generation,
           ++sequence,
           reasoningPayload("suggest", input),
+          observerScope,
         ),
       };
     };
@@ -896,7 +1088,7 @@ describe("Evidence has no control authority", () => {
     expect(context?.framing).toContain("never approval or control authority");
     expect(context).not.toHaveProperty("approval");
     for (const boundary of [
-      "wrong-location",
+      "mismatched-catalog-location",
       "worker-identity",
       "deny",
     ] as const) {
@@ -906,7 +1098,13 @@ describe("Evidence has no control authority", () => {
         fixture.ownership,
         "/projects/coordinator",
       );
-      if (boundary === "wrong-location") fixture.location("/projects/other");
+      if (boundary === "mismatched-catalog-location") {
+        fixture.location("/projects/other");
+        fixture.host.agent.list = async () => ({
+          location: { directory: "/projects/coordinator" },
+          data: [coordinatorDefinition],
+        });
+      }
       if (boundary === "deny") fixture.deny();
       const before = structuredClone(fixture.root());
       await expect(
@@ -954,7 +1152,7 @@ describe("Evidence has no control authority", () => {
         identity.suggestionFingerprint = hash("false");
       if (changed === "invalidation")
         f.extras.set(
-          `home:${encodeURIComponent(f.observed.home)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:invalidation`,
+          `store:${encodeURIComponent(f.observed.dataDir)}:worker:${encodeURIComponent(task.location)}:${encodeURIComponent(task.workerID)}:invalidation`,
           1,
         );
       const result = await f.backend.validate(

@@ -178,7 +178,7 @@ export interface NativeCoordinatorProof {
   home: string;
   workerHome: string;
   runtime: { app: string; bun: string };
-  passive?: unknown;
+  workerBootstrap?: unknown;
   denied?: boolean;
   observation?: unknown;
   snapshot?: unknown;
@@ -251,9 +251,10 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
     await completed;return admitted;
   };
   queueMicrotask(async()=>{try{
-    proof.passive=await rpc.inspect({},{location:{directory:o.workerHome},signal});
-    if(proof.passive.authority!=="passive"||proof.passive.home!==o.home)throw new Error("Worker location did not bootstrap product passive observer");
+     proof.workerBootstrap=await rpc.bootstrap({},{location:{directory:o.workerHome},signal});
+     if(proof.workerBootstrap.dataDir!==o.dataDir||Object.keys(proof.workerBootstrap).some(key=>!["dataDir","authority","reason"].includes(key)))throw new Error("Worker bootstrap disclosed unexpected authority state");
     const agents=await client.agent.list({location:{directory:o.workerHome}},{signal});
+    if(!agents.data.some(value=>value.id==="conman-coordinator"&&value.mode==="primary"&&!value.hidden))throw new Error("Bundled coordinator unavailable in second enabled project");
     const agent=agents.data.find(a=>!a.hidden&&a.mode!=="subagent");
     if(agents.location.directory!==o.workerHome||!agent)throw new Error("Native target agent unavailable");
     const coordinators=await client.agent.list({location:{directory:o.home}},{signal});
@@ -263,33 +264,46 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
     const worker=await client.session.create({title:"Owned worker",agent:agent.id,location:{directory:o.workerHome}},{signal});
     const capability=createObserverCapability();
     const attachRequest={coordinatorID:coordinator.id,verifier:capability.verifier};
-    const resources=[JSON.stringify([o.home,coordinator.id,capability.verifier,1])];
+     const scopedResource=value=>JSON.stringify([o.dataDir,o.home,coordinator.id,JSON.stringify(value)]);
+     const observerScope={dataDir:o.dataDir,coordinatorLocation:o.home};
+     const resources=[scopedResource([o.dataDir,coordinator.id,capability.verifier,1])];
     record("attach-denial");
     const denied={sessionID:coordinator.id,action:"conman.attach",resources,decision:"reject"};expected=denied;
     let denialError;
     try{await rpc.attach(attachRequest,{location:{directory:o.home},signal})}catch(error){denialError=error;}
     if(!denied.asked||!denialError)throw new Error("Native denial did not reject attach");
-    const afterDenial=await rpc.inspect({},{location:{directory:o.home},signal});
-    if(afterDenial.observer)throw new Error("Denied attach persisted observer authority");
+    const afterDenial=await rpc.bootstrap({},{location:{directory:o.home},signal});
+    if(Object.keys(afterDenial).some(key=>!["dataDir","authority","reason"].includes(key)))throw new Error("Bootstrap disclosed observer authority");
+    let unsignedRead;
+    try {await rpc.inspect({},{location:{directory:o.home},signal}); unsignedRead=true;} catch {unsignedRead=false;}
+     if(unsignedRead)throw new Error("Unsigned inventory read was accepted");
+     let unapprovedError;
+     try {await rpc.inspect({proof:capability.sign(1,1,{operation:"inspect",taskID:coordinator.id,revision:0,epoch:0},observerScope)},{location:{directory:o.home},signal});} catch(error) {unapprovedError=error;}
+     // Native RPC hides internal exception text; a schema-valid proof must reach the server rejection boundary.
+     if(unapprovedError?.type!=="rpc.internal"||unapprovedError.message!=="RPC call failed")throw new Error("Denied capability was not rejected by the server");
     proof.denied=true;
     record("attach-approval");
     const approved={sessionID:coordinator.id,action:"conman.attach",resources,decision:"once"};expected=approved;
     generation=(await rpc.attach(attachRequest,{location:{directory:o.home},signal})).generation;
     if(!approved.asked)throw new Error("Attach bypassed scripted native approval");
+     const inspect=()=>rpc.inspect({proof:capability.sign(generation,++sequence,{operation:"inspect",taskID:coordinator.id,revision:0,epoch:0},observerScope)},{location:{directory:o.workerHome},signal});
+    const observe=()=>rpc.observe({taskID:goal.id,workerID:worker.id,proof:capability.sign(generation,++sequence,{operation:"observe",taskID:goal.id,revision:binding.revision,epoch:binding.epoch,body:{workerID:worker.id}},observerScope)},{location:{directory:o.home},signal});
     const goal={id:"owned-seed-task",title:"Inspect owned seed",goal:"Read the owned seed file",criteria:["Owned seed contents inspected by native read"],
       constraints:["Read only the owned seed file; no external requests"],scope:[o.seed],location:o.workerHome,agent:agent.id};
     const control=async(operation,body,zero=false)=>rpc.control({operation,taskID:goal.id,proof:capability.sign(generation,++sequence,
-      {operation,taskID:goal.id,revision:zero?0:binding.revision,epoch:zero?0:binding.epoch,body})},{location:{directory:o.home},signal});
+       {operation,taskID:goal.id,revision:zero?0:binding.revision,epoch:zero?0:binding.epoch,body},observerScope)},{location:{directory:o.home},signal});
     record("adopt");
-    const adoption={sessionID:coordinator.id,action:"conman.adopt",resources:[JSON.stringify([o.home,goal,worker.id])],decision:"once"};expected=adoption;
+     const adoption={sessionID:coordinator.id,action:"conman.adopt",resources:[scopedResource([o.dataDir,goal,worker.id])],decision:"once"};expected=adoption;
     const adopted=await control("adopt",{goal,workerID:worker.id},true);
     binding=adopted.snapshot.bindings[0];
-    if(!adoption.asked||!adopted.accepted||binding.workerID!==worker.id||binding.location!==o.workerHome)throw new Error("Approved native adoption did not bind owned worker");
+     if(!adoption.asked||!adopted.accepted||binding.workerID!==worker.id||binding.location!==o.workerHome)throw new Error("Approved native adoption did not bind owned worker");
+     const shared=await inspect();
+     if(shared.dataDir!==o.dataDir||JSON.stringify(shared.bindings[0])!==JSON.stringify(binding))throw new Error("Projects did not share the approved store");
     record("worker-read");await run(worker.id,"Read only this owned seed file: "+o.seed);
     record("observe");
-     let observed=await rpc.observe({taskID:goal.id,workerID:worker.id},{location:{directory:o.home},signal});
+      let observed=await observe();
     if(!observed.snapshot)throw new Error("Product worker observation unavailable: "+observed.reason);
-    proof.passiveSnapshot=observed.snapshot;
+     proof.workerSnapshot=observed.snapshot;
     const page=await client.message.list({sessionID:worker.id,limit:200,order:"asc"},{signal});
     proof.historyMetadata={count:page.data.length,hasNext:!!page.cursor.next,hasPrevious:!!page.cursor.previous,types:page.data.map(message=>message.type),
       tools:page.data.flatMap(message=>message.type==="assistant"?message.content.filter(part=>part.type==="tool").map(part=>({messageID:message.id,callID:part.id,name:part.name,status:part.state.status,executed:part.executed,time:part.time,input:part.state.input,result:part.state.content})):[])};
@@ -330,11 +344,11 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
          throw new Error("Resume native reconciliation changed around approval");
      };
      await verifyResume();
-     const resume={sessionID:coordinator.id,action:"conman.resume",resources:[JSON.stringify([o.home,binding.id,binding.revision,binding.epoch,resumeBody])],decision:"once",verify:verifyResume};expected=resume;
+       const resume={sessionID:coordinator.id,action:"conman.resume",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,resumeBody])],decision:"once",verify:verifyResume};expected=resume;
      const resumed=await control("resume",resumeBody,false);
     if(!resume.asked||!resumed.accepted)throw new Error("Native resume was not explicitly approved");
      binding=resumed.snapshot.bindings[0];
-     observed=await rpc.observe({taskID:goal.id,workerID:worker.id},{location:{directory:o.home},signal});
+      observed=await observe();
      observation=await readNativeObservation(client,binding,[],signal,observed.snapshot);
      if(observation.state!=="settled"||observation.asks.length||fingerprint(observed.snapshot)!==reconciliation.snapshotFingerprint)throw new Error("Native resume eligibility changed");
     const entries=observation.context.evidence;
@@ -347,14 +361,14 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
     const evidence={taskID:goal.id,workerID:worker.id,turn:observation.turn,entries};
     record("suggest");
      const suggestInput={taskID:goal.id,revision:binding.revision,epoch:binding.epoch,generation,evidence};
-     const issued=await rpc.suggest({...suggestInput,proof:capability.sign(generation,++sequence,reasoningPayload("suggest",suggestInput))},{location:{directory:o.home},signal});
+      const issued=await rpc.suggest({...suggestInput,proof:capability.sign(generation,++sequence,reasoningPayload("suggest",suggestInput),observerScope)},{location:{directory:o.home},signal});
     if(!issued.suggestion||issued.suggestion.action!==o.action)throw new Error("Product did not issue expected task-only suggestion: "+issued.reason);
     const identity=decisionIdentity(binding,generation,evidence,observed.snapshot,issued.suggestion);
      const validateInput={generation,identity,evidence,suggestion:issued.suggestion};
-     record("validate");proof.validation=await rpc.validate({...validateInput,proof:capability.sign(generation,++sequence,reasoningPayload("validate",validateInput))},{location:{directory:o.home},signal});
+      record("validate");proof.validation=await rpc.validate({...validateInput,proof:capability.sign(generation,++sequence,reasoningPayload("validate",validateInput),observerScope)},{location:{directory:o.home},signal});
     if(proof.validation.status!=="accept"){
-      proof.validationState=await rpc.inspect({},{location:{directory:o.home},signal});
-      proof.validationObserved=await rpc.observe({taskID:goal.id,workerID:worker.id},{location:{directory:o.home},signal});
+       proof.validationState=await inspect();
+       proof.validationObserved=await observe();
       proof.validationIdentity=identity;
       throw new Error("Product validation did not accept inspected evidence: "+proof.validation.rationale);
     }
@@ -624,6 +638,7 @@ export async function captureNativeCoordinator(
       nativeFlowDriver({
         action,
         home,
+        dataDir: join(home, "conman-state"),
         workerHome,
         seed,
         seedContent,
@@ -642,7 +657,10 @@ export async function captureNativeCoordinator(
         },
       },
       plugins: [
-        { package: resolve(import.meta.dir, ".."), options: { home } },
+        {
+          package: resolve(import.meta.dir, ".."),
+          options: { dataDir: join(home, "conman-state") },
+        },
         { package: probe },
       ],
     };
@@ -901,16 +919,18 @@ import product from ${JSON.stringify(new URL("../src/server.ts", import.meta.url
 import {coordinatorAgent} from ${JSON.stringify(new URL("../src/coordinator-agent.ts", import.meta.url).href)};
 import {ConmanRpc} from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
 export default Plugin.define({id:"conman",async setup(ctx){
-  const close=await product.setup({...ctx,options:{home:${JSON.stringify(home)}}});
+  const close=await product.setup({...ctx,options:{}});
+  let attachmentRequests=0;
+  await ctx.permission.hook("evaluate",event=>{if(event.action==="conman.attach")attachmentRequests++;});
   await ctx.session.hook("title",event=>{event.result="Owned coordination conversation"});
   await ctx.session.hook("context",async event=>{
     const session=await ctx.session.get({sessionID:event.sessionID});
     const history=await ctx.session.context({sessionID:event.sessionID});
-    const snapshot=await ctx.rpc(ConmanRpc).inspect({});
+    const metadata=await ctx.rpc(ConmanRpc).bootstrap({});
     const catalog=await ctx.agent.list();
     writeFileSync(${JSON.stringify(proofPath)},JSON.stringify({agent:event.agent,sessionAgent:session.agent,
       permissions:catalog.data.find(agent=>agent.id===coordinatorAgent.id)?.permissions,
-      attached:!!snapshot.observer,userMessages:history.filter(message=>message.type==="user").map(message=>message.text),
+      attachmentRequests,bootstrapKeys:Object.keys(metadata),userMessages:history.filter(message=>message.type==="user").map(message=>message.text),
       tools:Object.keys(event.tools),instructions:event.system.some(part=>part.type==="text"&&part.text.includes(coordinatorAgent.system))}));
     throw new Error("Native entry verified before model transport");
   });
@@ -1038,7 +1058,8 @@ export default Plugin.define({id:"conman",async setup(ctx){
           sessionAgent: string;
           tools: string[];
           instructions: boolean;
-          attached: boolean;
+          attachmentRequests: number;
+          bootstrapKeys: string[];
           userMessages: string[];
         }>(proofPath, (value) => !!value.sessionAgent);
         return { frame, entry, terminal };

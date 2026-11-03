@@ -255,6 +255,7 @@ export function coordinationStatusDetails(
   reason: string,
   width: number,
   nativeStatus: Readonly<Record<string, "needs-input" | "running">> = {},
+  inventoryAvailable = true,
 ): { title: string; options: readonly UiOption<number>[] } {
   return textDetails(
     "Status (read only)",
@@ -268,7 +269,11 @@ export function coordinationStatusDetails(
         `Agent: ${display(task.agent)}`,
         `Status: ${nativeStatus[task.workerID] ?? task.status}`,
       ]),
-      ...(!tasks.length ? ["No workers available"] : []),
+      ...(!inventoryAvailable
+        ? ["Worker inventory unavailable until attachment"]
+        : !tasks.length
+          ? ["No workers available"]
+          : []),
     ],
     width,
   );

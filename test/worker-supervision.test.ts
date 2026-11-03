@@ -120,7 +120,7 @@ async function observerFixture() {
     },
   };
   const home = "/project/coordinator";
-  const root = `home:${encodeURIComponent(home)}:state`;
+  const root = "coordinator:state";
   const task = fixture().task;
   values.set(root, {
     version: 1,
@@ -213,19 +213,25 @@ async function completionFixture(
     verifier: capability.verifier,
   });
   const held = (await f.backend.inspect()).bindings[0]!;
+  const observerScope = (await f.backend.inspect()).observer!;
   let sequence = 0;
   const signControl = (
     operation: ControlOperation,
     body: ControlBody,
     binding: WorkerBinding,
   ) =>
-    capability.sign(generation, ++sequence, {
-      operation,
-      taskID: binding.id,
-      revision: binding.revision,
-      epoch: binding.epoch,
-      body,
-    });
+    capability.sign(
+      generation,
+      ++sequence,
+      {
+        operation,
+        taskID: binding.id,
+        revision: binding.revision,
+        epoch: binding.epoch,
+        body,
+      },
+      observerScope,
+    );
   const call = {
     type: "tool" as const,
     id: "native-call",
@@ -334,6 +340,7 @@ async function completionFixture(
         generation,
         ++sequence,
         reasoningPayload("suggest", suggestionInput),
+        observerScope,
       ),
     })
   ).suggestion!;
@@ -362,6 +369,7 @@ async function completionFixture(
           generation,
           ++sequence,
           reasoningPayload("validate", input),
+          observerScope,
         ),
       });
     },
@@ -903,6 +911,52 @@ describe("Native TUI-owned worker supervision", () => {
     }
   });
   it("Defers background work and holds abnormal termination", async () => {
+    const overflowAvailability: boolean[] = [];
+    for (const [count, size] of [
+      [1, 100_000],
+      [30, 50_000],
+    ]) {
+      const n = await observerFixture();
+      try {
+        await n.observer.idle({ sessionID: "worker", background: [] });
+        const storage = n.host.storage;
+        let enter!: () => void, finish!: () => void;
+        const entered = new Promise<void>((resolve) => {
+          enter = resolve;
+        });
+        const waiting = new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        let paused = false;
+        n.host.storage = {
+          ...storage,
+          get: async (key) => {
+            if (!paused) {
+              paused = true;
+              enter();
+              await waiting;
+            }
+            return storage.get(key);
+          },
+        };
+        const work = Array.from({ length: count! }, (_, index) =>
+          n.observer.event({
+            id: `evt_overflow_${index}`,
+            created: index + 10,
+            type: "plugin.updated",
+            location: { directory: `/${"x".repeat(size!)}` },
+            data: {},
+          }),
+        );
+        await entered;
+        finish();
+        await Promise.all(work);
+        overflowAvailability.push(!!(await n.read()).snapshot);
+      } finally {
+        await n.cleanup();
+      }
+    }
+    expect(overflowAvailability).toEqual([false, false]);
     for (const state of [
       "running",
       "background",
@@ -1645,6 +1699,10 @@ describe("Native TUI-owned worker supervision", () => {
         ),
       });
       expect(recorded.accepted).toBe(true);
+      if (!recorded.snapshot)
+        throw new Error(
+          "Current eligible coordinator must receive the completion inventory",
+        );
       expect(recorded.snapshot.bindings[0]?.status).toBe("complete");
       expect(recorded.snapshot.completions[0]).toMatchObject({
         validation: {

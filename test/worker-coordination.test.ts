@@ -1,7 +1,10 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { ConmanRpc } from "../src/rpc.ts";
+import { openSharedStorage, resolveDataDirectory } from "../src/storage.ts";
 import { coordinatorAgent } from "../src/coordinator-agent.ts";
 import * as subprocess from "node:child_process";
+import * as ownershipModule from "../src/ownership.ts";
+import * as filesystem from "node:fs/promises";
 import {
   chmod,
   link,
@@ -28,13 +31,14 @@ import {
 import { creationHost, goal, coordinatorDefinition } from "./host.ts";
 import {
   CoordinatorOwnership,
+  acquireCoordinatorCore,
   ObserverAuthority,
   createFilesystemOwnershipPort,
   createObserverCapability,
   forceNativeAsk,
-  registerServiceHome,
   type LockInspection,
   type ObserverRecord,
+  type SignedControl,
   type OwnershipPort,
 } from "../src/ownership.ts";
 import nativePlugin, {
@@ -48,37 +52,296 @@ import type { AgentEditor } from "@opencode/plugin/promise/agent";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 
 type NativeAgent = NonNullable<ReturnType<AgentEditor["get"]>>;
+const observerScope = {
+  dataDir: "/projects/home",
+  coordinatorLocation: "/projects/home",
+};
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Shared durable coordination store", () => {
+  it("Shares an XDG-backed store across projects", async () => {
+    expect(
+      resolveDataDirectory({}, { home: "/users/example", XDG_DATA_HOME: "" }),
+    ).toBe("/users/example/.local/share/opencode-conman");
+    expect(resolveDataDirectory({}, { home: "/users/example" })).toBe(
+      "/users/example/.local/share/opencode-conman",
+    );
+    expect(
+      resolveDataDirectory(
+        {},
+        { home: "/users/example", XDG_DATA_HOME: "/data" },
+      ),
+    ).toBe("/data/opencode-conman");
+    expect(
+      resolveDataDirectory(
+        {},
+        { home: "/users/example", XDG_DATA_HOME: "relative" },
+      ),
+    ).toBe("/users/example/.local/share/opencode-conman");
+    expect(
+      resolveDataDirectory(
+        { dataDir: "/custom/store" },
+        { home: "/users/example", XDG_DATA_HOME: "/data" },
+      ),
+    ).toBe("/custom/store");
+    const root = resolve(".opencode/conman");
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const fixture = await mkdtemp(`${root}/shared-store-`);
+    const directory = `${fixture}/data`;
+    try {
+      const first = await openSharedStorage(directory);
+      try {
+        expect(await first.get("task")).toBeUndefined();
+        await first.set("task", {
+          location: "/projects/one",
+          followUps: 2,
+          uncertain: true,
+        });
+        expect((await stat(directory)).mode & 0o777).toBe(0o700);
+        expect((await stat(`${directory}/state.json`)).mode & 0o777).toBe(
+          0o600,
+        );
+      } finally {
+        await first.close();
+      }
+      const second = await openSharedStorage(directory);
+      try {
+        expect(await second.get("task")).toEqual({
+          location: "/projects/one",
+          followUps: 2,
+          uncertain: true,
+        });
+      } finally {
+        await second.close();
+      }
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("Holds unsafe or corrupt shared storage", async () => {
+    for (const dataDir of ["", "relative/store"]) {
+      const project = await registeredCoordinator(false, undefined, dataDir);
+      try {
+        expect(project.setupError).toBeUndefined();
+        expect(project.catalog.has(coordinatorAgent.id)).toBe(true);
+        const metadata = await project.rpc.bootstrap();
+        expect(metadata).toMatchObject({ authority: "held" });
+        expect(metadata).not.toHaveProperty("dataDir");
+        expect(metadata.reason).toContain("absolute");
+        expect(
+          ConmanRpc.methods.bootstrap.output["~standard"].validate(metadata),
+        ).toEqual({ value: metadata });
+      } finally {
+        await project.close();
+      }
+    }
+    {
+      const directory = await mkdtemp(
+        resolve(".opencode/conman/unsafe-registration-"),
+      );
+      await chmod(directory, 0o755);
+      const project = await registeredCoordinator(false, undefined, directory);
+      try {
+        expect(project.setupError).toBeUndefined();
+        expect(project.catalog.has(coordinatorAgent.id)).toBe(true);
+        expect((await project.rpc.bootstrap()).authority).toBe("held");
+        expect(
+          await readFile(`${directory}/state.json`, "utf8").catch(
+            () => undefined,
+          ),
+        ).toBeUndefined();
+      } finally {
+        await project.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+    {
+      const directory = await mkdtemp(
+        resolve(".opencode/conman/held-registration-"),
+      );
+      const owner = new CoordinatorOwnership(
+        directory,
+        "existing-owner",
+        createFilesystemOwnershipPort(async () => {}),
+      );
+      expect(await owner.claim()).toBe("owned");
+      const project = await registeredCoordinator(false, undefined, directory);
+      try {
+        expect(project.setupError).toBeUndefined();
+        expect(project.catalog.has(coordinatorAgent.id)).toBe(true);
+        expect((await project.rpc.bootstrap()).authority).toBe("held");
+        expect(
+          await readFile(`${directory}/state.json`, "utf8").catch(
+            () => undefined,
+          ),
+        ).toBeUndefined();
+      } finally {
+        await project.close();
+        await owner.dispose(async () => {});
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+    for (const dataDir of ["", "relative/store"])
+      expect(() =>
+        resolveDataDirectory({ dataDir }, { home: "/users/example" }),
+      ).toThrow("absolute");
+    const root = resolve(".opencode/conman");
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const fixture = await mkdtemp(`${root}/unsafe-store-`);
+    try {
+      for (const failure of [
+        "corrupt",
+        "missing",
+        "symlink",
+        "hardlink",
+        "mode",
+        "directory",
+        "interrupted",
+      ] as const) {
+        const directory = `${fixture}/${failure}`;
+        const storage = await openSharedStorage(directory);
+        await storage.set("limits", { followUps: 2 });
+        await storage.close();
+        const file = `${directory}/state.json`;
+        if (failure === "corrupt") await writeFile(file, "{broken");
+        if (failure === "missing" || failure === "symlink") await rm(file);
+        if (failure === "symlink") {
+          await writeFile(`${fixture}/target`, "unchanged");
+          await symlink(`${fixture}/target`, file);
+        }
+        if (failure === "hardlink") await link(file, `${fixture}/linked-state`);
+        if (failure === "mode") await chmod(file, 0o644);
+        if (failure === "directory") await chmod(directory, 0o755);
+        if (failure === "interrupted")
+          await writeFile(`${directory}/.publish-interrupted`, "unfinished", {
+            mode: 0o600,
+          });
+        await expect(openSharedStorage(directory)).rejects.toThrow();
+        if (failure === "symlink")
+          expect(await readFile(`${fixture}/target`, "utf8")).toBe("unchanged");
+      }
+      const nativeOpen = filesystem.open;
+      const opened = spyOn(filesystem, "open").mockImplementation(
+        async (...args) => {
+          const file = await nativeOpen(...args);
+          if (
+            (await file.stat()).isDirectory() &&
+            (await filesystem.realpath(`/proc/self/fd/${file.fd}`)) === fixture
+          )
+            spyOn(file, "sync").mockRejectedValue(
+              new Error("Parent directory synchronization failed"),
+            );
+          return file;
+        },
+      );
+      try {
+        for (let attempt = 0; attempt < 2; attempt++)
+          await expect(
+            openSharedStorage(`${fixture}/parent-sync`),
+          ).rejects.toThrow("Parent directory synchronization failed");
+      } finally {
+        opened.mockRestore();
+      }
+      for (const [index, value] of [
+        "a".repeat(32 * 1024 * 1024),
+        { invalid: undefined },
+        { number: Number.NaN },
+        Array.from({ length: 80 }).reduce<unknown>((value) => [value], null),
+      ].entries()) {
+        const storage = await openSharedStorage(`${fixture}/bounded-${index}`);
+        try {
+          await expect(storage.set("oversized", value)).rejects.toThrow();
+        } finally {
+          await storage.close();
+        }
+      }
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+});
 async function registeredCoordinator(
   passive = false,
   configured?: NativeAgent,
+  dataDir?: string,
+  sessions = new Map<string, string>(),
+  faults: {
+    failHook?: string;
+    ask?: () => Promise<void>;
+    catalog?: () => Promise<void>;
+    get?: () => Promise<void>;
+    hook?: (name: string) => Promise<void>;
+    stream?: () => AsyncIterable<never>;
+  } = {},
 ) {
   const root = resolve(".opencode/conman");
   await mkdir(root, { recursive: true, mode: 0o700 });
   const home = await mkdtemp(`${root}/agent-test-`);
   const worker = `${home}/worker`;
   await mkdir(worker);
+  sessions.set(home, passive ? worker : home);
   const catalog = new Map<string, NativeAgent>(
     configured ? [[configured.id, structuredClone(configured)]] : [],
   );
   const values = new Map<string, unknown>();
   const defaults: unknown[] = [];
+  const disposedHooks: string[] = [];
   let transforms = 0,
     disposed = 0;
   let replay: (() => void) | undefined;
   let contextHook: ((event: SessionContext) => Promise<void>) | undefined;
   let failCatalog = false;
+  let nativeRpc:
+    | {
+        bootstrap(): Promise<import("../src/rpc.ts").CoordinatorBootstrap>;
+        attach(
+          input: { coordinatorID: string; verifier: string },
+          context: { signal: AbortSignal },
+        ): Promise<{
+          generation: number;
+          dataDir: string;
+          coordinatorLocation: string;
+        }>;
+        inspect(input: {
+          proof: SignedControl;
+        }): Promise<import("../src/rpc.ts").CoordinatorSnapshot>;
+        recover(
+          input: { coordinatorID: string },
+          context: { signal: AbortSignal },
+        ): Promise<import("../src/rpc.ts").CoordinatorBootstrap>;
+      }
+    | undefined;
   const registration = { dispose: async () => {} };
   const context = {
     app: { version: "2.2.5" },
-    options: { home },
+    options: { dataDir: dataDir ?? `${home}/data` },
     location: { directory: passive ? worker : home },
     session: {
+      get: async ({ sessionID }: { sessionID: string }) => {
+        await faults.get?.();
+        return {
+          id: sessionID,
+          projectID: sessions.get(sessionID) ?? home,
+          agent: coordinatorAgent.id,
+          location: {
+            directory: sessions.get(sessionID) ?? (passive ? worker : home),
+          },
+          time: { created: 1, updated: 1 },
+        };
+      },
       hook: async (
         name: string,
         callback: (event: SessionContext) => Promise<void>,
       ) => {
+        await faults.hook?.(name);
+        if (name === faults.failHook) throw new Error("Injected setup failure");
         if (name === "context") contextHook = callback;
-        return registration;
+        return {
+          dispose: async () => {
+            disposedHooks.push(name);
+          },
+        };
       },
     },
     storage: {
@@ -89,6 +352,10 @@ async function registeredCoordinator(
     },
     event: {
       async *subscribe({ signal }: { signal: AbortSignal }) {
+        if (faults.stream) {
+          yield* faults.stream();
+          return;
+        }
         await new Promise<void>((done) =>
           signal.aborted
             ? done()
@@ -96,13 +363,29 @@ async function registeredCoordinator(
         );
       },
     },
-    permission: { hook: async () => registration },
-    rpc: { register: async () => registration },
+    permission: {
+      hook: async () => registration,
+      assert: async () => {
+        await faults.ask?.();
+      },
+    },
+    rpc: {
+      register: async (_definition: unknown, handlers: typeof nativeRpc) => {
+        nativeRpc = handlers;
+        return registration;
+      },
+    },
     tool: { transform: async () => registration },
     agent: {
-      async list() {
+      async list(input?: { location?: { directory?: string } }) {
+        await faults.catalog?.();
         if (failCatalog) throw new Error("Unavailable catalog");
-        return { location: { directory: home }, data: [...catalog.values()] };
+        return {
+          location: {
+            directory: input?.location?.directory ?? (passive ? worker : home),
+          },
+          data: [...catalog.values()],
+        };
       },
       async transform(
         callback: Parameters<Plugin.Context["agent"]["transform"]>[0],
@@ -144,13 +427,25 @@ async function registeredCoordinator(
       },
     },
   } as unknown as Plugin.Context;
-  const close = await nativePlugin.setup(context);
+  let setupError: unknown;
+  const close = await Promise.resolve(nativePlugin.setup(context)).catch(
+    (error) => {
+      setupError = error;
+    },
+  );
   return {
     catalog,
+    coordinatorID: home,
+    setupError,
     defaults,
+    disposedHooks,
     replay: () => replay?.(),
     transforms: () => transforms,
     disposed: () => disposed,
+    get rpc() {
+      if (!nativeRpc) throw new Error("Native handlers not registered");
+      return nativeRpc;
+    },
     async tools(agent: string, unavailable = false) {
       failCatalog = unavailable;
       const event = {
@@ -187,8 +482,8 @@ describe("Bundled conversational coordinator", () => {
     for (const passive of [false, true]) {
       const f = await registeredCoordinator(passive);
       try {
-        expect(f.catalog.has("conman-coordinator")).toBe(!passive);
-        if (!passive) {
+        expect(f.catalog.has("conman-coordinator")).toBe(true);
+        {
           const agent = structuredClone(f.catalog.get("conman-coordinator"));
           expect(agent).toMatchObject({
             id: "conman-coordinator",
@@ -203,7 +498,7 @@ describe("Bundled conversational coordinator", () => {
       } finally {
         await f.close();
       }
-      expect(f.disposed()).toBe(passive ? 0 : 1);
+      expect(f.disposed()).toBe(1);
     }
   });
   it("Preserves a configured coordinator agent", async () => {
@@ -571,18 +866,23 @@ async function backendFixture(
     return backend.control({
       operation,
       taskID,
-      proof: capability.sign(generation, ++sequence, {
-        operation,
-        taskID,
-        revision: b?.revision ?? 0,
-        epoch: b?.epoch ?? 0,
-        body,
-      }),
+      proof: capability.sign(
+        generation,
+        ++sequence,
+        {
+          operation,
+          taskID,
+          revision: b?.revision ?? 0,
+          epoch: b?.epoch ?? 0,
+          body,
+        },
+        observerScope,
+      ),
     });
   };
   const observation = (b: WorkerBinding) => {
     const snapshot = {
-      home,
+      dataDir: home,
       location: b.location,
       sessionID: b.workerID,
       incarnation: "incarnation",
@@ -594,7 +894,7 @@ async function backendFixture(
       background: [],
       publishedAt: Date.now(),
     };
-    const prefix = `home:${encodeURIComponent(home)}:worker:${encodeURIComponent(b.location)}`;
+    const prefix = `store:${encodeURIComponent(home)}:worker:${encodeURIComponent(b.location)}`;
     values.set(`${prefix}:observer`, {
       incarnation: snapshot.incarnation,
       usable: true,
@@ -637,6 +937,357 @@ async function backendFixture(
     },
   };
 }
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Authorised shared-state inspection", () => {
+  it("Bootstraps without disclosing task state", async () => {
+    const f = await backendFixture([
+      {
+        ...goal,
+        workerID: "worker",
+        revision: 1,
+        epoch: 1,
+        status: "held",
+        followups: 2,
+        nonprogress: 0,
+      },
+    ]);
+    try {
+      expect(f.backend.bootstrap()).toEqual({
+        dataDir: "/projects/home",
+        authority: "owned",
+      });
+      const capability = createObserverCapability();
+      const attached = await f.backend.attach({
+        coordinatorID: "coordinator",
+        verifier: capability.verifier,
+      });
+      expect(attached).toMatchObject(observerScope);
+      f.failWrite();
+      await expect(
+        f.backend.read(
+          capability.sign(
+            attached.generation,
+            1,
+            {
+              operation: "inspect",
+              taskID: "coordinator",
+              revision: 0,
+              epoch: 0,
+            },
+            attached,
+          ),
+        ),
+      ).rejects.toThrow("Storage failed");
+      const metadata = f.backend.bootstrap();
+      expect(metadata.authority).toBe("held");
+      expect(Object.keys(metadata).sort()).toEqual([
+        "authority",
+        "dataDir",
+        "reason",
+      ]);
+    } finally {
+      await f.backend.dispose();
+    }
+  });
+  it("Rejects unauthorised shared-state reads", async () => {
+    for (const change of ["location", "role"] as const) {
+      const f = await backendFixture([
+        {
+          ...goal,
+          workerID: "worker",
+          revision: 1,
+          epoch: 1,
+          status: "held",
+          followups: 2,
+          nonprogress: 0,
+        },
+      ]);
+      try {
+        const get = f.host.session.get;
+        let changed = false;
+        f.host.session.get = async (input) => ({
+          ...(await get(input)),
+          ...(changed && input.sessionID === "coordinator"
+            ? change === "location"
+              ? { location: { directory: "/projects/relocated" } }
+              : { agent: "engineer" }
+            : {}),
+        });
+        let entered!: () => void, release!: () => void;
+        const ready = new Promise<void>((done) => {
+          entered = done;
+        });
+        const wait = new Promise<void>((done) => {
+          release = done;
+        });
+        const { get: read, set } = f.host.storage;
+        let writes = 0;
+        f.host.storage = {
+          get: read,
+          set: async (key, value) => {
+            if (++writes === 2) {
+              entered();
+              await wait;
+            }
+            await set(key, value);
+          },
+        };
+        const pending = f.control("hold", goal.id, {});
+        await ready;
+        changed = true;
+        release();
+        const result = await pending;
+        expect(result.accepted).toBe(true);
+        expect(result.snapshot).toBeUndefined();
+        expect(result.reason).toMatch(/committed.*do not retry/i);
+        expect((await f.backend.inspect()).bindings[0]!.epoch).toBe(2);
+      } finally {
+        await f.backend.dispose();
+      }
+    }
+    const disclosures: string[] = [];
+    for (const window of [
+      "proof-publication",
+      "observation-read",
+      "final-catalog",
+    ] as const) {
+      const paused = await backendFixture([
+        {
+          ...goal,
+          workerID: "worker",
+          revision: 1,
+          epoch: 1,
+          status: "held",
+          followups: 2,
+          nonprogress: 0,
+        },
+      ]);
+      try {
+        const getSession = paused.host.session.get;
+        let directory = observerScope.coordinatorLocation;
+        paused.host.session.get = async (input) => ({
+          ...(await getSession(input)),
+          ...(input.sessionID === "coordinator"
+            ? { location: { directory } }
+            : {}),
+        });
+        const listAgents = paused.host.agent.list;
+        paused.host.agent.list = async (input) => ({
+          ...(await listAgents(input)),
+          location: { directory: input?.location?.directory ?? directory },
+        });
+        const entry = (await paused.backend.inspect()).bindings[0]!;
+        paused.observation(entry);
+        const capability = createObserverCapability();
+        const { generation } = await paused.backend.attach({
+          coordinatorID: "coordinator",
+          verifier: capability.verifier,
+        });
+        let entered!: () => void, release!: () => void;
+        const ready = new Promise<void>((done) => {
+          entered = done;
+        });
+        const wait = new Promise<void>((done) => {
+          release = done;
+        });
+        const catalog = paused.host.agent.list;
+        let catalogs = 0;
+        paused.host.agent.list = async (input) => {
+          const result = await catalog(input);
+          if (window === "final-catalog" && ++catalogs === 2) {
+            entered();
+            await wait;
+          }
+          return result;
+        };
+        const { get, set } = paused.host.storage;
+        paused.host.storage = {
+          get: async (key) => {
+            if (window === "observation-read" && key.endsWith(":snapshot")) {
+              entered();
+              await wait;
+            }
+            return get(key);
+          },
+          set: async (key, value) => {
+            if (window === "proof-publication") {
+              entered();
+              await wait;
+            }
+            return set(key, value);
+          },
+        };
+        const operation =
+          window === "proof-publication" ? "inspect" : "observe";
+        const proof = capability.sign(
+          generation,
+          1,
+          {
+            operation,
+            taskID: operation === "inspect" ? "coordinator" : entry.id,
+            revision: operation === "inspect" ? 0 : entry.revision,
+            epoch: operation === "inspect" ? 0 : entry.epoch,
+            ...(operation === "observe"
+              ? { body: { workerID: entry.workerID } }
+              : {}),
+          },
+          observerScope,
+        );
+        const pending =
+          operation === "inspect"
+            ? paused.backend.read(proof)
+            : paused.backend.readObservation(
+                { taskID: entry.id, workerID: entry.workerID },
+                proof,
+              );
+        await ready;
+        directory = "/projects/relocated-before-disclosure";
+        release();
+        disclosures.push(
+          await pending.then(
+            () => `${window}:disclosed`,
+            (error) =>
+              `${window}:${/Observer authority|Coordinator identity changed/.test(String(error)) ? "held" : String(error)}`,
+          ),
+        );
+      } finally {
+        await paused.backend.dispose();
+      }
+    }
+    expect(disclosures).toEqual([
+      "proof-publication:held",
+      "observation-read:held",
+      "final-catalog:held",
+    ]);
+    const f = await backendFixture([
+      {
+        ...goal,
+        workerID: "worker",
+        revision: 1,
+        epoch: 1,
+        status: "held",
+        followups: 2,
+        nonprogress: 0,
+      },
+    ]);
+    const capability = createObserverCapability();
+    try {
+      const { generation } = await f.backend.attach({
+        coordinatorID: "coordinator",
+        verifier: capability.verifier,
+      });
+      const read = capability.sign(
+        generation,
+        1,
+        { operation: "inspect", taskID: "coordinator", revision: 0, epoch: 0 },
+        observerScope,
+      );
+      for (const change of [
+        { dataDir: "/different-store" },
+        { coordinatorLocation: "/different-conversation" },
+      ]) {
+        await expect(f.backend.read({ ...read, ...change })).rejects.toThrow(
+          "Observer authority",
+        );
+        await expect(
+          f.backend.read(
+            capability.sign(
+              generation,
+              1,
+              {
+                operation: "inspect",
+                taskID: "coordinator",
+                revision: 0,
+                epoch: 0,
+              },
+              { ...observerScope, ...change },
+            ),
+          ),
+        ).rejects.toThrow("Observer authority");
+      }
+      await expect(
+        f.backend.read({
+          ...read,
+          signature: createObserverCapability().sign(
+            generation,
+            1,
+            {
+              operation: "inspect",
+              taskID: "coordinator",
+              revision: 0,
+              epoch: 0,
+            },
+            observerScope,
+          ).signature,
+        }),
+      ).rejects.toThrow("Observer authority");
+      expect((await f.backend.read(read)).bindings[0]?.followups).toBe(2);
+      await expect(f.backend.read(read)).rejects.toThrow("Observer authority");
+      const task = (await f.backend.inspect()).bindings[0]!;
+      f.observation(task);
+      const observation = capability.sign(
+        generation,
+        2,
+        {
+          operation: "observe",
+          taskID: task.id,
+          revision: task.revision,
+          epoch: task.epoch,
+          body: { workerID: task.workerID },
+        },
+        observerScope,
+      );
+      await expect(
+        f.backend.readObservation(
+          { taskID: task.id, workerID: "different-worker" },
+          observation,
+        ),
+      ).rejects.toThrow("Mismatched observation");
+      const current = capability.sign(
+        generation,
+        3,
+        {
+          operation: "observe",
+          taskID: task.id,
+          revision: task.revision,
+          epoch: task.epoch,
+          body: { workerID: task.workerID },
+        },
+        observerScope,
+      );
+      expect(
+        (
+          await f.backend.readObservation(
+            { taskID: task.id, workerID: task.workerID },
+            current,
+          )
+        ).snapshot?.sessionID,
+      ).toBe(task.workerID);
+      await f.backend.attach({
+        coordinatorID: "coordinator",
+        verifier: createObserverCapability().verifier,
+      });
+      await expect(
+        f.backend.read(
+          capability.sign(
+            generation,
+            4,
+            {
+              operation: "inspect",
+              taskID: "coordinator",
+              revision: 0,
+              epoch: 0,
+            },
+            observerScope,
+          ),
+        ),
+      ).rejects.toThrow("Observer authority");
+    } finally {
+      await f.backend.dispose();
+    }
+  });
+});
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Approved task binding", () => {
@@ -756,6 +1407,9 @@ describe("Filesystem coordinator authority", () => {
       owner,
       crash ? "process.exit(0);" : "await a.dispose(async()=>{});",
     );
+    return runChild(code);
+  }
+  async function runChild(code: string) {
     const process = Bun.spawn([Bun.which("bun")!, "-e", code], {
       stdout: "pipe",
       stderr: "pipe",
@@ -805,26 +1459,14 @@ describe("Filesystem coordinator authority", () => {
 
   it("Holds a competing or unsafe authority", async () => {
     await mockAuthority("competing");
-    const registrations = [
-      registerServiceHome("/projects/home"),
-      registerServiceHome("/projects/home"),
-    ];
-    try {
-      expect(() => registerServiceHome("/projects/conflict")).toThrow(
-        "Conflicting canonical homes",
-      );
-      registrations[0]!();
-      expect(() => registerServiceHome("/projects/conflict")).toThrow(
-        "Conflicting canonical homes",
-      );
-    } finally {
-      registrations.forEach((release) => release());
-    }
     const home = await fixture();
     const first = authority(home, "first");
     try {
       expect(await first.claim()).toBe("owned");
-      const lock = resolve(home, ".opencode/conman/ownership.lock");
+      const lock = resolve(home, "ownership.lock");
+      expect(
+        await readFile(lock, "utf8").catch(() => "missing ownership record"),
+      ).toContain('"owner":"first"');
       const inode = (await stat(lock)).ino;
       expect(await child(home, "independent")).toBe("held");
       await expect(
@@ -860,17 +1502,15 @@ describe("Filesystem coordinator authority", () => {
         const target = await fixture();
         const blocked = authority(target, "blocked");
         try {
-          const directory = resolve(target, ".opencode");
-          if (unsafe === "symlink") await symlink(home, directory);
-          else {
-            await mkdir(resolve(directory, "conman"), {
-              recursive: true,
-              mode: 0o700,
-            });
+          const directory = target;
+          if (unsafe === "symlink") {
+            await rm(directory, { recursive: true });
+            await symlink(home, directory);
+          } else {
             if (unsafe === "mode") await chmod(directory, 0o777);
             if (unsafe === "malformed")
               await writeFile(
-                resolve(directory, "conman/ownership.lock"),
+                resolve(directory, "ownership.lock"),
                 "not-json",
                 { mode: 0o600 },
               );
@@ -881,26 +1521,24 @@ describe("Filesystem coordinator authority", () => {
               };
               const bytes = Buffer.from(JSON.stringify(record));
               bytes[bytes.indexOf("invalid-marker")] = 0xff;
-              await writeFile(
-                resolve(directory, "conman/ownership.lock"),
-                bytes,
-                { mode: 0o600 },
-              );
+              await writeFile(resolve(directory, "ownership.lock"), bytes, {
+                mode: 0o600,
+              });
             }
             if (unsafe === "oversized")
               await writeFile(
-                resolve(directory, "conman/ownership.lock"),
+                resolve(directory, "ownership.lock"),
                 " ".repeat(8193),
                 { mode: 0o600 },
               );
             if (unsafe === "lock-mode")
-              await writeFile(resolve(directory, "conman/ownership.lock"), "", {
+              await writeFile(resolve(directory, "ownership.lock"), "", {
                 mode: 0o644,
               });
             if (unsafe === "lock-symlink")
-              await symlink(lock, resolve(directory, "conman/ownership.lock"));
+              await symlink(lock, resolve(directory, "ownership.lock"));
             if (unsafe === "hardlink")
-              await link(lock, resolve(directory, "conman/ownership.lock"));
+              await link(lock, resolve(directory, "ownership.lock"));
           }
           expect(await blocked.claim(), unsafe).toBe("held");
           await expect(blocked.recover()).rejects.toThrow(
@@ -971,7 +1609,655 @@ describe("Filesystem coordinator authority", () => {
     }
   });
 
+  it("Fences an unloaded project without releasing other participants", async () => {
+    {
+      const directory = await mkdtemp(
+        resolve(".opencode/conman/observer-stop-"),
+      );
+      try {
+        const output = await runChild(`
+          import {spyOn} from "bun:test";
+          import nativePlugin from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
+          import * as ownership from ${JSON.stringify(new URL("../src/ownership.ts", import.meta.url).href)};
+          const directory=${JSON.stringify(directory)};
+          let finish, failing=false, unhandled=0, releases=0;
+          const ended=new Promise(resolve=>{finish=resolve;});
+          const values=new Map();
+          const registration={dispose:async()=>{}};
+          const core={projects:new Map(),backend:{bootstrap:()=>({dataDir:directory,authority:"owned"}),fenceProject:async()=>{}},storage:{get:async key=>values.get(key),set:async(key,value)=>{if(failing)throw new Error("Injected observer invalidation failure");values.set(key,value);}},dispose:async()=>{}};
+          const acquisition=spyOn(ownership,"acquireCoordinatorCore").mockResolvedValue({core,release:async()=>{releases++;}});
+          process.on("unhandledRejection",()=>{unhandled++;});
+          const close=await nativePlugin.setup({app:{version:"2.2.5"},options:{dataDir:directory},location:{directory},session:{hook:async()=>registration},event:{async *subscribe(){await ended;}},permission:{hook:async()=>registration},agent:{transform:async()=>registration},rpc:{register:async()=>registration},tool:{transform:async()=>registration}});
+          failing=true;finish();
+          await new Promise(resolve=>setImmediate(resolve));
+          await new Promise(resolve=>setImmediate(resolve));
+          let held=false;try{await close();}catch{held=true;}
+          acquisition.mockRestore();
+          process.stdout.write(JSON.stringify({unhandled,releases,held}));
+        `);
+        expect(JSON.parse(output)).toEqual({
+          unhandled: 0,
+          releases: 0,
+          held: true,
+        });
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+    {
+      let releases = 0;
+      const acquisition = spyOn(
+        ownershipModule,
+        "acquireCoordinatorCore",
+      ).mockResolvedValueOnce({
+        core: {
+          backend: {
+            bootstrap: () => ({ authority: "held" }),
+            fenceProject: async () => {
+              throw new Error("Injected cleanup failure");
+            },
+          },
+          projects: new Map(),
+          storage: {},
+          dispose: async () => {},
+        },
+        release: async () => {
+          releases++;
+        },
+      } as unknown as Awaited<
+        ReturnType<typeof ownershipModule.acquireCoordinatorCore>
+      >);
+      try {
+        const project = await registeredCoordinator(
+          false,
+          undefined,
+          undefined,
+          new Map(),
+          { failHook: "context" },
+        );
+        try {
+          expect(project.setupError).toBeInstanceOf(AggregateError);
+          const error = project.setupError as AggregateError;
+          expect(error.errors[0]?.message).toBe("Injected setup failure");
+          expect(error.errors[1]).toBeInstanceOf(AggregateError);
+          expect(releases).toBe(0);
+        } finally {
+          await project.close();
+        }
+      } finally {
+        acquisition.mockRestore();
+      }
+    }
+    {
+      const directory = await mkdtemp(resolve(".opencode/conman/stream-eof-"));
+      let finish!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const project = await registeredCoordinator(
+        false,
+        undefined,
+        directory,
+        new Map(),
+        {
+          stream: async function* () {
+            await waiting;
+          },
+        },
+      );
+      try {
+        finish();
+        const capability = createObserverCapability();
+        const attached = await project.rpc.attach(
+          {
+            coordinatorID: project.coordinatorID,
+            verifier: capability.verifier,
+          },
+          { signal: new AbortController().signal },
+        );
+        await project.rpc.inspect({
+          proof: capability.sign(
+            attached.generation,
+            1,
+            {
+              operation: "inspect",
+              taskID: project.coordinatorID,
+              revision: 0,
+              epoch: 0,
+            },
+            attached,
+          ),
+        });
+        const values = JSON.parse(
+          await readFile(`${directory}/state.json`, "utf8"),
+        ).values as Record<string, { usable?: boolean }>;
+        expect(
+          Object.values(values)
+            .filter((value) => typeof value.usable === "boolean")
+            .map((value) => value.usable),
+        ).toEqual([false]);
+      } finally {
+        finish();
+        await project.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+    for (const startup of ["unload", "failure"] as const) {
+      const directory = await mkdtemp(
+        resolve(".opencode/conman/late-observer-"),
+      );
+      expect(await child(directory, "terminated-project", true)).toBe("owned");
+      let enter!: () => void, finish!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const waiting = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const sessions = new Map<string, string>();
+      const first = await registeredCoordinator(
+        false,
+        undefined,
+        directory,
+        sessions,
+        {
+          hook: async (name) => {
+            if (name === "experimental.idle") {
+              enter();
+              await waiting;
+              if (startup === "failure")
+                throw new Error("Observer startup failed");
+            }
+          },
+        },
+      );
+      const second = await registeredCoordinator(
+        true,
+        undefined,
+        directory,
+        sessions,
+      );
+      try {
+        const signal = new AbortController().signal;
+        await first.rpc.recover(
+          { coordinatorID: first.coordinatorID },
+          { signal },
+        );
+        const attaching = first.rpc
+          .attach(
+            {
+              coordinatorID: first.coordinatorID,
+              verifier: createObserverCapability().verifier,
+            },
+            { signal },
+          )
+          .catch(() => undefined);
+        await entered;
+        const closing =
+          startup === "unload" ? first.close() : Promise.resolve();
+        finish();
+        const [, attached] = await Promise.all([closing, attaching]);
+        if (startup === "unload")
+          expect(first.disposedHooks).toContain("experimental.idle");
+        else {
+          expect(attached?.generation).toBeDefined();
+          const values = JSON.parse(
+            await readFile(`${directory}/state.json`, "utf8"),
+          ).values as Record<string, { usable?: boolean }>;
+          expect(
+            Object.values(values)
+              .filter((value) => typeof value.usable === "boolean")
+              .map((value) => value.usable)
+              .sort(),
+          ).toEqual([false, true]);
+        }
+        expect((await second.rpc.bootstrap()).authority).toBe("owned");
+      } finally {
+        finish();
+        await first.close();
+        await second.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+    {
+      const fixture = await backendFixture([
+        {
+          ...goal,
+          workerID: "worker",
+          revision: 1,
+          epoch: 1,
+          status: "held",
+          followups: 0,
+          nonprogress: 0,
+        },
+      ]);
+      try {
+        const abort = new AbortController();
+        fixture.host.projectSignal = () => abort.signal;
+        const before = (await fixture.backend.inspect()).bindings[0]!;
+        const body = fixture.observation(before);
+        const context = fixture.host.session.context!;
+        let approved = false;
+        fixture.approve(async () => {
+          approved = true;
+        });
+        fixture.host.session.context = async (...args) => {
+          const result = await context(...args);
+          if (approved) abort.abort();
+          return result;
+        };
+        await expect(
+          fixture.control("resume", before.id, body),
+        ).rejects.toThrow("Native operation aborted");
+        await fixture.backend.fenceProject(observerScope.coordinatorLocation);
+        expect((await fixture.backend.inspect()).bindings).toEqual([before]);
+        const durable = fixture.root() as { bindings: WorkerBinding[] };
+        expect(durable.bindings).toEqual([before]);
+      } finally {
+        await fixture.backend.dispose();
+      }
+    }
+    {
+      const dataDir = await mkdtemp(resolve(".opencode/conman/setup-fence-"));
+      const sessions = new Map<string, string>();
+      const failed = await registeredCoordinator(
+        false,
+        undefined,
+        dataDir,
+        sessions,
+        { failHook: "experimental.idle" },
+      );
+      let replacement:
+        Awaited<ReturnType<typeof registeredCoordinator>> | undefined;
+      try {
+        expect(String(failed.setupError)).toContain("Injected setup failure");
+        replacement = await registeredCoordinator(
+          false,
+          undefined,
+          dataDir,
+          sessions,
+        );
+        expect(replacement.setupError).toBeUndefined();
+        expect(replacement.catalog.has(coordinatorAgent.id)).toBe(true);
+      } finally {
+        await failed.close();
+        await replacement?.close();
+      }
+      try {
+        expect(await child(dataDir, "after-failed-setup")).toBe("owned");
+      } finally {
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    }
+    {
+      const dataDir = await mkdtemp(resolve(".opencode/conman/ask-fence-"));
+      let entered!: () => void;
+      const ready = new Promise<void>((done) => {
+        entered = done;
+      });
+      const pendingAsk = new Promise<void>(() => {});
+      const project = await registeredCoordinator(
+        false,
+        undefined,
+        dataDir,
+        new Map(),
+        {
+          ask: async () => {
+            entered();
+            await pendingAsk;
+          },
+        },
+      );
+      const capability = createObserverCapability();
+      const attachment = project.rpc
+        .attach(
+          {
+            coordinatorID: project.coordinatorID,
+            verifier: capability.verifier,
+          },
+          { signal: new AbortController().signal },
+        )
+        .then(
+          () => "approved",
+          () => "cancelled",
+        );
+      await ready;
+      try {
+        await project.close();
+        expect(await attachment).toBe("cancelled");
+      } finally {
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    }
+    {
+      const shared = await mkdtemp(resolve(".opencode/conman/project-core-"));
+      const sessions = new Map<string, string>();
+      const faults: { catalog?: () => Promise<void> } = {};
+      const first = await registeredCoordinator(
+        false,
+        undefined,
+        shared,
+        sessions,
+        faults,
+      );
+      const second = await registeredCoordinator(
+        false,
+        undefined,
+        shared,
+        sessions,
+      );
+      const conflicting = await registeredCoordinator(
+        false,
+        undefined,
+        `${shared}-conflicting`,
+        sessions,
+      );
+      try {
+        expect(conflicting.setupError).toBeUndefined();
+        expect(conflicting.catalog.has(coordinatorAgent.id)).toBe(true);
+        expect((await conflicting.rpc.bootstrap()).authority).toBe("held");
+        expect(
+          await stat(`${shared}-conflicting`).catch(() => undefined),
+        ).toBeUndefined();
+      } finally {
+        await conflicting.close();
+      }
+      let firstClosed = false;
+      try {
+        const capability = createObserverCapability();
+        const signal = new AbortController().signal;
+        const initial = await first.rpc.attach(
+          { coordinatorID: first.coordinatorID, verifier: capability.verifier },
+          { signal },
+        );
+        const replacement = await second.rpc.attach(
+          {
+            coordinatorID: second.coordinatorID,
+            verifier: capability.verifier,
+          },
+          { signal },
+        );
+        expect(replacement.generation).toBe(initial.generation + 1);
+        expect(await second.rpc.bootstrap()).toEqual({
+          dataDir: shared,
+          authority: "owned",
+        });
+        let entered!: () => void, release!: () => void;
+        const ready = new Promise<void>((done) => {
+          entered = done;
+        });
+        const wait = new Promise<void>((done) => {
+          release = done;
+        });
+        faults.catalog = async () => {
+          entered();
+          await wait;
+        };
+        const departedRead = first.rpc
+          .inspect({
+            proof: capability.sign(
+              replacement.generation,
+              1,
+              {
+                operation: "inspect",
+                taskID: second.coordinatorID,
+                revision: 0,
+                epoch: 0,
+              },
+              replacement,
+            ),
+          })
+          .then(
+            () => "disclosed",
+            () => "withheld",
+          );
+        await ready;
+        const unloading = first.close();
+        firstClosed = true;
+        release();
+        expect(await departedRead).toBe("withheld");
+        await unloading;
+        const snapshot = await second.rpc.inspect({
+          proof: capability.sign(
+            replacement.generation,
+            2,
+            {
+              operation: "inspect",
+              taskID: second.coordinatorID,
+              revision: 0,
+              epoch: 0,
+            },
+            replacement,
+          ),
+        });
+        expect(snapshot.observer?.coordinatorID).toBe(second.coordinatorID);
+        expect(snapshot.observer?.sequence).toBe(2);
+      } finally {
+        if (!firstClosed) await first.close();
+        await second.close();
+        await rm(shared, { recursive: true, force: true });
+      }
+    }
+    const directory = await fixture();
+    let finishDrain!: () => void;
+    const drain = new Promise<void>((resolve) => {
+      finishDrain = resolve;
+    });
+    let startedDrain!: () => void;
+    const draining = new Promise<void>((resolve) => {
+      startedDrain = resolve;
+    });
+    let opens = 0;
+    const create = async () => {
+      const owner = authority(directory, `runtime-${++opens}`);
+      if ((await owner.claim()) !== "owned")
+        throw new Error("Runtime authority held");
+      const storage = await openSharedStorage(directory);
+      return {
+        storage,
+        async dispose() {
+          startedDrain();
+          await owner.dispose(async () => {
+            await drain;
+            await storage.close();
+          });
+        },
+      };
+    };
+    const first = await acquireCoordinatorCore(directory, create);
+    let second: typeof first | undefined;
+    try {
+      await first.core.storage.set("consumed", {
+        followUps: 2,
+        uncertain: true,
+      });
+      second = await acquireCoordinatorCore(directory, create).catch(
+        () => undefined,
+      );
+      expect(
+        second,
+        "Another enabled project must reuse the owned runtime",
+      ).toBeDefined();
+      if (!second) return;
+      expect(await second.core.storage.get("consumed")).toEqual({
+        followUps: 2,
+        uncertain: true,
+      });
+      const other = await fixture();
+      try {
+        await expect(acquireCoordinatorCore(other, create)).rejects.toThrow(
+          "Conflicting coordination stores",
+        );
+      } finally {
+        await rm(other, { recursive: true, force: true });
+      }
+      await first.release();
+      await first.release();
+      expect(await child(directory, "after-project-unload")).toBe("held");
+      await second.core.storage.set("consumed", {
+        followUps: 3,
+        uncertain: true,
+      });
+      const closing = second.release();
+      await draining;
+      const reopening = acquireCoordinatorCore(directory, create);
+      expect(opens).toBe(1);
+      expect(await child(directory, "during-final-drain")).toBe("held");
+      finishDrain();
+      await closing;
+      const reopened = await reopening;
+      try {
+        expect(await reopened.core.storage.get("consumed")).toEqual({
+          followUps: 3,
+          uncertain: true,
+        });
+        expect(opens).toBe(2);
+      } finally {
+        await reopened.release();
+      }
+      const failedShutdown = await runChild(`
+        import {acquireCoordinatorCore} from ${JSON.stringify(adapterURL)};
+        let disposals=0, replacements=0;
+        const lease=await acquireCoordinatorCore(${JSON.stringify(directory)},async()=>({async dispose(){disposals++;throw new Error("Shutdown failed");}}));
+        const closing=lease.release();
+        const first=await closing.catch(error=>error.message);
+        const repeated=lease.release();
+        const second=await repeated.catch(error=>error.message);
+        const attempts=[];
+        for(const directory of ${JSON.stringify([directory, `${directory}/other`])}) {
+          attempts.push(await acquireCoordinatorCore(directory,async()=>{replacements++;return {async dispose(){}};}).then(()=>"opened",()=>"held"));
+        }
+        process.stdout.write(JSON.stringify({first,second,same:closing===repeated,disposals,replacements,attempts}));
+      `);
+      expect(JSON.parse(failedShutdown)).toEqual({
+        first: "Shutdown failed",
+        second: "Shutdown failed",
+        same: true,
+        disposals: 1,
+        replacements: 0,
+        attempts: ["held", "held"],
+      });
+    } finally {
+      finishDrain();
+      await second?.release();
+      await first.release();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("Requires explicit stale-owner recovery", async () => {
+    const released: boolean[] = [];
+    for (const change of ["cancel", "role"] as const) {
+      const directory = await mkdtemp(
+        resolve(".opencode/conman/recover-cancel-"),
+      );
+      expect(await child(directory, "terminated-project", true)).toBe("owned");
+      let approved = false;
+      const request = new AbortController();
+      let project:
+        Awaited<ReturnType<typeof registeredCoordinator>> | undefined;
+      try {
+        project = await registeredCoordinator(
+          false,
+          undefined,
+          directory,
+          new Map(),
+          {
+            ask: async () => {
+              approved = true;
+              if (change === "role")
+                project!.catalog.get(coordinatorAgent.id)!.permissions = [
+                  { action: "*", resource: "*", effect: "allow" },
+                ];
+            },
+            get: async () => {
+              if (approved && change === "cancel") request.abort();
+            },
+          },
+        );
+        await project.rpc
+          .recover(
+            { coordinatorID: project.coordinatorID },
+            { signal: request.signal },
+          )
+          .catch(() => undefined);
+        released.push(
+          JSON.parse(await readFile(`${directory}/ownership.lock`, "utf8"))
+            .released,
+        );
+      } finally {
+        await project?.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+    expect(released).toEqual([false, false]);
+    {
+      const directory = await mkdtemp(
+        resolve(".opencode/conman/recover-project-"),
+      );
+      expect(await child(directory, "terminated-project", true)).toBe("owned");
+      let approvals = 0;
+      const project = await registeredCoordinator(
+        false,
+        undefined,
+        directory,
+        new Map(),
+        {
+          ask: async () => {
+            approvals++;
+          },
+        },
+      );
+      try {
+        const signal = new AbortController().signal;
+        expect((await project.rpc.bootstrap()).authority).toBe("held");
+        expect(
+          await project.rpc.recover(
+            { coordinatorID: project.coordinatorID },
+            { signal },
+          ),
+        ).toEqual({
+          dataDir: directory,
+          authority: "held",
+          reason: "Recovery approved; separate attachment/rearm required",
+        });
+        expect(approvals).toBe(1);
+        expect(
+          await readFile(`${directory}/state.json`, "utf8").catch(
+            () => undefined,
+          ),
+        ).toBeUndefined();
+        const capability = createObserverCapability();
+        const attached = await project.rpc.attach(
+          {
+            coordinatorID: project.coordinatorID,
+            verifier: capability.verifier,
+          },
+          { signal },
+        );
+        expect(approvals).toBe(2);
+        const snapshot = await project.rpc.inspect({
+          proof: capability.sign(
+            attached.generation,
+            1,
+            {
+              operation: "inspect",
+              taskID: project.coordinatorID,
+              revision: 0,
+              epoch: 0,
+            },
+            attached,
+          ),
+        });
+        expect(snapshot.bindings).toEqual([]);
+        expect(await readFile(`${directory}/state.json`, "utf8")).toContain(
+          "observer",
+        );
+      } finally {
+        await project.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
     await mockAuthority("recovery");
     const home = await fixture();
     const approvals: string[] = [];
@@ -981,7 +2267,7 @@ describe("Filesystem coordinator authority", () => {
     });
     try {
       expect(await child(home, "crashed", true)).toBe("owned");
-      const lock = resolve(home, ".opencode/conman/ownership.lock");
+      const lock = resolve(home, "ownership.lock");
       const inode = (await stat(lock)).ino;
       expect(await next.claim()).toBe("held");
       const denied = authority(home, "denied", async () => {
@@ -1291,7 +2577,7 @@ describe("Explicit control transitions", () => {
           const result = await f.control("resume", current.id, body).then(
             (result) => ({
               accepted: result.accepted,
-              status: result.snapshot.bindings[0]?.status,
+              status: result.snapshot?.bindings[0]?.status,
               error: undefined,
             }),
             (error) => ({
@@ -1492,13 +2778,18 @@ async function mockAuthority(scenario: "competing" | "recovery") {
 
 function assertNativeRpcBoundary() {
   const capability = createObserverCapability();
-  const proof = capability.sign(1, 1, {
-    operation: "hold",
-    taskID: "api-task",
-    revision: 1,
-    epoch: 1,
-    body: {},
-  });
+  const proof = capability.sign(
+    1,
+    1,
+    {
+      operation: "hold",
+      taskID: "api-task",
+      revision: 1,
+      epoch: 1,
+      body: {},
+    },
+    observerScope,
+  );
   const valid = { operation: "hold" as const, taskID: "api-task", proof };
   const parse = ConmanRpc.methods.control.input["~standard"].validate;
   expect(parse(valid)).toEqual({ value: valid });
@@ -1529,7 +2820,7 @@ function assertNativeRpcBoundary() {
   ).toHaveProperty("issues");
   const snapshot = {
     version: 1 as const,
-    home: "/projects/coordinator",
+    dataDir: "/projects/coordinator",
     authority: "owned" as const,
     bindings: [],
     snapshots: [],
@@ -1542,6 +2833,22 @@ function assertNativeRpcBoundary() {
       snapshot,
     }),
   ).toEqual({ value: { accepted: true, snapshot } });
+  const reason = "Control committed; inventory withheld; do not retry";
+  expect(
+    ConmanRpc.methods.control.output["~standard"].validate({
+      accepted: true,
+      reason,
+    }),
+  ).toEqual({ value: { accepted: true, reason } });
+  for (const reply of [
+    { accepted: false, reason },
+    { accepted: true },
+    { accepted: true, reason, extra: true },
+  ]) {
+    expect(
+      ConmanRpc.methods.control.output["~standard"].validate(reply),
+    ).toHaveProperty("issues");
+  }
   expect(
     ConmanRpc.methods.control.output["~standard"].validate({
       accepted: "yes",
@@ -1572,6 +2879,118 @@ describe("Approved observer generation", () => {
   }
 
   it("Native approval binds observer generation", async () => {
+    for (const field of ["projectID", "workspaceID"] as const) {
+      const current = await backendFixture();
+      try {
+        let changed = false;
+        const get = current.host.session.get;
+        current.host.session.get = async (input) => {
+          const session = await get(input);
+          return input.sessionID === "coordinator"
+            ? {
+                ...session,
+                ...(field === "projectID"
+                  ? { projectID: changed ? "after" : "before" }
+                  : {}),
+                location: {
+                  ...session.location,
+                  ...(field === "workspaceID"
+                    ? { workspaceID: changed ? "after" : "before" }
+                    : {}),
+                },
+              }
+            : session;
+        };
+        current.approve(async () => {
+          changed = true;
+        });
+        await expect(
+          current.backend.attach({
+            coordinatorID: "coordinator",
+            verifier: createObserverCapability().verifier,
+          }),
+        ).rejects.toThrow("changed during native approval");
+      } finally {
+        await current.backend.dispose();
+      }
+    }
+    const unloading = await backendFixture();
+    try {
+      const abort = new AbortController();
+      unloading.host.projectSignal = () => abort.signal;
+      const list = unloading.host.agent.list;
+      let approved = false;
+      unloading.approve(async () => {
+        approved = true;
+      });
+      unloading.host.agent.list = async (input) => {
+        const result = await list(input);
+        if (approved && input?.location?.directory === goal.location)
+          abort.abort();
+        return result;
+      };
+      await expect(unloading.control("create", goal.id, goal)).rejects.toThrow(
+        "Native operation aborted",
+      );
+      expect(
+        unloading.effects.filter((effect) =>
+          ["create", "prompt"].includes(effect),
+        ),
+      ).toEqual([]);
+    } finally {
+      await unloading.backend.dispose();
+    }
+    const relocated = await backendFixture();
+    try {
+      const get = relocated.host.session.get;
+      let location = "/projects/conversation";
+      relocated.host.session.get = async (input) => ({
+        ...(await get(input)),
+        location: { directory: location },
+      });
+      const list = relocated.host.agent.list;
+      relocated.host.agent.list = async (input) => ({
+        ...(await list(input)),
+        location: { directory: input?.location?.directory ?? location },
+      });
+      const capability = createObserverCapability();
+      await relocated.backend.attach({
+        coordinatorID: "coordinator",
+        verifier: capability.verifier,
+      });
+      relocated.approve(async () => {
+        location = "/projects/moved-during-approval";
+      });
+      await expect(
+        relocated.backend.attach({
+          coordinatorID: "coordinator",
+          verifier: createObserverCapability().verifier,
+        }),
+      ).rejects.toThrow("changed during native approval");
+      expect((await relocated.backend.inspect()).observer?.verifier).toBe(
+        capability.verifier,
+      );
+      await expect(
+        relocated.backend.read(
+          capability.sign(
+            2,
+            1,
+            {
+              operation: "inspect",
+              taskID: "coordinator",
+              revision: 0,
+              epoch: 0,
+            },
+            {
+              dataDir: "/projects/home",
+              coordinatorLocation: "/projects/conversation",
+            },
+          ),
+        ),
+      ).rejects.toThrow("coordinator location changed");
+    } finally {
+      await relocated.backend.dispose();
+    }
     const root = resolve(".opencode/conman");
     await mkdir(root, { recursive: true, mode: 0o700 });
     const home = await mkdtemp(`${root}/setup-test-`);
@@ -1580,7 +2999,7 @@ describe("Approved observer generation", () => {
     const registration = { dispose: async () => {} };
     const setupContext = {
       app: { version: "2.2.5" },
-      options: { home },
+      options: { dataDir: `${home}/data` },
       location: { directory: home },
       session: {
         async hook() {
@@ -1649,32 +3068,6 @@ describe("Approved observer generation", () => {
       },
     ]);
     try {
-      const observerHost = {
-        session: {
-          get: incumbent.host.session.get,
-          context: incumbent.host.session.context!,
-        },
-        storage: incumbent.host.storage,
-        canonical: incumbent.host.canonical,
-      };
-      const passive = await createWorkerObserver(
-        observerHost,
-        "/projects/home",
-        "/projects/passive",
-      );
-      try {
-        const before = structuredClone([...incumbent.values]);
-        await expect(
-          createWorkerObserver(
-            observerHost,
-            "/projects/conflict",
-            "/projects/other",
-          ),
-        ).rejects.toThrow("Conflicting canonical homes");
-        expect([...incumbent.values]).toEqual(before);
-      } finally {
-        await passive.dispose();
-      }
       const before = incumbent.root();
       incumbent.approve(async () => {
         throw new Error("Denied replacement");
@@ -1712,24 +3105,17 @@ describe("Approved observer generation", () => {
     } finally {
       await incumbent.backend.dispose();
     }
-    const allowed = {
-      action: "conman.observer.attach",
-      effect: "allow" as "allow" | "ask" | "deny",
-    };
-    forceNativeAsk(allowed);
-    expect(allowed.effect).toBe("ask");
-    const denied = {
-      action: "conman.observer.attach",
-      effect: "deny" as const,
-    };
-    forceNativeAsk(denied);
-    expect(denied.effect).toBe("deny");
     const { port, approvals } = observerPort();
     const capability = createObserverCapability();
-    const authority = new ObserverAuthority("coordinator-home", port);
+    const authority = new ObserverAuthority(
+      "coordinator-home",
+      port,
+      observerScope,
+    );
     const generation = await authority.attach(capability.verifier);
     expect(approvals).toEqual([
       {
+        ...observerScope,
         coordinatorID: "coordinator-home",
         generation,
         verifier: capability.verifier,
@@ -1745,7 +3131,7 @@ describe("Approved observer generation", () => {
     };
     expect(
       await authority.authorize(
-        capability.sign(generation, 1, payload),
+        capability.sign(generation, 1, payload, observerScope),
         payload,
       ),
     ).toEqual(payload);
@@ -1760,7 +3146,10 @@ describe("Approved observer generation", () => {
     ).rejects.toThrow("Denied candidate");
     expect(await port.load()).toEqual(saved);
     await expect(
-      authority.authorize(capability.sign(generation, 2, payload), payload),
+      authority.authorize(
+        capability.sign(generation, 2, payload, observerScope),
+        payload,
+      ),
     ).resolves.toEqual(payload);
     port.approve = approve;
     expect(JSON.stringify(saved)).not.toContain("PRIVATE KEY");
@@ -1807,7 +3196,11 @@ describe("Approved observer generation", () => {
     assertNativeRpcBoundary();
     const { port } = observerPort();
     const capability = createObserverCapability();
-    const authority = new ObserverAuthority("coordinator-home", port);
+    const authority = new ObserverAuthority(
+      "coordinator-home",
+      port,
+      observerScope,
+    );
     const expected = {
       operation: "hold",
       taskID: goal.id,
@@ -1815,17 +3208,20 @@ describe("Approved observer generation", () => {
       epoch: 1,
     };
     await expect(
-      authority.authorize(capability.sign(1, 1, expected), expected),
+      authority.authorize(
+        capability.sign(1, 1, expected, observerScope),
+        expected,
+      ),
     ).rejects.toThrow("Observer authority is not eligible");
     const generation = await authority.attach(capability.verifier);
-    const proof = capability.sign(generation, 1, expected);
+    const proof = capability.sign(generation, 1, expected, observerScope);
     for (const invalid of [
-      createObserverCapability().sign(generation, 1, expected),
+      createObserverCapability().sign(generation, 1, expected, observerScope),
       {
         ...proof,
         payload: JSON.stringify({ ...expected, taskID: "unapproved-task" }),
       },
-      capability.sign(generation, 1, { ...expected, epoch: 2 }),
+      capability.sign(generation, 1, { ...expected, epoch: 2 }, observerScope),
     ]) {
       await expect(authority.authorize(invalid, expected)).rejects.toThrow(
         "Observer authority is not eligible",
@@ -1837,17 +3233,27 @@ describe("Approved observer generation", () => {
     );
     authority.revoke();
     await expect(
-      authority.authorize(capability.sign(generation, 2, expected), expected),
+      authority.authorize(
+        capability.sign(generation, 2, expected, observerScope),
+        expected,
+      ),
     ).rejects.toThrow("Observer authority is not eligible");
-    const denied = new ObserverAuthority("coordinator-home", {
-      ...port,
-      async approve() {
-        throw new Error("Denied");
+    const denied = new ObserverAuthority(
+      "coordinator-home",
+      {
+        ...port,
+        async approve() {
+          throw new Error("Denied");
+        },
       },
-    });
+      observerScope,
+    );
     await expect(denied.attach(capability.verifier)).rejects.toThrow("Denied");
     await expect(
-      denied.authorize(capability.sign(generation + 1, 1, expected), expected),
+      denied.authorize(
+        capability.sign(generation + 1, 1, expected, observerScope),
+        expected,
+      ),
     ).rejects.toThrow("Observer authority is not eligible");
     for (const abort of ["shutdown", "request"] as const) {
       const f = await backendFixture();

@@ -3,7 +3,11 @@ import type { EvaluationContext, TaskEvidence } from "./context.ts";
 import type { Suggestion } from "./evaluator.ts";
 import type { DecisionIdentity, StrictValidationResult } from "./evaluator.ts";
 import type { WorkerSnapshot } from "./state.ts";
-import type { SignedControl, ControlPayload } from "./ownership.ts";
+import type {
+  SignedControl,
+  ControlPayload,
+  ObserverScope,
+} from "./ownership.ts";
 import { fingerprint } from "./state.ts";
 import {
   exact,
@@ -40,7 +44,7 @@ export interface AttachInput {
   coordinatorID: string;
   verifier: string;
 }
-export interface AttachResult {
+export interface AttachResult extends ObserverScope {
   generation: number;
 }
 export interface ControlInput {
@@ -144,8 +148,17 @@ export function reasoningPayload(
 }
 function parseProof(value: unknown): SignedControl {
   const p = object(value);
-  exact(p, ["generation", "sequence", "payload", "signature"]);
+  exact(p, [
+    "dataDir",
+    "coordinatorLocation",
+    "generation",
+    "sequence",
+    "payload",
+    "signature",
+  ]);
   return {
+    dataDir: text(p.dataDir),
+    coordinatorLocation: text(p.coordinatorLocation),
     generation: integer(p.generation, 1),
     sequence: integer(p.sequence, 1),
     payload: text(p.payload),
@@ -153,13 +166,19 @@ function parseProof(value: unknown): SignedControl {
   };
 }
 export interface CoordinatorSnapshot extends CoordinatorState {
-  home: string;
-  authority: "owned" | "held" | "passive";
+  dataDir: string;
+  authority: "owned" | "held";
+  reason?: string;
+}
+export interface CoordinatorBootstrap {
+  dataDir?: string;
+  authority: "owned" | "held";
   reason?: string;
 }
 export interface ControlResult {
-  snapshot: CoordinatorSnapshot;
+  snapshot?: CoordinatorSnapshot;
   accepted: boolean;
+  reason?: string;
 }
 export interface RecoverInput {
   coordinatorID: string;
@@ -215,6 +234,27 @@ const empty = schema<Record<string, never>>((value) => {
   exact(v, []);
   return {};
 });
+const bootstrap = schema<CoordinatorBootstrap>((value) => {
+  const v = object(value);
+  exact(v, ["dataDir", "authority", "reason"]);
+  if (v.authority !== "owned" && v.authority !== "held")
+    throw new Error("Invalid bootstrap authority");
+  if (
+    v.dataDir === undefined &&
+    (v.authority !== "held" || v.reason === undefined)
+  )
+    throw new Error("Unavailable store requires a held reason");
+  return {
+    ...(v.dataDir === undefined ? {} : { dataDir: text(v.dataDir) }),
+    authority: v.authority,
+    ...(v.reason === undefined ? {} : { reason: text(v.reason) }),
+  };
+});
+const inspection = schema<{ proof: SignedControl }>((value) => {
+  const v = object(value);
+  exact(v, ["proof"]);
+  return { proof: parseProof(v.proof) };
+});
 const attach = schema<AttachInput>((value) => {
   const v = object(value);
   exact(v, ["coordinatorID", "verifier"]);
@@ -250,12 +290,12 @@ const suggest = schema<SuggestInput>((value) => {
 });
 const snapshot = schema<CoordinatorSnapshot>((value) => {
   const v = object(value);
-  const { home, authority, reason, ...state } = v;
-  if (!["owned", "held", "passive"].includes(String(authority)))
+  const { dataDir, authority, reason, ...state } = v;
+  if (!["owned", "held"].includes(String(authority)))
     throw new Error("Invalid authority");
   return {
     ...parseCoordinatorState(state),
-    home: text(home),
+    dataDir: text(dataDir),
     authority: authority as CoordinatorSnapshot["authority"],
     ...(reason === undefined ? {} : { reason: text(reason) }),
   };
@@ -263,10 +303,14 @@ const snapshot = schema<CoordinatorSnapshot>((value) => {
 const suggestion = schema<SuggestResult>(
   (value) => object(value) as SuggestResult,
 );
-const observe = schema<ObserveInput>((value) => {
+const observe = schema<ObserveInput & { proof: SignedControl }>((value) => {
   const v = object(value);
-  exact(v, ["taskID", "workerID"]);
-  return { taskID: text(v.taskID), workerID: text(v.workerID) };
+  exact(v, ["taskID", "workerID", "proof"]);
+  return {
+    taskID: text(v.taskID),
+    workerID: text(v.workerID),
+    proof: parseProof(v.proof),
+  };
 });
 const observed = schema<ObserveResult>((value) => {
   const v = object(value);
@@ -294,10 +338,13 @@ const validate = schema<ValidateInput>((value) => {
 export const ConmanRpc = Rpc.define({
   id: "conman",
   methods: {
-    inspect: { input: empty, output: snapshot },
+    bootstrap: { input: empty, output: bootstrap },
+    inspect: { input: inspection, output: snapshot },
     attach: {
       input: attach,
       output: schema<AttachResult>((value) => ({
+        dataDir: text(object(value).dataDir),
+        coordinatorLocation: text(object(value).coordinatorLocation),
         generation: integer(object(value).generation, 1),
       })),
     },
@@ -305,7 +352,13 @@ export const ConmanRpc = Rpc.define({
       input: control,
       output: schema<ControlResult>((value) => {
         const v = object(value);
+        exact(v, ["accepted", "snapshot", "reason"]);
         if (typeof v.accepted !== "boolean") throw new Error("Invalid result");
+        if (v.snapshot === undefined) {
+          if (!v.accepted)
+            throw new Error("Missing rejected-operation snapshot");
+          return { accepted: true, reason: text(v.reason) };
+        }
         const parsed = snapshot["~standard"].validate(v.snapshot);
         if (!("value" in parsed)) throw new Error("Invalid snapshot");
         return { accepted: v.accepted, snapshot: parsed.value };
@@ -317,7 +370,7 @@ export const ConmanRpc = Rpc.define({
       input: validate,
       output: schema<StrictValidationResult>(parseStrictValidationResult),
     },
-    recover: { input: recover, output: snapshot },
+    recover: { input: recover, output: bootstrap },
   },
   events: {},
 });

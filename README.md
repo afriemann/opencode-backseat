@@ -30,17 +30,21 @@ Loading the package does not approve an observer, arm supervision or authorise a
 
 ## Project-local loading
 
-Fill the portable package and coordinator-home placeholders in `examples/opencode.jsonc`, then manually use that plugin entry in the coordinator and each worker project's `opencode.json(c)`. One canonical home is supported per local service: every entry must agree, and conflicting controller or observer configurations are rejected. No global configuration is required. Worker-location server instances only publish native observations; they cannot control workers or grant approval.
+Fill the portable package placeholder in `examples/opencode.jsonc`, then use that plugin entry in each participating project's `opencode.json(c)`. No global configuration is required. Conversation locations and explicitly selected worker projects are independent of coordination storage.
 
-Select **Conman Coordinator** (`conman-coordinator`) in OpenCode's native agent picker at the canonical home and describe your goal. The plugin bundles this primary agent without changing your default agent or model. It gathers the task's criteria, constraints, scope, location and worker agent, inspects existing bindings, and uses the plugin's native approval-gated controls. Unknown project locations and worker agents must come from you; its inspection tool does not enumerate those catalogs. Conversational resume hands off to the native Resume action.
+Select **Conman Coordinator** (`conman-coordinator`) in OpenCode's native agent picker from any participating project and describe your goal. The plugin bundles this primary agent without changing your default agent or model. It gathers the task's criteria, constraints, scope, location and worker agent, inspects existing bindings, and uses the plugin's native approval-gated controls. Unknown project locations and worker agents must come from you; its inspection tool does not enumerate those catalogs. Conversational resume hands off to the native Resume action.
+
+State and ownership use `$XDG_DATA_HOME/opencode-conman`, or `~/.local/share/opencode-conman` when XDG_DATA_HOME is unset, empty or relative. The optional plugin option `dataDir` selects an absolute private directory instead. All participating projects in a service share the first registered store; a conflicting override holds coordination instead of opening another authority. The directory is data storage, not a project to navigate to. Unsafe permissions, corrupt or missing initialized state, and incomplete publication hold coordination without resetting limits or unresolved deliveries. Existing project-local state is neither imported nor deleted.
 
 Coordination requires the bundled role. A conflicting user-defined `conman-coordinator` is preserved unchanged, but makes the dedicated role unavailable. The bundled coordinator cannot be used as a worker; unrelated user roles remain available for worker tasks.
 
 Use `/coordinate` for worker status and supporting controls. Automatic follow-ups require **Coordinate: attach observer (native approval)** followed by **Coordinate: explicitly rearm reconciled observer**. Attachment and rearming are separate, explicit actions. Overview inspection cannot create a session, change its agent or arm supervision. Worker creation and adoption require their own native approvals.
 
-The TUI reads the configured home from native server RPC instead of assuming server plugin options are available as terminal options. A missing, stale, uncorrelated or nonempty worker observation holds supervision. Disconnect stops future admission, not an already admitted operation; reconnect requires fresh inventory and explicit rearming.
+Before attachment, the TUI receives only store identity and availability metadata. Full inventory requires approved attachment and a current signed request; conversational inspection requires the actual dedicated native role. A missing, stale, uncorrelated or nonempty worker observation holds supervision. Disconnect stops future admission, not an already admitted operation; reconnect requires fresh inventory and explicit rearming.
 
-Each suggestion receives one bounded task-only validation pass. A validation receipt is bound to current scope, generation, native boundary, evidence and shared versions. Completion records validated criterion-to-native-call relationships and bounded rationales, not assistant success claims or caller-supplied criterion tags. Validation never grants consent, and recording does not trigger another model pass.
+Recovery returns availability metadata, not task inventory, and requires separate attachment and rearming. If an operation commits after read eligibility changes, the TUI withholds inventory and reports the committed outcome: do not retry it; attach and reconcile explicitly.
+
+Background suggestions and validation use OpenCode's resolved default model for the initiating coordinator's project, not the conversation's selected model, worker model or title agent. There is no separate plugin model setting. Unavailable default-model lookup or generation holds the evaluation without a fallback or worker dispatch. Each suggestion receives one bounded task-only validation pass. A validation receipt is bound to current scope, generation, native boundary, evidence and shared versions. Completion records validated criterion-to-native-call relationships and bounded rationales, not assistant success claims or caller-supplied criterion tags. Validation never grants consent, and recording does not trigger another model pass.
 
 At narrow terminal widths, use **Coordinate: inspect shared versions** (`Alt+V`) for keyboard-accessible full snapshot identifiers and versions instead of relying on clipped overview descriptions.
 
@@ -53,7 +57,7 @@ Run `make prerequisites` for the basic platform/helper check. The ownership
 adapter also verifies path safety and actual exclusion; this check alone does
 not establish filesystem safety. No helper is automatically installed.
 
-The runtime lock inode is permanent and ignored under `.opencode/conman/`.
+The runtime lock inode is permanent at `dataDir/ownership.lock` alongside the private state envelope.
 A short nonblocking helper acquires kernel ownership through an inherited
 descriptor; the coordinator retains that descriptor. Recovery never deletes
 or replaces the lockfile and never resumes workers automatically. Real Bun

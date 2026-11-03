@@ -242,7 +242,7 @@ export interface WorkerBinding extends TaskGoal {
 }
 
 export interface WorkerSnapshot {
-  home: string;
+  dataDir: string;
   location: string;
   sessionID: string;
   incarnation: string;
@@ -621,7 +621,7 @@ export function parseEvidence(
 export function parseWorkerSnapshot(value: unknown): WorkerSnapshot {
   const v = object(value);
   exact(v, [
-    "home",
+    "dataDir",
     "location",
     "sessionID",
     "incarnation",
@@ -682,7 +682,7 @@ export function parseWorkerSnapshot(value: unknown): WorkerSnapshot {
   )
     throw new Error("Invalid native snapshot bound");
   return {
-    home: text(v.home),
+    dataDir: text(v.dataDir),
     location: text(v.location),
     sessionID: text(v.sessionID),
     incarnation: text(v.incarnation),
@@ -825,9 +825,18 @@ export function parseCoordinatorState(value: unknown): CoordinatorState {
   };
   if (v.observer !== undefined) {
     const o = object(v.observer);
-    exact(o, ["coordinatorID", "verifier", "generation", "sequence"]);
+    exact(o, [
+      "dataDir",
+      "coordinatorLocation",
+      "coordinatorID",
+      "verifier",
+      "generation",
+      "sequence",
+    ]);
     state.observer = {
       coordinatorID: text(o.coordinatorID),
+      dataDir: text(o.dataDir),
+      coordinatorLocation: text(o.coordinatorLocation),
       verifier: text(o.verifier),
       generation: integer(o.generation, 1),
       sequence: integer(o.sequence),

@@ -6,17 +6,8 @@ import {
 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  readFile,
-  realpath,
-  stat,
-  statfs,
-  type FileHandle,
-} from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, open, readFile, stat, type FileHandle } from "node:fs/promises";
+import { openAnchoredDirectory } from "./storage.ts";
 
 function serialQueue() {
   let tail = Promise.resolve();
@@ -36,11 +27,11 @@ export interface LockInspection {
 }
 
 export interface OwnershipPort {
-  inspect(home: string): Promise<LockInspection>;
-  acquire(home: string, owner: string): Promise<boolean>;
-  release(home: string, owner: string): Promise<void>;
-  approveRecovery(home: string, owner: string): Promise<void>;
-  recover(home: string, owner: string): Promise<void>;
+  inspect(dataDir: string): Promise<LockInspection>;
+  acquire(dataDir: string, owner: string): Promise<boolean>;
+  release(dataDir: string, owner: string): Promise<void>;
+  approveRecovery(dataDir: string, owner: string): Promise<void>;
+  recover(dataDir: string, owner: string): Promise<void>;
 }
 
 interface ProcessIdentity {
@@ -62,10 +53,6 @@ interface KernelGuard {
 }
 
 const ownerRecordLimit = 8192;
-// Linux magic.h: ext, XFS, Btrfs, tmpfs, overlayfs; unknown/network types hold.
-const localFilesystems = new Set([
-  0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630,
-]);
 const ownershipError = () => new Error("Recovery is not eligible");
 
 function hasCode(error: unknown, code: string): boolean {
@@ -164,8 +151,10 @@ async function readOwner(
 async function writeOwner(
   guard: KernelGuard,
   record: FilesystemOwner,
+  validateWrite?: () => Promise<void>,
 ): Promise<void> {
   await guard.validate();
+  await validateWrite?.();
   const bytes = Buffer.from(JSON.stringify(record));
   let written = 0;
   while (written < bytes.length) {
@@ -215,102 +204,42 @@ async function acquireKernelLock(file: FileHandle): Promise<boolean> {
   return exit === 0;
 }
 
-async function kernelGuard(home: string): Promise<KernelGuard | undefined> {
+async function kernelGuard(dataDir: string): Promise<KernelGuard | undefined> {
   if (
     process.platform !== "linux" ||
     typeof Bun === "undefined" ||
     Bun.version !== "1.4.4" ||
     !process.getuid ||
     !constants.O_NOFOLLOW ||
-    !constants.O_DIRECTORY ||
-    resolve(home) !== home ||
-    (await realpath(home)) !== home
+    !constants.O_DIRECTORY
   )
     throw ownershipError();
-  const uid = process.getuid();
-  const handles: {
-    file: FileHandle;
-    path: string;
-    directory: boolean;
-    private: boolean;
-  }[] = [];
+  const anchor = await openAnchoredDirectory(dataDir);
+  let file: FileHandle | undefined;
   const close = async () => {
-    const results = await Promise.allSettled(
-      handles
-        .slice()
-        .reverse()
-        .map(({ file }) => file.close()),
-    );
-    const failed = results.find((result) => result.status === "rejected");
-    if (failed?.status === "rejected") throw failed.reason;
-  };
-  const validate = async () => {
-    for (const entry of handles) {
-      const actual = await entry.file.stat();
-      const named = await lstat(entry.path);
-      if (
-        actual.ino !== named.ino ||
-        actual.dev !== named.dev ||
-        named.isSymbolicLink() ||
-        (entry.directory
-          ? !actual.isDirectory()
-          : !actual.isFile() || actual.nlink !== 1) ||
-        (actual.uid !== uid && actual.uid !== 0) ||
-        (actual.mode & 0o022) !== 0 ||
-        (entry.private &&
-          (actual.uid !== uid ||
-            (actual.mode & 0o777) !== (entry.directory ? 0o700 : 0o600)))
-      )
-        throw ownershipError();
+    try {
+      await file?.close();
+    } finally {
+      await anchor.close();
     }
   };
   try {
-    const root = await open(
-      "/",
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-    );
-    handles.push({ file: root, path: "/", directory: true, private: false });
-    let parent = root;
-    let path = "";
-    for (const part of [
-      ...home.slice(1).split("/").filter(Boolean),
-      ".opencode",
-      "conman",
-    ]) {
-      path += `/${part}`;
-      const privateDirectory = path === `${home}/.opencode/conman`;
-      const anchored = `/proc/self/fd/${parent.fd}/${part}`;
-      if (path === `${home}/.opencode` || privateDirectory) {
-        try {
-          await mkdir(anchored, { mode: 0o700 });
-        } catch (error) {
-          if (!hasCode(error, "EEXIST")) throw error;
-        }
-      }
-      const file = await open(
-        anchored,
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
-      handles.push({ file, path, directory: true, private: privateDirectory });
-      parent = file;
-      await validate();
-    }
-    const filesystem = await statfs(`/proc/self/fd/${parent.fd}`);
-    if (!localFilesystems.has(filesystem.type)) throw ownershipError();
-    const file = await open(
-      `/proc/self/fd/${parent.fd}/ownership.lock`,
+    file = await open(
+      `${anchor.path}/ownership.lock`,
       constants.O_RDWR |
         constants.O_CREAT |
         constants.O_NOFOLLOW |
         constants.O_NONBLOCK,
       0o600,
     );
-    handles.push({
-      file,
-      path: `${path}/ownership.lock`,
-      directory: false,
-      private: true,
-    });
+    const lockedFile = file;
+    const validate = async () => {
+      try {
+        await anchor.validateFile(lockedFile, "ownership.lock");
+      } catch {
+        throw ownershipError();
+      }
+    };
     await validate();
     if (!(await acquireKernelLock(file))) {
       await close();
@@ -325,7 +254,8 @@ async function kernelGuard(home: string): Promise<KernelGuard | undefined> {
 }
 
 export function createFilesystemOwnershipPort(
-  approveRecovery: (home: string, owner: string) => Promise<void>,
+  approveRecovery: (dataDir: string, owner: string) => Promise<void>,
+  validateRecovery?: () => Promise<void>,
 ): OwnershipPort {
   const serial = serialQueue();
   const owned = new Map<
@@ -334,11 +264,11 @@ export function createFilesystemOwnershipPort(
   >();
   const approvals = new Map<string, string>();
   async function withGuard<T>(
-    home: string,
+    dataDir: string,
     work: (guard: KernelGuard) => Promise<T>,
   ): Promise<T> {
-    const lease = owned.get(home);
-    const guard = lease?.guard ?? (await kernelGuard(home));
+    const lease = owned.get(dataDir);
+    const guard = lease?.guard ?? (await kernelGuard(dataDir));
     if (!guard) throw ownershipError();
     try {
       return await work(guard);
@@ -347,11 +277,11 @@ export function createFilesystemOwnershipPort(
     }
   }
   return {
-    inspect(home) {
+    inspect(dataDir) {
       return serial(async () => {
         try {
           return await withGuard(
-            home,
+            dataDir,
             async (guard): Promise<LockInspection> => {
               const { record } = await readOwner(guard);
               return record && !record.released
@@ -370,12 +300,12 @@ export function createFilesystemOwnershipPort(
         }
       });
     },
-    acquire(home, owner) {
+    acquire(dataDir, owner) {
       return serial(async () => {
-        if (!owner || owner.length > 512 || owned.has(home)) return false;
+        if (!owner || owner.length > 512 || owned.has(dataDir)) return false;
         let guard: KernelGuard | undefined;
         try {
-          guard = await kernelGuard(home);
+          guard = await kernelGuard(dataDir);
           if (!guard) return false;
           const { record: prior } = await readOwner(guard);
           if (prior && !prior.released) return false;
@@ -386,7 +316,7 @@ export function createFilesystemOwnershipPort(
             identity: await processIdentity(),
           };
           await writeOwner(guard, record);
-          owned.set(home, { guard, record });
+          owned.set(dataDir, { guard, record });
           guard = undefined;
           return true;
         } catch {
@@ -396,9 +326,9 @@ export function createFilesystemOwnershipPort(
         }
       });
     },
-    release(home, owner) {
+    release(dataDir, owner) {
       return serial(async () => {
-        const lease = owned.get(home);
+        const lease = owned.get(dataDir);
         if (!lease || lease.record.owner !== owner) throw ownershipError();
         try {
           const { record } = await readOwner(lease.guard);
@@ -406,15 +336,15 @@ export function createFilesystemOwnershipPort(
             throw ownershipError();
           await writeOwner(lease.guard, { ...lease.record, released: true });
         } finally {
-          owned.delete(home);
+          owned.delete(dataDir);
           await lease.guard.close();
         }
       });
     },
-    async approveRecovery(home, owner) {
+    async approveRecovery(dataDir, owner) {
       const text = await serial(async () => {
-        approvals.delete(home);
-        return withGuard(home, async (guard) => {
+        approvals.delete(dataDir);
+        return withGuard(dataDir, async (guard) => {
           const { text, record } = await readOwner(guard);
           if (
             !record ||
@@ -426,16 +356,16 @@ export function createFilesystemOwnershipPort(
           return text;
         });
       });
-      await approveRecovery(home, owner);
+      await approveRecovery(dataDir, owner);
       await serial(async () => {
-        approvals.set(home, text);
+        approvals.set(dataDir, text);
       });
     },
-    recover(home, owner) {
+    recover(dataDir, owner) {
       return serial(async () => {
-        const approved = approvals.get(home);
-        approvals.delete(home);
-        await withGuard(home, async (guard) => {
+        const approved = approvals.get(dataDir);
+        approvals.delete(dataDir);
+        await withGuard(dataDir, async (guard) => {
           const { text, record } = await readOwner(guard);
           if (
             !approved ||
@@ -446,7 +376,11 @@ export function createFilesystemOwnershipPort(
             !(await terminated(record.identity))
           )
             throw ownershipError();
-          await writeOwner(guard, { ...record, released: true });
+          await writeOwner(
+            guard,
+            { ...record, released: true },
+            validateRecovery,
+          );
         });
       });
     },
@@ -458,7 +392,7 @@ export class CoordinatorOwnership {
   private owned = false;
   private closed = false;
   constructor(
-    readonly home: string,
+    readonly dataDir: string,
     readonly owner: string,
     private readonly port: OwnershipPort,
   ) {}
@@ -467,9 +401,9 @@ export class CoordinatorOwnership {
       if (this.closed) return "held";
       if (this.owned) return "owned";
       try {
-        const inspection = await this.port.inspect(this.home);
+        const inspection = await this.port.inspect(this.dataDir);
         if (!inspection.safe || inspection.lock) return "held";
-        this.owned = await this.port.acquire(this.home, this.owner);
+        this.owned = await this.port.acquire(this.dataDir, this.owner);
         return this.owned && !this.closed ? "owned" : "held";
       } catch {
         return "held";
@@ -478,7 +412,7 @@ export class CoordinatorOwnership {
   }
   recover(): Promise<"held"> {
     return this.serial(async (): Promise<"held"> => {
-      const before = await this.port.inspect(this.home);
+      const before = await this.port.inspect(this.dataDir);
       if (
         this.closed ||
         this.owned ||
@@ -487,8 +421,8 @@ export class CoordinatorOwnership {
         before.lock.running
       )
         throw new Error("Recovery is not eligible");
-      await this.port.approveRecovery(this.home, before.lock.owner);
-      const after = await this.port.inspect(this.home);
+      await this.port.approveRecovery(this.dataDir, before.lock.owner);
+      const after = await this.port.inspect(this.dataDir);
       if (
         this.closed ||
         !after.safe ||
@@ -497,7 +431,7 @@ export class CoordinatorOwnership {
         after.lock.owner !== before.lock.owner
       )
         throw new Error("Recovery is not eligible");
-      await this.port.recover(this.home, before.lock.owner);
+      await this.port.recover(this.dataDir, before.lock.owner);
       return "held";
     });
   }
@@ -505,40 +439,82 @@ export class CoordinatorOwnership {
     this.closed = true;
     await this.serial(async () => {
       await drain();
-      if (this.owned) await this.port.release(this.home, this.owner);
+      if (this.owned) await this.port.release(this.dataDir, this.owner);
       this.owned = false;
     });
   }
 }
 
-export interface ObserverRecord {
+export interface ObserverScope {
+  dataDir: string;
+  coordinatorLocation: string;
+}
+export interface ObserverRecord extends ObserverScope {
   coordinatorID: string;
   generation: number;
   verifier: string;
   sequence: number;
 }
-const serviceHomeKey = Symbol.for("opencode.conman.native-service-home.v1");
-type ServiceHome = { home: string; instances: number };
-// Symbol.for survives plugin-module reloads within the native service process.
-export function registerServiceHome(home: string): () => void {
-  const registry = globalThis as typeof globalThis & {
-    [serviceHomeKey]?: ServiceHome;
+
+export interface CoordinatorCoreLease<T> {
+  readonly core: T;
+  release(): Promise<void>;
+}
+
+type DisposableCore = { dispose(): Promise<void> };
+type CoreRegistry = {
+  tail: Promise<unknown>;
+  entry?: {
+    directory: string;
+    core: DisposableCore;
+    leases: number;
+    closing: boolean;
   };
-  const existing = registry[serviceHomeKey];
-  if (existing && existing.home !== home)
-    throw new Error(
-      "Conflicting canonical homes in one native service are unsupported",
-    );
-  const entry = existing ?? { home, instances: 0 };
-  registry[serviceHomeKey] = entry;
-  entry.instances++;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    if (--entry.instances === 0 && registry[serviceHomeKey] === entry)
-      delete registry[serviceHomeKey];
+};
+const coordinatorCoreKey = Symbol.for("opencode.conman.coordinator-core");
+
+export async function acquireCoordinatorCore<
+  T extends { dispose(): Promise<void> },
+>(
+  directory: string,
+  create: () => Promise<T>,
+): Promise<CoordinatorCoreLease<T>> {
+  const service = globalThis as typeof globalThis & {
+    [coordinatorCoreKey]?: CoreRegistry;
   };
+  const registry = (service[coordinatorCoreKey] ??= {
+    tail: Promise.resolve(),
+  });
+  const serial = <R>(work: () => Promise<R>): Promise<R> => {
+    const result = registry.tail.then(work);
+    registry.tail = result.catch(() => undefined);
+    return result;
+  };
+  return serial(async () => {
+    let entry = registry.entry;
+    if (entry && entry.directory !== directory)
+      throw new Error("Conflicting coordination stores in one native service");
+    if (entry?.closing)
+      throw new Error("Coordination runtime shutdown is incomplete; held");
+    if (!entry) {
+      entry = { directory, core: await create(), leases: 0, closing: false };
+      registry.entry = entry;
+    }
+    const current = entry;
+    current.leases++;
+    let release: Promise<void> | undefined;
+    return {
+      core: current.core as T,
+      release() {
+        return (release ??= serial(async () => {
+          if (--current.leases !== 0) return;
+          current.closing = true;
+          await current.core.dispose();
+          if (registry.entry === current) delete registry.entry;
+        }));
+      },
+    };
+  });
 }
 
 export interface ObserverPort {
@@ -547,7 +523,7 @@ export interface ObserverPort {
   approve(record: ObserverRecord): Promise<void>;
 }
 
-export interface SignedControl {
+export interface SignedControl extends ObserverScope {
   generation: number;
   sequence: number;
   payload: string;
@@ -568,12 +544,13 @@ export function createObserverCapability(): {
     generation: number,
     sequence: number,
     payload: ControlPayload,
+    scope: ObserverScope,
   ): SignedControl;
 } {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   return {
     verifier: publicKey.export({ format: "pem", type: "spki" }).toString(),
-    sign(generation, sequence, payload) {
+    sign(generation, sequence, payload, scope) {
       const text = JSON.stringify(payload);
       return {
         generation,
@@ -581,9 +558,11 @@ export function createObserverCapability(): {
         payload: text,
         signature: sign(
           null,
-          controlBytes(generation, sequence, text),
+          controlBytes(generation, sequence, text, scope),
           privateKey,
         ).toString("base64"),
+        dataDir: scope.dataDir,
+        coordinatorLocation: scope.coordinatorLocation,
       };
     },
   };
@@ -593,8 +572,17 @@ function controlBytes(
   generation: number,
   sequence: number,
   payload: string,
+  scope: ObserverScope,
 ): Buffer {
-  return Buffer.from(JSON.stringify([generation, sequence, payload]));
+  return Buffer.from(
+    JSON.stringify([
+      scope.dataDir,
+      scope.coordinatorLocation,
+      generation,
+      sequence,
+      payload,
+    ]),
+  );
 }
 
 export function forceNativeAsk(event: {
@@ -612,6 +600,7 @@ export class ObserverAuthority {
   constructor(
     readonly coordinatorID: string,
     private readonly port: ObserverPort,
+    private readonly scope: ObserverScope,
   ) {}
   attach(verifier: string): Promise<number> {
     const fence = this.fence;
@@ -626,6 +615,8 @@ export class ObserverAuthority {
       if (!Number.isSafeInteger(generation) || generation < 1)
         throw new Error("Observer authority is not eligible");
       const record = {
+        dataDir: this.scope.dataDir,
+        coordinatorLocation: this.scope.coordinatorLocation,
         coordinatorID: this.coordinatorID,
         generation,
         verifier,
@@ -678,6 +669,8 @@ function validateControl(
   const fail = () => new Error("Observer authority is not eligible");
   if (
     !record ||
+    proof.dataDir !== record.dataDir ||
+    proof.coordinatorLocation !== record.coordinatorLocation ||
     proof.generation !== record.generation ||
     !Number.isSafeInteger(proof.sequence) ||
     proof.sequence !== record.sequence + 1 ||
@@ -694,7 +687,7 @@ function validateControl(
       signature.toString("base64") !== proof.signature ||
       !verify(
         null,
-        controlBytes(proof.generation, proof.sequence, proof.payload),
+        controlBytes(proof.generation, proof.sequence, proof.payload, record),
         record.verifier,
         signature,
       )
