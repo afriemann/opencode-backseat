@@ -13,8 +13,8 @@ The coordinator SHALL bind each task to an explicitly authorised goal, success c
 #### Scenario: Creates a worker at the selected location
 
 - **GIVEN** an authorised task and an agent available at its selected location
-- **WHEN** the coordinator creates its worker
-- **THEN** the new session uses that location and agent and receives only the task's authorised starting prompt.
+- **WHEN** the coordinator creates its worker through conversational control without TUI attachment
+- **THEN** the new session uses that location and agent and receives only the task's authorised starting prompt, without a separate resume or automation-arming step.
 
 #### Scenario: Rejects an unavailable or mismatched target
 
@@ -112,15 +112,15 @@ The plugin SHALL provide a selectable primary coordinator agent wherever it is e
 
 ### Requirement: Restricted conversational coordination
 
-The plugin SHALL restrict matching coordinator roles to coordination tools and user questions while keeping native consent and connected-TUI supervision authoritative.
+The plugin SHALL restrict matching coordinator roles to coordination tools and user questions while keeping native consent authoritative and automatic supervision separate from conversational commands.
 
 #### Scenario: Preserves native approval for conversational control
 
 - **WHEN** a matching coordinator role is selected
 - **THEN** only `conman_inspect`, `conman_control` and user questions are permitted, subject to configured denials, with native `conman.*` actions requiring approval rather than inheriting permissive agent defaults.
 - **AND** shell, editing, reading, web, Code Mode, subagent and permission/form-reply capabilities remain denied; attachment and supervision are not automatically approved or armed.
-- **AND** the role requests unknown project and agent fields, treats worker evidence as untrusted, and directs operations requiring native reconciliation to the TUI rather than inventing authority or retrying uncertain results.
-- **AND** coordinator operations require matching role semantics resolved at the initiating session's current project for the selected store; an unrelated assigned agent or an agentless session cannot acquire coordinator authority.
+- **AND** the role resolves project and agent fields through inventory, asks only when the user's selection remains ambiguous, treats worker evidence as untrusted, and performs ordinary listing, takeover, creation and assignment without directing the user to a TUI.
+- **AND** coordinator operations require matching role semantics resolved at the initiating session's current project; an unrelated assigned agent or an agentless session cannot acquire coordinator authority. Durable mutations still require authority for the selected store; native inventory does not.
 
 #### Scenario: Rejects coordinator worker assignments
 
@@ -137,8 +137,8 @@ The plugin SHALL restrict matching coordinator roles to coordination tools and u
 #### Scenario: Preserves cross-project control under inherited policy
 
 - **GIVEN** a matching coordinator conversation in one project and an approved task-bound worker in another project share the coordination store
-- **WHEN** inherited policy is merged and the coordinator inspects or controls that task
-- **THEN** recognition uses the conversation's current project, the worker remains at its explicit approved location, and existing scope, isolation and native approval checks apply without requiring another coordinator or navigation to storage.
+- **WHEN** inherited policy is merged and the coordinator inspects or manually controls that task without TUI attachment
+- **THEN** recognition uses the conversation's current project, the worker remains at its explicit approved location, and existing scope, isolation and native approval checks apply without another coordinator, navigation to storage, or a persisted observer's initiating-session prerequisite.
 
 ### Requirement: Shared durable coordination store
 
@@ -157,6 +157,18 @@ The plugin SHALL keep coordination state in one selected user data store indepen
 - **THEN** coordination stays visibly held without resetting limits, losing uncertain deliveries, repairing existing permissions, following substituted files or falling back to project-local state.
 - **AND** shared state and observations have bounded reads and atomic durable publication; only genuinely uninitialized stores start empty.
 
+#### Scenario: Preserves populated stores across manual assignments
+
+- **GIVEN** an existing version-1 store with initial or automatic sends and consumed automation limits
+- **WHEN** explicitly approved manual assignments are recorded and the store reloads
+- **THEN** existing records and counters remain intact, manual sends retain distinct provenance and delivery identities in the same ledger, and no migration or reset is required.
+- **AND** older readers that cannot represent manual sends reject those records rather than silently reinterpret them.
+
+#### Scenario: Rejects invalid manual-delivery records
+
+- **WHEN** a manual record claims automation authority or validation, references an invalid binding, or violates delivery identity bounds
+- **THEN** loading rejects the invalid state without dropping records or treating it as an empty store.
+
 ### Requirement: Authorised shared-state inspection
 
 The plugin SHALL restrict full coordination state and evidence to verified native coordinator-tool context or current approved native-TUI possession.
@@ -172,3 +184,73 @@ The plugin SHALL restrict full coordination state and evidence to verified nativ
 - **WHEN** full state or evidence is requested with an unrelated role, caller-supplied identity alone, obsolete proof, wrong store, relocated initiating session or revoked attachment
 - **THEN** no task snapshot or evidence is disclosed.
 - **AND** verified coordinator-tool calls and currently approved native-TUI proofs can inspect the selected store without granting worker evidence any control authority.
+
+### Requirement: Automatic same-service native connection
+
+The coordinator SHALL obtain native inventory through an automatically authenticated connection verified against its current service instance without manual connection configuration or TUI attachment.
+
+#### Scenario: Connects automatically to the current native service
+
+- **GIVEN** a native registration for the service hosting the plugin
+- **WHEN** the coordinator requests session inventory
+- **THEN** authentication and instance verification occur without user-supplied endpoint or credential settings, and no service is started or restarted.
+
+#### Scenario: Rejects an unavailable or different native service
+
+- **WHEN** native registration is missing, incompatible, or does not identify the hosting service incarnation
+- **THEN** inventory reports the specific unavailable or unsupported connection without accepting another service's sessions or changing durable state.
+
+#### Scenario: Rejects unsafe destinations before exposing credentials
+
+- **WHEN** registration safety or destination confinement cannot be established, or a request redirects outside the verified connection
+- **THEN** the connection rejects the request without exposing credentials in output, diagnostics, or an unapproved destination.
+
+#### Scenario: Cancels native reads when the plugin unloads
+
+- **WHEN** the plugin unloads during a native read
+- **THEN** the read is cancelled and cannot publish a successful inventory for the disposed instance.
+
+### Requirement: Native session inventory
+
+The coordinator SHALL list native sessions across all projects on its verified service independently of task bindings, storage authority, and automation attachment.
+
+#### Scenario: Lists sessions across projects without task or TUI prerequisites
+
+- **GIVEN** native sessions in multiple projects, including sessions without Conman bindings
+- **WHEN** a verified coordinator requests inventory while task storage is unavailable or no TUI is attached
+- **THEN** those sessions remain discoverable with identity, title, project location, agent, and current status metadata; protected task content and native conversation, form, inbox, and log contents are not disclosed.
+
+#### Scenario: Reports native running and waiting status without automation evidence
+
+- **WHEN** native activity and pending permission or form state are read for a session without automation observations
+- **THEN** running or waiting-for-input status reflects those native reads, not execution timestamps or missing automation evidence.
+
+#### Scenario: Reports partial or unknown inventory honestly
+
+- **WHEN** a bounded inventory page is incomplete or a native status read fails or conflicts
+- **THEN** the response identifies continuation or partial availability and unknown status rather than claiming an empty inventory, idle session, or completed work.
+
+### Requirement: Conversational manual assignment
+
+The coordinator SHALL admit explicitly requested assignments to selected existing sessions through operation-bound native approval without observer attachment, resume, or automation arming.
+
+#### Scenario: Takes over a selected session without inventing work
+
+- **WHEN** the user selects an existing session for coordinator management without requesting an assignment
+- **THEN** the coordinator adopts its binding or takes over its existing binding, fences automatic decisions, and sends no invented prompt, agent switch, or interruption.
+
+#### Scenario: Sends repeated assignments without automation prerequisites
+
+- **GIVEN** a selected held or manually managed binding with no observer attachment
+- **WHEN** the user requests successive assignments within its approved scope and each receives native approval
+- **THEN** each assignment reaches the selected worker without resume or arming, does not consume automation allowances, and leaves automatic dispatch disabled.
+
+#### Scenario: Rejects changed or unapproved manual targets
+
+- **WHEN** native approval is denied, the initiating identity or selected binding changes during approval, competing ownership remains, or the assignment's declared scope exceeds approved scope
+- **THEN** no manual prompt is admitted and the concrete unresolved target or permission is reported without implicitly answering pending native asks.
+
+#### Scenario: Retains an uncertain manual send without resending
+
+- **WHEN** admission acknowledgement is lost or durable publication fails after a manual send may have been accepted
+- **THEN** its reserved delivery identity survives reload, further sends remain blocked pending reconciliation, and no automatic resend or replacement identity is generated.
