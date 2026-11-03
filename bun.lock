@@ -4,8 +4,10 @@
   "workspaces": {
     "": {
       "name": "opencode-conman",
-      "devDependencies": {
+      "dependencies": {
         "@opencode/client": "2.2.5",
+      },
+      "devDependencies": {
         "@opencode/plugin": "2.2.5",
         "@opencode/theme": "2.2.5",
         "@opentui/core": "0.8.0",

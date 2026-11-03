@@ -14,9 +14,11 @@
   "peerDependencies": {
     "@opencode/plugin": ">=2.2.5 <3"
   },
+  "dependencies": {
+    "@opencode/client": "2.2.5"
+  },
   "devDependencies": {
     "@opencode/plugin": "2.2.5",
-    "@opencode/client": "2.2.5",
     "@opencode/theme": "2.2.5",
     "@opentui/core": "0.8.0",
     "@opentui/solid": "0.8.0",

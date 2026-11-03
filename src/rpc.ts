@@ -30,6 +30,7 @@ import type { SharedSnapshot } from "./context.ts";
 export const CONTROL_OPERATIONS = [
   "create",
   "adopt",
+  "dispatch",
   "hold",
   "resume",
   "takeover",
@@ -185,6 +186,7 @@ export interface RecoverInput {
 }
 export type ControlBody =
   | TaskGoal
+  | { text: string; scope: readonly string[] }
   | { reconciliation: ResumeReconciliation }
   | { goal: TaskGoal; workerID: string }
   | {
@@ -338,6 +340,25 @@ const validate = schema<ValidateInput>((value) => {
 export const ConmanRpc = Rpc.define({
   id: "conman",
   methods: {
+    identity: {
+      input: schema<{ nonce: string; origin: string }>((value) => {
+        const v = object(value);
+        exact(v, ["nonce", "origin"]);
+        const nonce = text(v.nonce),
+          origin = text(v.origin);
+        if (!/^[a-f0-9]{64}$/.test(nonce) || origin.length > 200)
+          throw new Error("Invalid native identity challenge");
+        return { nonce, origin };
+      }),
+      output: schema<{ mac: string }>((value) => {
+        const v = object(value);
+        exact(v, ["mac"]);
+        const mac = text(v.mac);
+        if (!/^[a-f0-9]{64}$/.test(mac))
+          throw new Error("Invalid native identity proof");
+        return { mac };
+      }),
+    },
     bootstrap: { input: empty, output: bootstrap },
     inspect: { input: inspection, output: snapshot },
     attach: {

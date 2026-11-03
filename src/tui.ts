@@ -9,8 +9,6 @@ import {
   coordinationStatusDetails,
   overview,
   sharedVersionDetails,
-  type ProjectChoice,
-  type WorkerChoice,
   type UiState,
 } from "./ui.ts";
 import {
@@ -55,154 +53,15 @@ import {
   type StrictValidationResult,
   type Suggestion,
 } from "./evaluator.ts";
-import type { DispatchIntent } from "./dispatch.ts";
-
-export type NativeClient = Plugin.Context["client"];
-export interface NativeCatalogClient {
-  project: Pick<NativeClient["project"], "list">;
-  agent: Pick<NativeClient["agent"], "list">;
-  session: Pick<NativeClient["session"], "list">;
-}
-
-export interface NativeAskClient {
-  permission: { request: Pick<NativeClient["permission"]["request"], "list"> };
-  session: { form: Pick<NativeClient["session"]["form"], "list" | "get"> };
-}
-
-export async function readNativeAsks(
-  client: NativeAskClient,
-  binding: WorkerBinding,
-  signal?: AbortSignal,
-): Promise<readonly string[]> {
-  const [permissions, forms] = await Promise.all([
-    client.permission.request.list(
-      { location: { directory: binding.location } },
-      signal ? { signal } : undefined,
-    ),
-    client.session.form.list(
-      { sessionID: binding.workerID },
-      signal ? { signal } : undefined,
-    ),
-  ]);
-  if (
-    permissions.location.directory !== binding.location ||
-    permissions.data.length > NATIVE_BOUNDS.catalogRows ||
-    forms.length > NATIVE_BOUNDS.catalogRows ||
-    forms.some((form) => form.sessionID !== binding.workerID)
-  ) {
-    throw new Error("Pending-input inventory is incomplete or mismatched");
-  }
-  const asks = permissions.data
-    .filter((request) => request.sessionID === binding.workerID)
-    .map((request) => `permission:${request.id}`);
-  for (const form of forms) {
-    const detail = await client.session.form.get(
-      { sessionID: binding.workerID, formID: form.id },
-      signal ? { signal } : undefined,
-    );
-    if (detail.id !== form.id || detail.sessionID !== binding.workerID)
-      throw new Error("Form inventory does not match the selected worker");
-    if (detail.state.status === "pending") asks.push(`form:${form.id}`);
-  }
-  return asks;
-}
-
-const NATIVE_BOUNDS = Object.freeze({ catalogRows: 200 });
-
-export class NativeDiscovery {
-  constructor(
-    private readonly client: NativeCatalogClient,
-    private readonly signal?: AbortSignal,
-  ) {}
-  async projects(): Promise<readonly ProjectChoice[]> {
-    const projects = await this.client.project.list(
-      { archived: false },
-      this.signal ? { signal: this.signal } : undefined,
-    );
-    const choices = projects.flatMap((project) =>
-      [...new Set([project.canonical, ...project.sandboxes])].map(
-        (location) => ({
-          id: JSON.stringify([project.id, location]),
-          title:
-            location === project.canonical
-              ? (project.name ?? pathName(location))
-              : `${project.name ?? pathName(project.canonical)} / ${pathName(location)}`,
-          location,
-        }),
-      ),
-    );
-    if (
-      choices.length > NATIVE_BOUNDS.catalogRows ||
-      choices.some((choice) => !choice.location.startsWith("/"))
-    ) {
-      throw new Error("Project discovery is incomplete or unsupported");
-    }
-    return choices;
-  }
-
-  async agents(location: string): Promise<readonly string[]> {
-    const result = await this.client.agent.list(
-      { location: { directory: location } },
-      this.signal ? { signal: this.signal } : undefined,
-    );
-    if (
-      result.location.directory !== location ||
-      result.data.length > NATIVE_BOUNDS.catalogRows
-    ) {
-      throw new Error("Agent discovery does not match the selected location");
-    }
-    return result.data
-      .filter(
-        (agent) =>
-          !agent.hidden &&
-          agent.mode !== "subagent" &&
-          !isCoordinatorAgent(agent),
-      )
-      .map((agent) => agent.id);
-  }
-
-  async workers(
-    location: string,
-    agent: string,
-  ): Promise<readonly WorkerChoice[]> {
-    const workers: WorkerChoice[] = [];
-    const cursors = new Set<string>();
-    let cursor: string | undefined;
-    let seen = 0;
-    do {
-      const page = await this.client.session.list(
-        { directory: location, archived: false, ...(cursor ? { cursor } : {}) },
-        this.signal ? { signal: this.signal } : undefined,
-      );
-      seen += page.data.length;
-      if (seen > NATIVE_BOUNDS.catalogRows)
-        throw new Error("Worker discovery exceeds its bound");
-      for (const worker of page.data) {
-        if (
-          worker.location.directory === location &&
-          worker.agent === agent &&
-          !worker.time.archived
-        ) {
-          workers.push({
-            workerID: worker.id,
-            title: worker.title ?? worker.id,
-            location,
-            agent,
-          });
-        }
-      }
-      cursor = page.cursor.next ?? undefined;
-      if (cursor && cursors.has(cursor))
-        throw new Error("Worker discovery is incomplete");
-      if (cursor) cursors.add(cursor);
-    } while (cursor);
-    return workers;
-  }
-}
-
-function pathName(location: string): string {
-  return location.split("/").filter(Boolean).at(-1) ?? location;
-}
+import {
+  NativeDiscovery,
+  readNativeDelivery,
+  readNativeLiveState,
+  NATIVE_BOUNDS,
+  type NativeClient,
+  type NativeCatalogClient,
+  type NativeAskClient,
+} from "./native-sessions.ts";
 
 export type NativeRuntimeClient = NativeCatalogClient &
   NativeAskClient & {
@@ -216,7 +75,9 @@ export type NativeRuntimeClient = NativeCatalogClient &
       session: Pick<NativeClient["experimental"]["session"], "log">;
     };
     event: Pick<NativeClient["event"], "subscribe">;
-    rpc(definition: typeof ConmanRpc): RpcClient<typeof ConmanRpc>;
+    rpc(
+      definition: typeof ConmanRpc,
+    ): Omit<RpcClient<typeof ConmanRpc>, "identity">;
   };
 export interface NativeRuntimeContext {
   location: Plugin.Context["location"];
@@ -233,81 +94,6 @@ export interface NativeRuntimeContext {
   };
 }
 
-export async function readNativeDelivery(
-  client: NativeRuntimeClient,
-  binding: WorkerBinding,
-  intent: DispatchIntent,
-  signal: AbortSignal,
-): Promise<"admitted" | "unknown"> {
-  if (
-    binding.id !== intent.taskID ||
-    binding.workerID !== intent.workerID ||
-    signal.aborted
-  )
-    return "unknown";
-  try {
-    const request = { signal };
-    const worker = await client.session.get(
-      { sessionID: intent.workerID },
-      request,
-    );
-    if (
-      worker.id !== intent.workerID ||
-      worker.agent !== binding.agent ||
-      worker.location.directory !== binding.location ||
-      worker.time.archived
-    )
-      return "unknown";
-    const inbox = await client.session.inbox.list(
-      { sessionID: intent.workerID },
-      request,
-    );
-    if (
-      inbox.length > NATIVE_BOUNDS.catalogRows ||
-      inbox.some((item) => item.sessionID !== intent.workerID)
-    )
-      return "unknown";
-    // Admission may still be queued. Its original ID is already durably native;
-    // do not send it again merely because execution has not started.
-    const queued = inbox.filter((item) => item.id === intent.id);
-    if (queued.length)
-      return queued.length === 1 &&
-        queued[0]?.type === "user" &&
-        !signal.aborted
-        ? "admitted"
-        : "unknown";
-    const seen = new Set<string>(),
-      cursors = new Set<string>();
-    let cursor: string | undefined;
-    let delivered = false;
-    do {
-      const page = await client.message.list(
-        {
-          sessionID: intent.workerID,
-          limit: NATIVE_BOUNDS.catalogRows,
-          ...(cursor ? { cursor } : { order: "asc" as const }),
-        },
-        request,
-      );
-      for (const message of page.data) {
-        if (seen.has(message.id) || seen.size >= NATIVE_BOUNDS.catalogRows)
-          return "unknown";
-        seen.add(message.id);
-        if (message.id === intent.id) {
-          if (message.type !== "user") return "unknown";
-          delivered = true;
-        }
-      }
-      cursor = page.cursor.next ?? undefined;
-      if (cursor && cursors.has(cursor)) return "unknown";
-      if (cursor) cursors.add(cursor);
-    } while (cursor);
-    return delivered && !signal.aborted ? "admitted" : "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
 /** Current full-client reads; no idle/log event can prove global settlement. */
 export async function readNativeObservation(
   client: NativeRuntimeClient,
@@ -317,15 +103,12 @@ export async function readNativeObservation(
   observed?: WorkerSnapshot,
 ): Promise<WorkerObservation> {
   const request = { signal };
-  const [worker, active, asks, inbox, shells, nativeContext] =
-    await Promise.all([
-      client.session.get({ sessionID: binding.workerID }, request),
-      client.session.active(request),
-      readNativeAsks(client, binding, signal),
-      client.session.inbox.list({ sessionID: binding.workerID }, request),
-      client.shell.list({ location: { directory: binding.location } }, request),
-      client.session.context({ sessionID: binding.workerID }, request),
-    ]);
+  const [live, shells, nativeContext] = await Promise.all([
+    readNativeLiveState(client, binding, signal),
+    client.shell.list({ location: { directory: binding.location } }, request),
+    client.session.context({ sessionID: binding.workerID }, request),
+  ]);
+  const { worker, active, asks, inbox } = live;
   if (
     worker.id !== binding.workerID ||
     worker.agent !== binding.agent ||

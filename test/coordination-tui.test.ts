@@ -15,14 +15,16 @@ import { RGBA } from "@opentui/core";
 import type { WorkerBinding } from "../src/state.ts";
 import {
   setupNativeTui,
+  readNativeObservation,
+  type NativeRuntimeContext,
+} from "../src/tui.ts";
+import {
   NativeDiscovery,
   readNativeAsks,
-  readNativeObservation,
   readNativeDelivery,
   type NativeCatalogClient,
   type NativeAskClient,
-  type NativeRuntimeContext,
-} from "../src/tui.ts";
+} from "../src/native-sessions.ts";
 import type {
   DialogSelectOptions,
   KeymapCommand,

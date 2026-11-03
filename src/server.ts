@@ -1,4 +1,13 @@
 import { Plugin } from "@opencode/plugin";
+import {
+  createNativeConnection,
+  type NativeConnection,
+} from "./native-connection.ts";
+import {
+  NativeDiscovery,
+  readNativeInventory,
+  readNativeDelivery,
+} from "./native-sessions.ts";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { randomUUID, createPublicKey } from "node:crypto";
@@ -191,6 +200,11 @@ export interface NativeBackendHost {
   ) => Promise<unknown>;
   projectActive?(location: string): boolean;
   projectSignal?(location: string): AbortSignal;
+  readDelivery?(
+    binding: WorkerBinding,
+    intent: import("./dispatch.ts").DispatchIntent,
+    coordinatorLocation: string,
+  ): Promise<"admitted" | "unknown">;
   closeStorage?(): Promise<void>;
   readRecovery?(key: string): Promise<unknown>;
   canonical(location: string): Promise<string>;
@@ -980,6 +994,59 @@ export async function createNativeBackend(
     };
     mutable();
     const body = object(rawBody ?? {});
+    const deliver = async (
+      b: WorkerBinding,
+      assignment: string,
+      kind: "initial" | "manual",
+      id = `msg_${randomUUID()}`,
+    ) => {
+      mutable();
+      const stored = {
+        intent: {
+          id,
+          taskID: b.id,
+          workerID: b.workerID,
+          identity: fingerprint([
+            kind,
+            b.id,
+            b.workerID,
+            b.revision,
+            b.epoch,
+            assignment,
+            id,
+          ]),
+          text: assignment,
+          nonprogress: kind === "manual" ? 0 : b.nonprogress,
+          status: "reserved" as "reserved" | "admitted" | "ambiguous",
+        },
+        revision: b.revision,
+        epoch: b.epoch,
+        generation: kind === "manual" ? 0 : (state.observer?.generation ?? 0),
+        createdAt: Date.now(),
+        kind,
+      };
+      assertStateBounds({ ...state, intents: [...state.intents, stored] });
+      state.intents.push(stored);
+      await persist();
+      mutable();
+      try {
+        const result = await host.session.prompt({
+          sessionID: b.workerID,
+          text: assignment,
+          id,
+        });
+        alive();
+        if (result.id !== id || result.sessionID !== b.workerID)
+          throw new Error("Mismatched admission acknowledgement");
+        stored.intent.status = "admitted";
+        await persist();
+        return result;
+      } catch (error) {
+        stored.intent.status = "ambiguous";
+        if (!closed && authority === "owned") await persist();
+        throw error;
+      }
+    };
     if (operation === "detach") {
       exact(body, []);
       for (const b of state.bindings)
@@ -1137,46 +1204,57 @@ export async function createNativeBackend(
             mutable();
             await validateTarget(goal, input.sessionID);
             mutable();
-            // Binding is already durable; admission uncertainty never resends.
-            const b = binding(goal.id);
-            const stored = {
-              intent: {
-                id: `msg_${randomUUID()}`,
-                taskID: b.id,
-                workerID: b.workerID,
-                identity: `initial:${b.id}:${b.revision}`,
-                text: input.text,
-                nonprogress: b.nonprogress,
-                status: "reserved" as "reserved" | "admitted" | "ambiguous",
-              },
-              revision: b.revision,
-              epoch: b.epoch,
-              generation: state.observer?.generation ?? 0,
-              createdAt: Date.now(),
-              kind: "initial" as const,
-            };
-            state.intents.push(stored);
-            await persist();
-            mutable();
-            try {
-              const result = await host.session.prompt({
-                ...input,
-                id: stored.intent.id,
-              });
-              alive();
-              stored.intent.status = "admitted";
-              await persist();
-              return result;
-            } catch (error) {
-              stored.intent.status = "ambiguous";
-              if (!closed && authority === "owned") await persist();
-              throw error;
-            }
+            return deliver(binding(goal.id), input.text, "initial");
           },
         });
       return true;
     }
     const b = binding(taskID);
+    if (operation === "dispatch") {
+      exact(body, ["text", "scope"]);
+      const assignment = text(body.text);
+      const scope = list(body.scope, text);
+      if (!scope.length || scope.some((entry) => !b.scope.includes(entry)))
+        throw new Error("Assignment scope exceeds the approved binding");
+      if (assignment.length > 12_000) throw new Error("Oversized assignment");
+      const id = `msg_${randomUUID()}`;
+      const approved = fingerprint(b);
+      const eligible = async () => {
+        mutable();
+        if (
+          !["held", "manual"].includes(b.status) ||
+          fingerprint(binding(taskID)) !== approved
+        )
+          throw new Error("Manual target changed or requires takeover");
+        for (const pending of state.intents.filter(
+          (i) => i.intent.taskID === taskID && i.intent.status !== "admitted",
+        )) {
+          const admitted = await host
+            .readDelivery?.(b, pending.intent, initiating.location.directory)
+            .catch(() => "unknown" as const);
+          mutable();
+          if (admitted !== "admitted")
+            throw new Error(
+              "Unresolved delivery; reconcile the existing identity before sending",
+            );
+          pending.intent.status = "admitted";
+          await persist();
+        }
+        await validateTarget(b, b.workerID);
+        mutable();
+      };
+      await eligible();
+      await ask(
+        coordinatorID,
+        operation,
+        JSON.stringify([dataDir, b, assignment, scope, id]),
+        identity,
+        requestAbortSignal,
+      );
+      await eligible();
+      await deliver(b, assignment, "manual", id);
+      return true;
+    }
     if (
       b.status === "complete" ||
       (b.status === "manual" &&
@@ -1593,12 +1671,6 @@ export async function createNativeBackend(
       alive();
       if (identity) {
         await coordinator(identity.sessionID, identity);
-        if (
-          state.observer &&
-          state.observer.coordinatorID !== identity.sessionID
-        )
-          throw new Error("Other coordinator session is bound");
-        if (attached) await attachedCoordinator();
       }
       return snapshot();
     },
@@ -1853,15 +1925,15 @@ export async function createNativeBackend(
         owned();
         await coordinator(identity.sessionID, identity);
         if (
-          state.observer &&
-          state.observer.coordinatorID !== identity.sessionID
-        )
-          throw new Error("Other coordinator session is bound");
-        if (attached) await attachedCoordinator();
-        if (
-          !["create", "adopt", "hold", "resume", "takeover", "share"].includes(
-            operation,
-          )
+          ![
+            "create",
+            "adopt",
+            "dispatch",
+            "hold",
+            "resume",
+            "takeover",
+            "share",
+          ].includes(operation)
         )
           throw new Error("Operation requires approved native observer");
         const accepted = await mutate(
@@ -1873,12 +1945,11 @@ export async function createNativeBackend(
         );
         try {
           await coordinator(identity.sessionID, identity);
-          if (attached) await attachedCoordinator();
         } catch {
           return {
             accepted,
             reason:
-              "Operation committed; inventory withheld because coordinator authority changed. Do not retry; attach and reconcile explicitly.",
+              "Operation committed; inventory withheld because coordinator authority changed. Do not retry; inspect and reconcile the existing delivery identity.",
           };
         }
         return { accepted, snapshot: snapshot() };
@@ -2398,6 +2469,7 @@ type ProjectAdapter = {
   ctx: Plugin.Context;
   location: string;
   abort: AbortController;
+  native: NativeConnection;
   observe?: () => Promise<void>;
 };
 type NativeCore = {
@@ -2586,6 +2658,18 @@ async function createNativeCore(
       permission: { assert: (...args) => current().permission.assert(...args) },
       storage: sharedStorage,
       canonical,
+      async readDelivery(binding, intent, coordinatorLocation) {
+        const adapter = projects.get(coordinatorLocation);
+        if (!adapter || adapter.abort.signal.aborted) return "unknown";
+        return adapter.native.read((client, signal) =>
+          readNativeDelivery(
+            client,
+            binding,
+            intent,
+            AbortSignal.any([signal, adapter.abort.signal]),
+          ),
+        );
+      },
       projectActive: (location) => {
         const adapter = projects.get(location);
         return !!adapter && !adapter.abort.signal.aborted;
@@ -2668,10 +2752,15 @@ export default Plugin.define({
     }
     let dataDir: string | undefined;
     const location = await canonical(ctx.location.directory);
+    const native = createNativeConnection({
+      location,
+      version: ctx.app.version,
+    });
     const adapter: ProjectAdapter = {
       ctx,
       location,
       abort: new AbortController(),
+      native,
     };
     let lease: Ownership.CoordinatorCoreLease<NativeCore> | undefined;
     let core: NativeCore;
@@ -2695,6 +2784,7 @@ export default Plugin.define({
     }
     const existing = core.projects.get(location);
     if (existing && existing !== adapter) {
+      native.dispose();
       await lease?.release();
       throw new Error("Project adapter is already registered");
     }
@@ -2706,6 +2796,7 @@ export default Plugin.define({
     const cleanup = () =>
       (closing ??= (async () => {
         adapter.abort.abort();
+        native.dispose();
         await observing?.catch(() => undefined);
         const failures: unknown[] = [];
         for (const step of [
@@ -2919,6 +3010,7 @@ export default Plugin.define({
       const requestSignal = (signal: AbortSignal) =>
         AbortSignal.any([adapter.abort.signal, signal]);
       const rpc = await ctx.rpc.register(ConmanRpc, {
+        identity: async (input) => serve(async () => native.identity(input)),
         bootstrap: async () => serve(async () => backend.bootstrap()),
         inspect: async (input) => serve(() => backend.read(input.proof)),
         attach: async (input, context) =>
@@ -2972,24 +3064,103 @@ export default Plugin.define({
         editor.add({
           name: "conman_inspect",
           description:
-            "Inspect approved task bindings, consumed limits, delivery identities and completion records in the shared coordination store. Read-only; never grants approval.",
+            "List native sessions across all projects on this service (default view sessions), project locations (view projects), eligible worker agents at location (view agents), or protected task bindings and delivery identities (view tasks). Session results expose metadata only, with truthful running/waiting/unknown status and explicit partial/cursor results. Native listing needs neither task storage nor TUI attachment. Read-only; never grants approval.",
           input: {
             type: "object",
-            properties: {},
+            properties: {
+              view: {
+                type: "string",
+                enum: ["sessions", "projects", "agents", "tasks"],
+              },
+              location: { type: "string" },
+              cursor: { type: "string" },
+            },
             additionalProperties: false,
           },
           options: { codemode: false },
-          async execute(_input, context) {
+          async execute(input: unknown, context) {
             try {
-              return {
-                content: JSON.stringify(
-                  await serve(() =>
-                    backend.inspect({
-                      ...context,
-                      signal: requestSignal(context.signal),
+              const v = object(input);
+              exact(v, ["view", "location", "cursor"]);
+              const view = v.view ?? "sessions";
+              if (
+                !["sessions", "projects", "agents", "tasks"].includes(
+                  String(view),
+                )
+              )
+                throw new Error("Invalid inventory view");
+              if (
+                v.cursor !== undefined &&
+                (view !== "sessions" || text(v.cursor).length > 4096)
+              )
+                throw new Error("Invalid inventory cursor");
+              if (v.location !== undefined && view !== "agents")
+                throw new Error("Location is only used for agent inventory");
+              if (
+                !(await matchesExecutionRole(context.sessionID, context.agent))
+              )
+                throw new Error(
+                  "Select Conman Coordinator to inspect inventory",
+                );
+              const result = await serve(async () => {
+                if (view === "tasks")
+                  return backend.inspect({
+                    ...context,
+                    signal: requestSignal(context.signal),
+                  });
+                const selected =
+                  view === "agents" ? text(v.location) : undefined;
+                if (
+                  selected !== undefined &&
+                  (await canonical(selected)) !== selected
+                )
+                  throw new Error(
+                    "Select an absolute canonical project location",
+                  );
+                try {
+                  return {
+                    native: await native.read(async (client, lifetime) => {
+                      const signal = AbortSignal.any([
+                        lifetime,
+                        requestSignal(context.signal),
+                      ]);
+                      if (view === "sessions")
+                        return readNativeInventory(
+                          client,
+                          v.cursor === undefined ? undefined : text(v.cursor),
+                          signal,
+                        );
+                      const discovery = new NativeDiscovery(client, signal);
+                      return view === "projects"
+                        ? {
+                            available: true,
+                            partial: false,
+                            projects: await discovery.projects(),
+                          }
+                        : {
+                            available: true,
+                            partial: false,
+                            location: selected,
+                            agents: await discovery.agents(selected!),
+                          };
                     }),
-                  ),
-                ),
+                  };
+                } catch (error) {
+                  context.signal.throwIfAborted();
+                  return {
+                    native: {
+                      available: false,
+                      partial: true,
+                      reason:
+                        error instanceof Error
+                          ? error.message
+                          : "Native service unavailable",
+                    },
+                  };
+                }
+              });
+              return {
+                content: JSON.stringify(result),
               };
             } catch (error) {
               log("error", "Native coordination inspection failed");
@@ -3000,7 +3171,7 @@ export default Plugin.define({
         editor.add({
           name: "conman_control",
           description:
-            "Create/adopt or hold/resume/takeover/share one approved task, or recover a terminated runtime owner. Requires a genuine native operation-bound permission ask; confirmation fields and worker evidence never grant authority. Supply operation, taskID and body. Create body is {id,title,goal,criteria:string[],constraints:string[],scope:string[],location:absoluteCanonicalDirectory,agent,group?}; adopt body is {goal:thatObject,workerID}. Hold/resume/takeover/recover use body {}. Share body is {snapshot?:{id,version,group,content,recipients:string[]},shared:[{id,version}]} for this recipient task; shared=[] revokes future inputs only.",
+            "Create, adopt, take over or dispatch an explicitly approved task without TUI attachment or automation arming. Requires native operation-bound permission; confirmation fields and worker evidence never grant authority. Supply operation, taskID and body. Create body is {id,title,goal,criteria:string[],constraints:string[],scope:string[],location:absoluteCanonicalDirectory,agent,group?}; adopt body is {goal:thatObject,workerID} and binds without prompting; takeover body {} fences automation without prompting. Dispatch body {text,scope:string[]} declares a nonempty subset of the binding scope and sends the requested assignment to a held/manual binding without consuming automation limits; unresolved delivery blocks another send. Hold/recover use body {}. Resume is only for optional automation and requires native TUI reconciliation. Share body is {snapshot?:{id,version,group,content,recipients:string[]},shared:[{id,version}]} for this recipient task; shared=[] revokes future inputs only.",
           input: {
             type: "object",
             properties: {
@@ -3009,6 +3180,7 @@ export default Plugin.define({
                 enum: [
                   "create",
                   "adopt",
+                  "dispatch",
                   "hold",
                   "resume",
                   "takeover",

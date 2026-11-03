@@ -452,7 +452,7 @@ export interface StoredIntent {
   epoch: number;
   generation: number;
   createdAt: number;
-  kind?: "initial";
+  kind?: "initial" | "manual";
   validation?: StrictValidationResult;
 }
 export interface CompletionRecord {
@@ -768,15 +768,24 @@ export function parseCoordinatorState(value: unknown): CoordinatorState {
         "kind",
         "validation",
       ]);
-      if (i.kind !== undefined && i.kind !== "initial")
+      if (i.kind !== undefined && i.kind !== "initial" && i.kind !== "manual")
         throw new Error("Invalid delivery kind");
+      if (
+        i.kind === "manual" &&
+        (i.generation !== 0 ||
+          i.validation !== undefined ||
+          object(i.intent).nonprogress !== 0)
+      )
+        throw new Error("Invalid manual delivery authority");
       return {
         intent: parseIntent(i.intent),
         revision: integer(i.revision, 1),
         epoch: integer(i.epoch, 1),
-        generation: integer(i.generation, i.kind === "initial" ? 0 : 1),
+        generation: integer(i.generation, i.kind === undefined ? 1 : 0),
         createdAt: integer(i.createdAt),
-        ...(i.kind === "initial" ? { kind: "initial" as const } : {}),
+        ...(i.kind === undefined
+          ? {}
+          : { kind: i.kind as "initial" | "manual" }),
         ...(i.validation === undefined
           ? {}
           : { validation: parseStrictValidationResult(i.validation) }),
@@ -888,7 +897,7 @@ export function parseCoordinatorState(value: unknown): CoordinatorState {
       i.intent.workerID !== b.workerID ||
       i.revision > b.revision ||
       i.epoch > b.epoch ||
-      (i.kind !== "initial" && (b.followups === 0 || !i.validation))
+      (i.kind === undefined && (b.followups === 0 || !i.validation))
     )
       throw new Error("Unbound durable intent");
     if (
@@ -907,7 +916,7 @@ export function parseCoordinatorState(value: unknown): CoordinatorState {
   for (const b of state.bindings)
     if (
       state.intents.filter(
-        (i) => i.intent.taskID === b.id && i.kind !== "initial",
+        (i) => i.intent.taskID === b.id && i.kind === undefined,
       ).length > b.followups
     )
       throw new Error("Durable intents exceed consumed allowance");

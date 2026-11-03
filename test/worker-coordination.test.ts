@@ -4,6 +4,8 @@ import { openSharedStorage, resolveDataDirectory } from "../src/storage.ts";
 import { coordinatorAgent } from "../src/coordinator-agent.ts";
 import * as subprocess from "node:child_process";
 import * as ownershipModule from "../src/ownership.ts";
+import * as nativeConnectionModule from "../src/native-connection.ts";
+import * as sharedStorageModule from "../src/storage.ts";
 import * as filesystem from "node:fs/promises";
 import {
   chmod,
@@ -51,11 +53,15 @@ import nativePlugin, {
   createWorkerObserver,
   type NativeBackendHost,
 } from "../src/server.ts";
-import type { SessionMessageInfo } from "@opencode/client";
+import type { OpenCodeClient, SessionMessageInfo } from "@opencode/client";
 import type { Plugin } from "@opencode/plugin";
 import type { AgentEditor } from "@opencode/plugin/promise/agent";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
+import type {
+  Info as NativeTool,
+  ToolEditor,
+} from "@opencode/plugin/promise/tool";
 
 type NativeAgent = NonNullable<ReturnType<AgentEditor["get"]>>;
 type NativeExecutionEvent = Pick<
@@ -69,6 +75,101 @@ const observerScope = {
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Shared durable coordination store", () => {
+  it("Preserves populated stores across manual assignments", async () => {
+    const { host } = creationHost();
+    const binding = {
+      ...(await createWorker(goal, host)),
+      followups: 2,
+      nonprogress: 1,
+    };
+    const initial = {
+      intent: {
+        id: "msg_initial",
+        taskID: binding.id,
+        workerID: binding.workerID,
+        identity: "initial",
+        text: "Approved task",
+        nonprogress: 0,
+        status: "admitted" as const,
+      },
+      revision: binding.revision,
+      epoch: binding.epoch,
+      generation: 0,
+      createdAt: 1,
+      kind: "initial" as const,
+    };
+    const manual = {
+      ...initial,
+      kind: "manual" as const,
+      intent: {
+        ...initial.intent,
+        id: "msg_manual",
+        identity: "manual",
+        status: "ambiguous" as const,
+      },
+    };
+    const populated = {
+      version: 1,
+      bindings: [binding],
+      snapshots: [],
+      intents: [initial],
+      completions: [],
+    };
+    const previous = parseCoordinatorState(populated);
+    const loaded = parseCoordinatorState({
+      ...populated,
+      intents: [
+        initial,
+        manual,
+        { ...manual, intent: { ...manual.intent, id: "msg_manual2" } },
+        { ...manual, intent: { ...manual.intent, id: "msg_manual3" } },
+      ],
+    });
+    expect(loaded.bindings).toEqual(previous.bindings);
+    expect(loaded.intents[0]).toEqual(previous.intents[0]);
+    expect(loaded.intents[1]).toEqual(manual);
+    expect(parseCoordinatorState(JSON.parse(JSON.stringify(loaded)))).toEqual(
+      loaded,
+    );
+  });
+
+  it("Rejects invalid manual-delivery records", async () => {
+    const { host } = creationHost();
+    const binding = await createWorker(goal, host);
+    const manual = {
+      intent: {
+        id: "msg_manual",
+        taskID: binding.id,
+        workerID: binding.workerID,
+        identity: "manual",
+        text: "Approved assignment",
+        nonprogress: 0,
+        status: "reserved",
+      },
+      revision: binding.revision,
+      epoch: binding.epoch,
+      generation: 0,
+      createdAt: 1,
+      kind: "manual",
+    };
+    const state = {
+      version: 1,
+      bindings: [binding],
+      snapshots: [],
+      completions: [],
+    };
+    for (const invalid of [
+      { ...manual, generation: 1 },
+      { ...manual, validation: {} },
+      { ...manual, intent: { ...manual.intent, workerID: "another-worker" } },
+      { ...manual, intent: { ...manual.intent, id: "x".repeat(201) } },
+      { ...manual, intent: { ...manual.intent, nonprogress: 1 } },
+    ])
+      expect(() =>
+        parseCoordinatorState({ ...state, intents: [invalid] }),
+      ).toThrow();
+  });
+
   it("Shares an XDG-backed store across projects", async () => {
     expect(
       resolveDataDirectory({}, { home: "/users/example", XDG_DATA_HOME: "" }),
@@ -283,6 +384,8 @@ async function registeredCoordinator(
     get?: () => Promise<void>;
     hook?: (name: string) => Promise<void>;
     stream?: () => AsyncIterable<never>;
+    native?: OpenCodeClient;
+    unavailableStore?: boolean;
   } = {},
 ) {
   const root = resolve(".opencode/conman");
@@ -305,6 +408,7 @@ async function registeredCoordinator(
     ((event: NativeExecutionEvent) => Promise<void>) | undefined;
   let sessionAgent: string | undefined = coordinatorAgent.id;
   const dispatched: string[] = [];
+  const nativeTools = new Map<string, NativeTool>();
   let failCatalog = false;
   let nativeRpc:
     | {
@@ -390,7 +494,14 @@ async function registeredCoordinator(
       },
     },
     tool: {
-      transform: async () => registration,
+      transform: async (transform: (editor: ToolEditor) => void) => {
+        transform({
+          add(tool) {
+            nativeTools.set(tool.name, tool);
+          },
+        } as ToolEditor);
+        return registration;
+      },
       hook: async (
         name: string,
         callback: (event: NativeExecutionEvent) => Promise<void>,
@@ -455,11 +566,32 @@ async function registeredCoordinator(
     },
   } as unknown as Plugin.Context;
   let setupError: unknown;
+  const nativeFactory = nativeConnectionModule.createNativeConnection;
+  const nativeStub = spyOn(
+    nativeConnectionModule,
+    "createNativeConnection",
+  ).mockImplementation((options) => {
+    const connection = nativeFactory({
+      ...options,
+      registration: async () => undefined,
+    });
+    if (faults.native)
+      connection.read = (operation) =>
+        operation(faults.native!, new AbortController().signal);
+    return connection;
+  });
+  const storeStub = faults.unavailableStore
+    ? spyOn(sharedStorageModule, "openSharedStorage").mockRejectedValue(
+        new Error("Unavailable store fixture"),
+      )
+    : undefined;
   const close = await Promise.resolve(nativePlugin.setup(context)).catch(
     (error) => {
       setupError = error;
     },
   );
+  nativeStub.mockRestore();
+  storeStub?.mockRestore();
   return {
     catalog,
     coordinatorID: home,
@@ -467,6 +599,24 @@ async function registeredCoordinator(
     defaults,
     disposedHooks,
     dispatched,
+    async invoke(tool: string, input: unknown = {}) {
+      const event = {
+        tool,
+        sessionID: home,
+        agent: sessionAgent!,
+        messageID: "coordinator-message",
+        id: "tool-call",
+        input,
+      } as NativeExecutionEvent;
+      await executionHook?.(event);
+      const selected = nativeTools.get(tool);
+      if (!selected) throw new Error("Unregistered tool");
+      return selected.execute(input, {
+        ...event,
+        signal: new AbortController().signal,
+        progress: async () => {},
+      });
+    },
     setAgent: (agent: string | undefined) => {
       sessionAgent = agent;
     },
@@ -747,6 +897,10 @@ describe("Bundled conversational coordinator", () => {
   it("Preserves native approval for conversational control", async () => {
     const f = await registeredCoordinator();
     try {
+      const native = await f.invoke("conman_inspect");
+      expect(JSON.parse(String(native.content))).toMatchObject({
+        native: { available: false, partial: true, reason: expect.any(String) },
+      });
       const permissions =
         f.catalog.get("conman-coordinator")?.permissions ?? [];
       const effect = (action: string) =>
@@ -763,6 +917,9 @@ describe("Bundled conversational coordinator", () => {
       for (const action of [
         "conman.attach",
         "conman.create",
+        "conman.dispatch",
+        "conman.adopt",
+        "conman.takeover",
         "conman.recover",
         "conman.resume",
       ])
@@ -814,6 +971,153 @@ describe("Bundled conversational coordinator", () => {
     } finally {
       await f.close();
     }
+    const worker = {
+      id: "native-worker",
+      title: "Native worker",
+      agent: goal.agent,
+      location: { directory: goal.location },
+      time: { created: 1, updated: 1 },
+    };
+    const native = {
+      session: {
+        list: async () => ({ data: [worker], cursor: {} }),
+        get: async () => worker,
+        active: async () => ({}),
+        inbox: { list: async () => [] },
+        form: {
+          list: async () => [],
+          get: async () => {
+            throw new Error("Unexpected form");
+          },
+        },
+      },
+      project: {
+        list: async () => [
+          {
+            id: "native-project",
+            canonical: worker.location.directory,
+            sandboxes: [],
+            name: "Project",
+          },
+        ],
+      },
+      agent: {
+        list: async () => ({
+          location: { directory: worker.location.directory },
+          data: [
+            coordinatorDefinition,
+            { id: goal.agent, mode: "all", hidden: false },
+          ],
+        }),
+      },
+      permission: {
+        request: {
+          list: async () => ({
+            location: { directory: worker.location.directory },
+            data: [],
+          }),
+        },
+      },
+    } as unknown as OpenCodeClient;
+    const unavailable = await registeredCoordinator(
+      false,
+      undefined,
+      undefined,
+      new Map(),
+      { native, unavailableStore: true },
+    );
+    worker.location.directory = unavailable.coordinatorID;
+    try {
+      expect(
+        JSON.parse(
+          String((await unavailable.invoke("conman_inspect")).content),
+        ),
+      ).toMatchObject({
+        native: {
+          available: true,
+          partial: false,
+          sessions: [
+            {
+              id: worker.id,
+              location: worker.location.directory,
+              status: "inactive",
+            },
+          ],
+        },
+      });
+      expect(
+        JSON.parse(
+          String(
+            (await unavailable.invoke("conman_inspect", { view: "projects" }))
+              .content,
+          ),
+        ),
+      ).toMatchObject({
+        native: {
+          available: true,
+          projects: [{ location: worker.location.directory }],
+        },
+      });
+      expect(
+        JSON.parse(
+          String(
+            (
+              await unavailable.invoke("conman_inspect", {
+                view: "agents",
+                location: worker.location.directory,
+              })
+            ).content,
+          ),
+        ),
+      ).toMatchObject({ native: { available: true, agents: [goal.agent] } });
+      for (const input of [
+        { view: "invalid" },
+        { view: "projects", cursor: "cursor" },
+        { location: goal.location },
+        { view: "projects", location: worker.location.directory },
+        { view: "agents", location: "relative-project" },
+      ])
+        await expect(
+          unavailable.invoke("conman_inspect", input),
+        ).rejects.toThrow();
+      await expect(
+        unavailable.invoke("conman_control", {
+          operation: "dispatch",
+          taskID: goal.id,
+          body: { text: "Approved assignment", scope: goal.scope },
+        }),
+      ).rejects.toThrow("recovery required");
+      await expect(
+        unavailable.invoke("conman_control", {
+          operation: "invalid",
+          taskID: goal.id,
+          body: {},
+        }),
+      ).rejects.toThrow();
+      expect(
+        JSON.parse(
+          String(
+            (await unavailable.invoke("conman_inspect", { view: "tasks" }))
+              .content,
+          ),
+        ),
+      ).toMatchObject({
+        authority: "held",
+        reason: expect.any(String),
+        bindings: [],
+      });
+      unavailable.setAgent("engineer");
+      await expect(unavailable.invoke("conman_inspect")).rejects.toThrow();
+    } finally {
+      await unavailable.close();
+    }
+    await expect(
+      unavailable.invoke("conman_control", {
+        operation: "dispatch",
+        taskID: goal.id,
+        body: { text: "Approved assignment", scope: goal.scope },
+      }),
+    ).rejects.toThrow("Project adapter is unavailable");
     for (const role of [
       "engineer",
       "collision",
@@ -926,6 +1230,7 @@ async function backendFixture(
   bindings: WorkerBinding[] = [],
   snapshotCount = 0,
   unresolved = false,
+  attach = true,
 ) {
   const home = "/projects/home";
   let root: unknown = {
@@ -1006,9 +1311,9 @@ async function backendFixture(
         effects.push("create");
         return host.session.get({ sessionID: `worker-${effects.length}` });
       },
-      async prompt() {
+      async prompt(input) {
         effects.push("prompt");
-        return { id: "prompt" } as Awaited<
+        return { id: input.id, sessionID: input.sessionID } as Awaited<
           ReturnType<NativeBackendHost["session"]["prompt"]>
         >;
       },
@@ -1071,10 +1376,12 @@ async function backendFixture(
     home,
   );
   const capability = createObserverCapability();
-  const { generation } = await backend.attach({
-    coordinatorID: "coordinator",
-    verifier: capability.verifier,
-  });
+  const { generation } = attach
+    ? await backend.attach({
+        coordinatorID: "coordinator",
+        verifier: capability.verifier,
+      })
+    : { generation: 0 };
   let sequence = 0;
   const control = async (
     operation: "create" | "adopt" | "hold" | "resume" | "share",
@@ -1151,8 +1458,8 @@ async function backendFixture(
     move: () => {
       directory = "/projects/changed";
     },
-    failWrite: () => {
-      failedWrite = true;
+    failWrite: (value = true) => {
+      failedWrite = value;
     },
   };
 }
@@ -1531,9 +1838,14 @@ describe("Approved task binding", () => {
     };
     const snapshotBinding = await createWorker(mutableGoal, second.host);
     expect(snapshotBinding.location).toBe(goal.location);
-    const f = await backendFixture();
+    const f = await backendFixture([], 0, false, false);
     try {
-      await f.control("create", goal.id, goal);
+      await f.backend.nativeControl("create", goal.id, goal, {
+        sessionID: "coordinator",
+        agent: coordinatorAgent.id,
+        messageID: "message",
+        id: "create-call",
+      });
       expect(f.effects).toEqual(["create", "prompt"]);
       expect((await f.backend.inspect()).bindings[0]?.location).toBe(
         goal.location,
@@ -1541,6 +1853,7 @@ describe("Approved task binding", () => {
       expect(parseCoordinatorState(f.root()).intents[0]?.intent.status).toBe(
         "admitted",
       );
+      expect((await f.backend.inspect()).observer).toBeUndefined();
     } finally {
       await f.backend.dispose();
     }
@@ -2644,6 +2957,329 @@ describe("Explicit adoption", () => {
 });
 
 // spec: openspec/specs/worker-coordination/spec.md
+describe("Conversational manual assignment", () => {
+  const identity = {
+    sessionID: "coordinator",
+    agent: coordinatorAgent.id,
+    messageID: "message",
+    id: "native-call",
+  };
+  const binding: WorkerBinding = {
+    ...goal,
+    workerID: "worker-api",
+    revision: 1,
+    epoch: 1,
+    status: "held",
+    followups: 0,
+    nonprogress: 0,
+  };
+
+  it("Takes over a selected session without inventing work", async () => {
+    const unbound = await backendFixture([], 0, false, false);
+    try {
+      await unbound.backend.nativeControl(
+        "adopt",
+        binding.id,
+        { goal, workerID: binding.workerID },
+        identity,
+      );
+      expect((await unbound.backend.inspect()).bindings[0]).toMatchObject({
+        workerID: binding.workerID,
+        location: goal.location,
+        status: "held",
+      });
+      expect(unbound.effects).toEqual([]);
+      expect(unbound.asks).toEqual(["conman.adopt"]);
+      expect((await unbound.backend.inspect()).observer).toBeUndefined();
+    } finally {
+      await unbound.backend.dispose();
+    }
+    const f = await backendFixture(
+      [{ ...binding, status: "active" }],
+      0,
+      false,
+      false,
+    );
+    try {
+      const before = (await f.backend.inspect()).bindings[0]!;
+      await f.backend.nativeControl("takeover", binding.id, {}, identity);
+      expect((await f.backend.inspect()).bindings[0]).toMatchObject({
+        status: "manual",
+        epoch: before.epoch + 1,
+      });
+      expect(f.effects).toEqual([]);
+      expect(f.asks).toEqual(["conman.takeover"]);
+    } finally {
+      await f.backend.dispose();
+    }
+  });
+
+  it("Sends repeated assignments without automation prerequisites", async () => {
+    const consumed = {
+      ...binding,
+      scope: [...binding.scope, "approved-tests"],
+      followups: 2,
+      nonprogress: 1,
+    };
+    const f = await backendFixture([consumed], 0, false, false);
+    const catalog = f.host.agent.list;
+    f.host.agent.list = async (...input) => {
+      const result = await catalog(...input);
+      return {
+        ...result,
+        data: result.data.map((agent) => ({
+          ...agent,
+          permissions: [...agent.permissions, ...inheritedPolicy],
+        })),
+      };
+    };
+    const prompts: string[] = [];
+    const approvals: string[][] = [];
+    const approve = f.host.permission.assert;
+    const approval = spyOn(f.host.permission, "assert").mockImplementation(
+      async (input) => {
+        approvals.push([...input.resources]);
+        return approve(input);
+      },
+    );
+    f.host.session.prompt = async (input) => {
+      const state = parseCoordinatorState(f.root());
+      expect(state.intents.at(-1)?.intent).toMatchObject({
+        id: input.id,
+        status: "reserved",
+        text: input.text,
+      });
+      prompts.push(input.text!);
+      return { id: input.id, sessionID: input.sessionID } as Awaited<
+        ReturnType<NativeBackendHost["session"]["prompt"]>
+      >;
+    };
+    try {
+      for (const text of [
+        "Implement the approved task",
+        "Verify the approved task",
+      ])
+        await f.backend.nativeControl(
+          "dispatch",
+          binding.id,
+          { text, scope: binding.scope },
+          identity,
+        );
+      const state = parseCoordinatorState(f.root());
+      expect(prompts).toEqual([
+        "Implement the approved task",
+        "Verify the approved task",
+      ]);
+      expect(
+        state.intents.map((i) => [i.kind, i.generation, i.intent.status]),
+      ).toEqual([
+        ["manual", 0, "admitted"],
+        ["manual", 0, "admitted"],
+      ]);
+      expect(new Set(state.intents.map((i) => i.intent.id)).size).toBe(2);
+      expect(state.bindings[0]).toEqual(consumed);
+      expect(f.asks).toEqual(["conman.dispatch", "conman.dispatch"]);
+      for (const [index, resources] of approvals.entries()) {
+        const outer = JSON.parse(resources[0]!);
+        const payload = JSON.parse(outer[3]);
+        expect(payload).toEqual([
+          outer[0],
+          consumed,
+          prompts[index],
+          binding.scope,
+          state.intents[index]!.intent.id,
+        ]);
+      }
+      expect(state.observer).toBeUndefined();
+      await f.backend.attach({
+        coordinatorID: "coordinator",
+        verifier: createObserverCapability().verifier,
+      });
+      const get = f.host.session.get;
+      f.host.session.get = (input) =>
+        get({
+          ...input,
+          sessionID:
+            input.sessionID === "new-coordinator"
+              ? "coordinator"
+              : input.sessionID,
+        }).then((session) => ({ ...session, id: input.sessionID }));
+      await f.backend.nativeControl(
+        "dispatch",
+        binding.id,
+        { text: "Review the approved task", scope: binding.scope },
+        {
+          ...identity,
+          sessionID: "new-coordinator",
+        },
+      );
+      expect(prompts.at(-1)).toBe("Review the approved task");
+      expect((await f.backend.inspect()).bindings[0]?.status).toBe("held");
+    } finally {
+      approval.mockRestore();
+      await f.backend.dispose();
+    }
+  });
+
+  it("Rejects changed or unapproved manual targets", async () => {
+    for (const mode of [
+      "denied",
+      "moved",
+      "scope",
+      "empty-scope",
+      "missing-scope",
+      "identity",
+    ] as const) {
+      const f = await backendFixture([binding], 0, false, false);
+      f.approve(async () => {
+        if (mode === "denied") throw new Error("Native dispatch denied");
+        if (mode === "moved") f.move();
+        if (mode === "identity") {
+          const get = f.host.session.get;
+          f.host.session.get = async (input) => ({
+            ...(await get(input)),
+            agent:
+              input.sessionID === identity.sessionID
+                ? "engineer"
+                : binding.agent,
+          });
+        }
+      });
+      try {
+        await expect(
+          f.backend.nativeControl(
+            "dispatch",
+            binding.id,
+            {
+              text: "Approved assignment",
+              ...(mode === "missing-scope"
+                ? {}
+                : {
+                    scope:
+                      mode === "scope"
+                        ? ["unapproved-project"]
+                        : mode === "empty-scope"
+                          ? []
+                          : binding.scope,
+                  }),
+            },
+            identity,
+          ),
+        ).rejects.toThrow();
+        expect(f.effects).toEqual([]);
+        expect(parseCoordinatorState(f.root()).intents).toEqual([]);
+      } finally {
+        await f.backend.dispose();
+      }
+    }
+  });
+
+  it("Retains an uncertain manual send without resending", async () => {
+    for (const failure of [
+      "transport",
+      "publication",
+      "ack-id",
+      "ack-session",
+    ] as const) {
+      const f = await backendFixture([binding], 0, false, false);
+      let sends = 0;
+      f.host.session.prompt = async (input) => {
+        sends++;
+        if (failure === "transport")
+          throw new Error("Admission acknowledgement lost");
+        if (failure === "publication") f.failWrite();
+        return {
+          id: failure === "ack-id" ? "different-delivery" : input.id,
+          sessionID:
+            failure === "ack-session" ? "different-worker" : input.sessionID,
+        } as Awaited<ReturnType<NativeBackendHost["session"]["prompt"]>>;
+      };
+      try {
+        await expect(
+          f.backend.nativeControl(
+            "dispatch",
+            binding.id,
+            { text: "Approved assignment", scope: binding.scope },
+            identity,
+          ),
+        ).rejects.toThrow(
+          failure === "transport"
+            ? "Admission acknowledgement lost"
+            : failure === "publication"
+              ? "Storage failed"
+              : "Mismatched admission acknowledgement",
+        );
+        const persisted = parseCoordinatorState(f.root());
+        expect(persisted.intents[0]).toMatchObject({
+          kind: "manual",
+          intent: {
+            status: failure === "publication" ? "reserved" : "ambiguous",
+          },
+        });
+        await f.backend.dispose();
+        f.failWrite(false);
+        const restored = await createNativeBackend(
+          f.host,
+          new CoordinatorOwnership("/projects/home", "restored", {
+            inspect: async () => ({ safe: true }),
+            acquire: async () => true,
+            release: async () => {},
+            approveRecovery: async () => {},
+            recover: async () => {},
+          }),
+          "/projects/home",
+        );
+        try {
+          await expect(
+            restored.nativeControl(
+              "dispatch",
+              binding.id,
+              { text: "Another assignment", scope: binding.scope },
+              identity,
+            ),
+          ).rejects.toThrow("Unresolved");
+          expect(sends).toBe(1);
+          expect(parseCoordinatorState(f.root()).intents).toEqual(
+            persisted.intents.map((stored) => ({
+              ...stored,
+              intent: { ...stored.intent, status: "ambiguous" as const },
+            })),
+          );
+          f.host.readDelivery = async (_binding, intent) => {
+            expect(intent.id).toBe(persisted.intents[0]!.intent.id);
+            return "admitted";
+          };
+          f.host.session.prompt = async (input) => {
+            sends++;
+            expect(input.id).not.toBe(persisted.intents[0]!.intent.id);
+            return { id: input.id, sessionID: input.sessionID } as Awaited<
+              ReturnType<NativeBackendHost["session"]["prompt"]>
+            >;
+          };
+          await restored.nativeControl(
+            "dispatch",
+            binding.id,
+            { text: "Another assignment", scope: binding.scope },
+            identity,
+          );
+          expect(sends).toBe(2);
+          expect(
+            parseCoordinatorState(f.root()).intents[0]?.intent,
+          ).toMatchObject({
+            id: persisted.intents[0]!.intent.id,
+            status: "admitted",
+          });
+        } finally {
+          await restored.dispose();
+        }
+      } finally {
+        await f.backend.dispose();
+      }
+    }
+  });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
 describe("Explicit control transitions", () => {
   const binding: WorkerBinding = {
     ...goal,
@@ -2810,6 +3446,22 @@ describe("Explicit control transitions", () => {
             status: "active",
             error: undefined,
           });
+          const asks = f.asks.length;
+          await expect(
+            f.backend.nativeControl(
+              "dispatch",
+              current.id,
+              { text: "Manual work", scope: current.scope },
+              {
+                sessionID: "coordinator",
+                agent: coordinatorAgent.id,
+                messageID: "message",
+                id: "manual-call",
+              },
+            ),
+          ).rejects.toThrow("requires takeover");
+          expect(f.asks).toHaveLength(asks);
+          expect(f.effects).not.toContain("prompt");
         } else {
           await expect(
             f.control("resume", current.id, problem === "bare" ? {} : body),

@@ -1,0 +1,13 @@
+- [x] Implement design "Automatic connection" and "Instance identity" for "Connects automatically to the current native service" and "Rejects an unavailable or different native service".
+- [x] Constrain native transport for "Rejects unsafe destinations before exposing credentials" and "Cancels native reads when the plugin unloads".
+- [x] Extract shared readers for "Lists sessions across projects without task or TUI prerequisites".
+- [x] Separate native status from automation evidence for "Reports native running and waiting status without automation evidence" and "Reports partial or unknown inventory honestly".
+- [x] Extend the existing ledger per design "One ledger" for "Preserves populated stores across manual assignments" and "Rejects invalid manual-delivery records".
+- [x] Implement conversational takeover for "Takes over a selected session without inventing work".
+- [x] Implement approved manual dispatch for "Sends repeated assignments without automation prerequisites" and "Rejects changed or unapproved manual targets".
+- [x] Reuse delivery reconciliation for "Retains an uncertain manual send without resending".
+- [x] Update conversational creation for "Creates a worker at the selected location" and preserve "Rejects an unavailable or mismatched target".
+- [x] Remove superseded conversational gates for "Preserves native approval for conversational control" and "Preserves cross-project control under inherited policy".
+- [x] Preserve "Rejects coordinator worker assignments", "Rejects disallowed coordinator tool execution", "Shares an XDG-backed store across projects", and "Holds unsafe or corrupt shared storage".
+- [x] Align bundled coordinator instructions and README with the conversational scenarios and design's compatibility limitation.
+- [x] Declare the native client runtime dependency and remove duplicated readers and deprecated control paths.
