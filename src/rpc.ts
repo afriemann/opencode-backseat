@@ -220,12 +220,12 @@ function schema<T>(parse: (value: unknown) => T): {
   return {
     "~standard": {
       version: 1,
-      vendor: "conman",
+      vendor: "backseat",
       validate(value) {
         try {
           return { value: parse(value) };
         } catch {
-          return { issues: [{ message: "Invalid conman boundary value" }] };
+          return { issues: [{ message: "Invalid backseat boundary value" }] };
         }
       },
     },
@@ -337,8 +337,8 @@ const validate = schema<ValidateInput>((value) => {
     proof: parseProof(v.proof),
   };
 });
-export const ConmanRpc = Rpc.define({
-  id: "conman",
+export const BackseatRpc = Rpc.define({
+  id: "backseat",
   methods: {
     identity: {
       input: schema<{ nonce: string; origin: string }>((value) => {

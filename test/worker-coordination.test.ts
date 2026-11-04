@@ -1,5 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { ConmanRpc } from "../src/rpc.ts";
+import { BackseatRpc } from "../src/rpc.ts";
 import { COORDINATOR_TOOL_IDS } from "../src/tools.ts";
 import { openSharedStorage, resolveDataDirectory } from "../src/storage.ts";
 import { coordinatorAgent } from "../src/coordinator-agent.ts";
@@ -174,33 +174,44 @@ describe("Shared durable coordination store", () => {
   it("Shares an XDG-backed store across projects", async () => {
     expect(
       resolveDataDirectory({}, { home: "/users/example", XDG_DATA_HOME: "" }),
-    ).toBe("/users/example/.local/share/opencode-conman");
+    ).toBe("/users/example/.local/share/opencode-backseat");
     expect(resolveDataDirectory({}, { home: "/users/example" })).toBe(
-      "/users/example/.local/share/opencode-conman",
+      "/users/example/.local/share/opencode-backseat",
     );
     expect(
       resolveDataDirectory(
         {},
         { home: "/users/example", XDG_DATA_HOME: "/data" },
       ),
-    ).toBe("/data/opencode-conman");
+    ).toBe("/data/opencode-backseat");
     expect(
       resolveDataDirectory(
         {},
         { home: "/users/example", XDG_DATA_HOME: "relative" },
       ),
-    ).toBe("/users/example/.local/share/opencode-conman");
+    ).toBe("/users/example/.local/share/opencode-backseat");
     expect(
       resolveDataDirectory(
         { dataDir: "/custom/store" },
         { home: "/users/example", XDG_DATA_HOME: "/data" },
       ),
     ).toBe("/custom/store");
-    const root = resolve(".opencode/conman");
+    const root = resolve(".opencode/backseat");
     await mkdir(root, { recursive: true, mode: 0o700 });
     const fixture = await mkdtemp(`${root}/shared-store-`);
-    const directory = `${fixture}/data`;
+    const directory = resolveDataDirectory(
+      {},
+      { home: fixture, XDG_DATA_HOME: fixture },
+    );
     try {
+      const oldDirectory = `${fixture}/opencode-conman`;
+      const oldStore = await openSharedStorage(oldDirectory);
+      try {
+        await oldStore.set("task", { uncertain: true, followUps: 2 });
+      } finally {
+        await oldStore.close();
+      }
+      const oldState = await readFile(`${oldDirectory}/state.json`, "utf8");
       const first = await openSharedStorage(directory);
       try {
         expect(await first.get("task")).toBeUndefined();
@@ -226,6 +237,12 @@ describe("Shared durable coordination store", () => {
       } finally {
         await second.close();
       }
+      expect(await readFile(`${oldDirectory}/state.json`, "utf8")).toBe(
+        oldState,
+      );
+      expect(
+        resolveDataDirectory({ dataDir: oldDirectory }, { home: fixture }),
+      ).toBe(oldDirectory);
     } finally {
       await rm(fixture, { recursive: true, force: true });
     }
@@ -242,7 +259,7 @@ describe("Shared durable coordination store", () => {
         expect(metadata).not.toHaveProperty("dataDir");
         expect(metadata.reason).toContain("absolute");
         expect(
-          ConmanRpc.methods.bootstrap.output["~standard"].validate(metadata),
+          BackseatRpc.methods.bootstrap.output["~standard"].validate(metadata),
         ).toEqual({ value: metadata });
       } finally {
         await project.close();
@@ -250,7 +267,7 @@ describe("Shared durable coordination store", () => {
     }
     {
       const directory = await mkdtemp(
-        resolve(".opencode/conman/unsafe-registration-"),
+        resolve(".opencode/backseat/unsafe-registration-"),
       );
       await chmod(directory, 0o755);
       const project = await registeredCoordinator(false, undefined, directory);
@@ -270,7 +287,7 @@ describe("Shared durable coordination store", () => {
     }
     {
       const directory = await mkdtemp(
-        resolve(".opencode/conman/held-registration-"),
+        resolve(".opencode/backseat/held-registration-"),
       );
       const owner = new CoordinatorOwnership(
         directory,
@@ -298,7 +315,7 @@ describe("Shared durable coordination store", () => {
       expect(() =>
         resolveDataDirectory({ dataDir }, { home: "/users/example" }),
       ).toThrow("absolute");
-    const root = resolve(".opencode/conman");
+    const root = resolve(".opencode/backseat");
     await mkdir(root, { recursive: true, mode: 0o700 });
     const fixture = await mkdtemp(`${root}/unsafe-store-`);
     try {
@@ -389,7 +406,7 @@ async function registeredCoordinator(
     unavailableStore?: boolean;
   } = {},
 ) {
-  const root = resolve(".opencode/conman");
+  const root = resolve(".opencode/backseat");
   await mkdir(root, { recursive: true, mode: 0o700 });
   const home = await mkdtemp(`${root}/agent-test-`);
   const worker = `${home}/worker`;
@@ -684,8 +701,8 @@ describe("Bundled conversational coordinator", () => {
         "shell",
         "read",
         "edit",
-        "conman_inspect",
-        "conman_control",
+        "backseat_inspect",
+        "backseat_control",
         "skill",
         "permission.reply",
         "form.reply",
@@ -695,21 +712,21 @@ describe("Bundled conversational coordinator", () => {
         await expect(f.execute(tool)).rejects.toThrow("Coordinator tool");
       await expect(
         f.execute("shell", {
-          input: { tool: "conman_list_sessions", agent: "engineer" },
+          input: { tool: "backseat_list_sessions", agent: "engineer" },
         }),
       ).rejects.toThrow("Coordinator tool");
       expect(f.dispatched).toEqual([]);
       for (const tool of [
         "execute",
-        "conman_list_sessions",
-        "conman_dispatch_task",
+        "backseat_list_sessions",
+        "backseat_dispatch_task",
         "question",
       ])
         await f.execute(tool);
       expect(f.dispatched).toEqual([
         "execute",
-        "conman_list_sessions",
-        "conman_dispatch_task",
+        "backseat_list_sessions",
+        "backseat_dispatch_task",
         "question",
       ]);
       await f.execute("read", {
@@ -717,18 +734,18 @@ describe("Bundled conversational coordinator", () => {
       });
       f.setAgent("engineer");
       await expect(
-        f.execute("conman_list_sessions", {
+        f.execute("backseat_list_sessions", {
           agent: coordinatorAgent.id as NativeExecutionEvent["agent"],
         }),
       ).rejects.toThrow("Coordinator");
       f.setAgent(coordinatorAgent.id);
       await expect(
-        f.execute("conman_list_sessions", {
+        f.execute("backseat_list_sessions", {
           sessionID: "" as NativeExecutionEvent["sessionID"],
         }),
       ).rejects.toThrow("Coordinator");
       await f.tools(coordinatorAgent.id, true);
-      await expect(f.execute("conman_list_sessions")).rejects.toThrow(
+      await expect(f.execute("backseat_list_sessions")).rejects.toThrow(
         "Coordinator",
       );
       await f.execute("read", {
@@ -750,7 +767,7 @@ describe("Bundled conversational coordinator", () => {
     }
     expect(f.disposedHooks).toContain("tool.execute.before");
     await expect(
-      f.execute("conman_list_sessions", {
+      f.execute("backseat_list_sessions", {
         agent: coordinatorAgent.id as NativeExecutionEvent["agent"],
       }),
     ).rejects.toThrow("Coordinator");
@@ -806,7 +823,7 @@ describe("Bundled conversational coordinator", () => {
     );
     try {
       pause = true;
-      const execution = moved.execute("conman_list_sessions");
+      const execution = moved.execute("backseat_list_sessions");
       await ready;
       sessions.set(moved.coordinatorID, `${moved.coordinatorID}/worker`);
       release();
@@ -821,17 +838,17 @@ describe("Bundled conversational coordinator", () => {
     for (const passive of [false, true]) {
       const f = await registeredCoordinator(passive);
       try {
-        expect(f.catalog.has("conman-coordinator")).toBe(true);
+        expect(f.catalog.has("backseat-coordinator")).toBe(true);
         {
-          const agent = structuredClone(f.catalog.get("conman-coordinator"));
+          const agent = structuredClone(f.catalog.get("backseat-coordinator"));
           expect(agent).toMatchObject({
-            id: "conman-coordinator",
+            id: "backseat-coordinator",
             mode: "primary",
             hidden: false,
           });
           expect(agent).not.toHaveProperty("model");
           f.replay();
-          expect(f.catalog.get("conman-coordinator")).toEqual(agent);
+          expect(f.catalog.get("backseat-coordinator")).toEqual(agent);
           expect(f.defaults).toEqual([]);
           f.catalog
             .get(coordinatorAgent.id)!
@@ -848,7 +865,7 @@ describe("Bundled conversational coordinator", () => {
   });
   it("Preserves a configured coordinator agent", async () => {
     const configured = {
-      id: "conman-coordinator",
+      id: "backseat-coordinator",
       name: "My coordinator",
       mode: "primary",
       hidden: false,
@@ -905,35 +922,35 @@ describe("Bundled conversational coordinator", () => {
   it("Preserves native approval for conversational control", async () => {
     const f = await registeredCoordinator();
     try {
-      await expect(f.invoke("conman_list_sessions")).rejects.toThrow(
+      await expect(f.invoke("backseat_list_sessions")).rejects.toThrow(
         "Native service",
       );
       const permissions =
-        f.catalog.get("conman-coordinator")?.permissions ?? [];
+        f.catalog.get("backseat-coordinator")?.permissions ?? [];
       const effect = (action: string) =>
         permissions
           .filter(
             (rule) =>
               rule.action === "*" ||
               rule.action === action ||
-              (rule.action === "conman.*" && action.startsWith("conman.")),
+              (rule.action === "backseat.*" && action.startsWith("backseat.")),
           )
           .at(-1)?.effect;
       for (const tool of [
         "execute",
-        "conman_list_sessions",
-        "conman_delete_session",
+        "backseat_list_sessions",
+        "backseat_delete_session",
         "question",
       ])
         expect(effect(tool)).toBe("allow");
       for (const action of [
-        "conman.attach",
-        "conman.create",
-        "conman.dispatch",
-        "conman.adopt",
-        "conman.takeover",
-        "conman.recover",
-        "conman.resume",
+        "backseat.attach",
+        "backseat.create",
+        "backseat.dispatch",
+        "backseat.adopt",
+        "backseat.takeover",
+        "backseat.recover",
+        "backseat.resume",
       ])
         expect(effect(action)).toBe("ask");
       for (const action of [
@@ -960,10 +977,10 @@ describe("Bundled conversational coordinator", () => {
         [...COORDINATOR_TOOL_IDS].sort(),
       );
       expect(
-        await f.tools(coordinatorAgent.id, false, ["conman_dispatch_task"]),
+        await f.tools(coordinatorAgent.id, false, ["backseat_dispatch_task"]),
       ).toEqual(
         [...COORDINATOR_TOOL_IDS]
-          .filter((id) => id !== "conman_dispatch_task")
+          .filter((id) => id !== "backseat_dispatch_task")
           .sort(),
       );
       f.catalog.set(coordinatorAgent.id, {
@@ -1034,7 +1051,7 @@ describe("Bundled conversational coordinator", () => {
     worker.location.directory = unavailable.coordinatorID;
     try {
       expect(
-        (await unavailable.invoke("conman_list_sessions")).output,
+        (await unavailable.invoke("backseat_list_sessions")).output,
       ).toMatchObject({
         available: true,
         partial: false,
@@ -1047,11 +1064,11 @@ describe("Bundled conversational coordinator", () => {
         ],
       });
       expect(
-        (await unavailable.invoke("conman_list_projects")).output,
+        (await unavailable.invoke("backseat_list_projects")).output,
       ).toMatchObject({ projects: [{ location: worker.location.directory }] });
       expect(
         (
-          await unavailable.invoke("conman_list_agents", {
+          await unavailable.invoke("backseat_list_agents", {
             location: worker.location.directory,
           })
         ).output,
@@ -1062,38 +1079,38 @@ describe("Bundled conversational coordinator", () => {
         { location: worker.location.directory },
       ])
         await expect(
-          unavailable.invoke("conman_list_projects", input),
+          unavailable.invoke("backseat_list_projects", input),
         ).rejects.toThrow();
       await expect(
-        unavailable.invoke("conman_list_agents", {
+        unavailable.invoke("backseat_list_agents", {
           location: "relative-project",
         }),
       ).rejects.toThrow();
       await expect(
-        unavailable.invoke("conman_dispatch_task", {
+        unavailable.invoke("backseat_dispatch_task", {
           taskID: goal.id,
           text: "Approved assignment",
           scope: goal.scope,
         }),
       ).rejects.toThrow("recovery required");
       await expect(
-        unavailable.invoke("conman_dispatch_task", {
+        unavailable.invoke("backseat_dispatch_task", {
           operation: "invalid",
           taskID: goal.id,
         }),
       ).rejects.toThrow();
-      await expect(unavailable.invoke("conman_list_tasks")).rejects.toThrow(
+      await expect(unavailable.invoke("backseat_list_tasks")).rejects.toThrow(
         "task store",
       );
       unavailable.setAgent("engineer");
       await expect(
-        unavailable.invoke("conman_list_sessions"),
+        unavailable.invoke("backseat_list_sessions"),
       ).rejects.toThrow();
     } finally {
       await unavailable.close();
     }
     await expect(
-      unavailable.invoke("conman_dispatch_task", {
+      unavailable.invoke("backseat_dispatch_task", {
         taskID: goal.id,
         text: "Approved assignment",
         scope: goal.scope,
@@ -1149,7 +1166,7 @@ describe("Bundled conversational coordinator", () => {
             coordinatorID: "coordinator",
             verifier: createObserverCapability().verifier,
           }),
-        ).rejects.toThrow("Conman Coordinator");
+        ).rejects.toThrow("Backseat Coordinator");
         expect(fixture.asks).toHaveLength(before);
       } finally {
         await fixture.backend.dispose();
@@ -1895,7 +1912,7 @@ describe("Approved task binding", () => {
 describe("Filesystem coordinator authority", () => {
   const adapterURL = new URL("../src/ownership.ts", import.meta.url).href;
   async function fixture() {
-    const root = resolve(".opencode/conman");
+    const root = resolve(".opencode/backseat");
     await mkdir(root, { recursive: true, mode: 0o700 });
     return mkdtemp(`${root}/kernel-test-`);
   }
@@ -2126,7 +2143,7 @@ describe("Filesystem coordinator authority", () => {
   it("Fences an unloaded project without releasing other participants", async () => {
     {
       const directory = await mkdtemp(
-        resolve(".opencode/conman/observer-stop-"),
+        resolve(".opencode/backseat/observer-stop-"),
       );
       try {
         const output = await runChild(`
@@ -2203,7 +2220,9 @@ describe("Filesystem coordinator authority", () => {
       }
     }
     {
-      const directory = await mkdtemp(resolve(".opencode/conman/stream-eof-"));
+      const directory = await mkdtemp(
+        resolve(".opencode/backseat/stream-eof-"),
+      );
       let finish!: () => void;
       const waiting = new Promise<void>((resolve) => {
         finish = resolve;
@@ -2258,7 +2277,7 @@ describe("Filesystem coordinator authority", () => {
     }
     for (const startup of ["unload", "failure"] as const) {
       const directory = await mkdtemp(
-        resolve(".opencode/conman/late-observer-"),
+        resolve(".opencode/backseat/late-observer-"),
       );
       expect(await child(directory, "terminated-project", true)).toBe("owned");
       let enter!: () => void, finish!: () => void;
@@ -2372,7 +2391,7 @@ describe("Filesystem coordinator authority", () => {
       }
     }
     {
-      const dataDir = await mkdtemp(resolve(".opencode/conman/setup-fence-"));
+      const dataDir = await mkdtemp(resolve(".opencode/backseat/setup-fence-"));
       const sessions = new Map<string, string>();
       const failed = await registeredCoordinator(
         false,
@@ -2404,7 +2423,7 @@ describe("Filesystem coordinator authority", () => {
       }
     }
     {
-      const dataDir = await mkdtemp(resolve(".opencode/conman/ask-fence-"));
+      const dataDir = await mkdtemp(resolve(".opencode/backseat/ask-fence-"));
       let entered!: () => void;
       const ready = new Promise<void>((done) => {
         entered = done;
@@ -2444,7 +2463,7 @@ describe("Filesystem coordinator authority", () => {
       }
     }
     {
-      const shared = await mkdtemp(resolve(".opencode/conman/project-core-"));
+      const shared = await mkdtemp(resolve(".opencode/backseat/project-core-"));
       const sessions = new Map<string, string>();
       const faults: { catalog?: () => Promise<void> } = {};
       const first = await registeredCoordinator(
@@ -2663,7 +2682,7 @@ describe("Filesystem coordinator authority", () => {
     const released: boolean[] = [];
     for (const change of ["cancel", "role"] as const) {
       const directory = await mkdtemp(
-        resolve(".opencode/conman/recover-cancel-"),
+        resolve(".opencode/backseat/recover-cancel-"),
       );
       expect(await child(directory, "terminated-project", true)).toBe("owned");
       let approved = false;
@@ -2707,7 +2726,7 @@ describe("Filesystem coordinator authority", () => {
     expect(released).toEqual([false, false]);
     {
       const directory = await mkdtemp(
-        resolve(".opencode/conman/recover-project-"),
+        resolve(".opencode/backseat/recover-project-"),
       );
       expect(await child(directory, "terminated-project", true)).toBe("owned");
       let approvals = 0;
@@ -3082,7 +3101,9 @@ describe("Conversational manual assignment", () => {
           affectedTasks: mode === "new-descendant" ? [b.id, child.id] : [b.id],
         });
         expect(removes).toBe(1);
-        expect(f.asks.slice(approvalCount)).toEqual(["conman.delete_session"]);
+        expect(f.asks.slice(approvalCount)).toEqual([
+          "backseat.delete_session",
+        ]);
         expect(
           await f.backend.inspectDeletions(b.id, {
             sessionID: "coordinator",
@@ -3403,7 +3424,7 @@ describe("Conversational manual assignment", () => {
         status: "held",
       });
       expect(unbound.effects).toEqual([]);
-      expect(unbound.asks).toEqual(["conman.adopt"]);
+      expect(unbound.asks).toEqual(["backseat.adopt"]);
       expect((await unbound.backend.inspect()).observer).toBeUndefined();
     } finally {
       await unbound.backend.dispose();
@@ -3422,7 +3443,7 @@ describe("Conversational manual assignment", () => {
         epoch: before.epoch + 1,
       });
       expect(f.effects).toEqual([]);
-      expect(f.asks).toEqual(["conman.takeover"]);
+      expect(f.asks).toEqual(["backseat.takeover"]);
     } finally {
       await f.backend.dispose();
     }
@@ -3492,7 +3513,7 @@ describe("Conversational manual assignment", () => {
       ]);
       expect(new Set(state.intents.map((i) => i.intent.id)).size).toBe(2);
       expect(state.bindings[0]).toEqual(consumed);
-      expect(f.asks).toEqual(["conman.dispatch", "conman.dispatch"]);
+      expect(f.asks).toEqual(["backseat.dispatch", "backseat.dispatch"]);
       for (const [index, resources] of approvals.entries()) {
         const outer = JSON.parse(resources[0]!);
         const payload = JSON.parse(outer[3]);
@@ -4076,7 +4097,7 @@ function assertNativeRpcBoundary() {
     observerScope,
   );
   const valid = { operation: "hold" as const, taskID: "api-task", proof };
-  const parse = ConmanRpc.methods.control.input["~standard"].validate;
+  const parse = BackseatRpc.methods.control.input["~standard"].validate;
   expect(parse(valid)).toEqual({ value: valid });
   for (const invalid of [
     { ...valid, confirmed: true },
@@ -4094,11 +4115,13 @@ function assertNativeRpcBoundary() {
     coordinatorID: "coordinator",
     verifier: capability.verifier,
   };
-  expect(ConmanRpc.methods.attach.input["~standard"].validate(attach)).toEqual({
+  expect(
+    BackseatRpc.methods.attach.input["~standard"].validate(attach),
+  ).toEqual({
     value: attach,
   });
   expect(
-    ConmanRpc.methods.attach.input["~standard"].validate({
+    BackseatRpc.methods.attach.input["~standard"].validate({
       ...attach,
       confirmed: true,
     }),
@@ -4113,14 +4136,14 @@ function assertNativeRpcBoundary() {
     completions: [],
   };
   expect(
-    ConmanRpc.methods.control.output["~standard"].validate({
+    BackseatRpc.methods.control.output["~standard"].validate({
       accepted: true,
       snapshot,
     }),
   ).toEqual({ value: { accepted: true, snapshot } });
   const reason = "Control committed; inventory withheld; do not retry";
   expect(
-    ConmanRpc.methods.control.output["~standard"].validate({
+    BackseatRpc.methods.control.output["~standard"].validate({
       accepted: true,
       reason,
     }),
@@ -4131,11 +4154,11 @@ function assertNativeRpcBoundary() {
     { accepted: true, reason, extra: true },
   ]) {
     expect(
-      ConmanRpc.methods.control.output["~standard"].validate(reply),
+      BackseatRpc.methods.control.output["~standard"].validate(reply),
     ).toHaveProperty("issues");
   }
   expect(
-    ConmanRpc.methods.control.output["~standard"].validate({
+    BackseatRpc.methods.control.output["~standard"].validate({
       accepted: "yes",
       snapshot,
     }),
@@ -4276,7 +4299,7 @@ describe("Approved observer generation", () => {
     } finally {
       await relocated.backend.dispose();
     }
-    const root = resolve(".opencode/conman");
+    const root = resolve(".opencode/backseat");
     await mkdir(root, { recursive: true, mode: 0o700 });
     const home = await mkdtemp(`${root}/setup-test-`);
     const values = new Map<string, unknown>();
@@ -4313,7 +4336,7 @@ describe("Approved observer generation", () => {
           registrations.push(kind);
           for (const effect of ["allow", "deny"] as const) {
             const event = {
-              action: "conman.create",
+              action: "backseat.create",
               effect: effect as "allow" | "ask" | "deny",
             };
             callback(event);

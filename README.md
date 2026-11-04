@@ -1,30 +1,34 @@
-# opencode-conman
+# opencode-backseat
 
 Native coordination for parallel OpenCode sessions. Development targets OpenCode 2.2.5; later 2.x hosts require compatibility verification.
 
+Backseat identifiers have no compatibility aliases. Default storage selection does not discover, read, migrate or delete stores under another product name. An absolute `dataDir` selects an existing store explicitly without changing its format.
+
+Different product identities use independent runtime cores and default stores; they do not reconcile each other's workers. The checkout ignores `/.opencode/backseat/`, not local state directories under other product names.
+
 ## Conversational coordination
 
-Select **Conman Coordinator** (`conman-coordinator`) in OpenCode's agent picker. Ask it to list sessions, take over an existing session, or start a session in a selected project. Ordinary coordination needs no TUI attachment, observer or automation arming.
+Select **Backseat Coordinator** (`backseat-coordinator`) in OpenCode's agent picker. Ask it to list sessions, take over an existing session, or start a session in a selected project. Ordinary coordination needs no TUI attachment, observer or automation arming.
 
-The coordinator discovers sessions across all projects on the same authenticated native service, including sessions with no Conman task binding. Inventory contains session identity, title, project identity and location, agent, parent session, explicit `topLevel` and `archived` flags, and native `running`, `waiting`, `inactive` or `unknown` status. `waiting` means a pending permission or form, not an idle conversation awaiting another message. Unknown status is not a completion claim. Project and agent catalogs resolve targets without requiring internal identifiers; ambiguous selections still need clarification.
+The coordinator discovers sessions across all projects on the same authenticated native service, including sessions with no Backseat task binding. Inventory contains session identity, title, project identity and location, agent, parent session, explicit `topLevel` and `archived` flags, and native `running`, `waiting`, `inactive` or `unknown` status. `waiting` means a pending permission or form, not an idle conversation awaiting another message. Unknown status is not a completion claim. Project and agent catalogs resolve targets without requiring internal identifiers; ambiguous selections still need clarification.
 
 The connection uses OpenCode's native service registration automatically, without endpoint or credential settings. Only a safe local registration identifying the hosting process and plugin incarnation is accepted. Unregistered, incompatible or different services report unavailable rather than starting a service or switching endpoints. Native listing remains available independently of task-store ownership; task mutations still need the selected store's authority and native operation-specific approval.
 
 ### Code Mode API
 
-Discover the namespace with `search({namespace: "conman"})` inside `execute`, then call the exact returned paths. All coordination tools return structured results. Native inventory never includes conversations, form answers, inbox payloads or journal contents. The generic conversational inspection and control multiplexers are not exposed; the optional TUI retains its protected internal RPC.
+Discover the namespace with `search({namespace: "backseat"})` inside `execute`, then call the exact returned paths. All coordination tools return structured results. Native inventory never includes conversations, form answers, inbox payloads or journal contents. The generic conversational inspection and control multiplexers are not exposed; the optional TUI retains its protected internal RPC.
 
-| Tool                                             | Purpose                                                                       |
-| ------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `conman.list_sessions`                           | Filter hierarchical native session metadata and follow private continuations. |
-| `conman.list_projects`                           | List project IDs and canonical or sandbox locations.                          |
-| `conman.list_agents`                             | List eligible worker agents at a canonical `location`.                        |
-| `conman.list_tasks` / `conman.get_task`          | Filter durable bindings or inspect one task's records.                        |
-| `conman.create_session` / `conman.adopt_session` | Create and assign an approved task, or bind an existing top-level session.    |
-| `conman.take_over_task` / `conman.dispatch_task` | Fence automation or submit an explicitly requested assignment.                |
-| `conman.hold_task` / `conman.share_context`      | Hold a task or select approved shared context versions.                       |
-| `conman.recover_runtime`                         | Recover runtime ownership without arming automation.                          |
-| `conman.delete_session`                          | Approve native recursive-subtree deletion with history retention.             |
+| Tool                                                 | Purpose                                                                       |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `backseat.list_sessions`                             | Filter hierarchical native session metadata and follow private continuations. |
+| `backseat.list_projects`                             | List project IDs and canonical or sandbox locations.                          |
+| `backseat.list_agents`                               | List eligible worker agents at a canonical `location`.                        |
+| `backseat.list_tasks` / `backseat.get_task`          | Filter durable bindings or inspect one task's records.                        |
+| `backseat.create_session` / `backseat.adopt_session` | Create and assign an approved task, or bind an existing top-level session.    |
+| `backseat.take_over_task` / `backseat.dispatch_task` | Fence automation or submit an explicitly requested assignment.                |
+| `backseat.hold_task` / `backseat.share_context`      | Hold a task or select approved shared context versions.                       |
+| `backseat.recover_runtime`                           | Recover runtime ownership without arming automation.                          |
+| `backseat.delete_session`                            | Approve native recursive-subtree deletion with history retention.             |
 
 `list_sessions` accepts `statuses`, `projectID`, canonical `location`, `taskIDs`, `agent`, native-service `search`, `parentID`, `includeArchived`, `limit`, `order` and `cursor`. Search matching is owned by the native service, without a second local title matcher. Statuses may be combined; the default is `running`, `waiting` and `inactive`, excluding `unknown`. Omit `parentID` for all levels, pass `null` for roots, or an ID for direct children. Archived sessions require `includeArchived: true`; unavailable live status remains `unknown`, so include that status when inspecting archived sessions.
 
@@ -74,7 +78,7 @@ Fill the portable package placeholder in `examples/opencode.jsonc`, then use tha
 
 The plugin bundles the coordinator without changing your default agent or model. Confirm the task's criteria, constraints and scope before creation or adoption. Selecting a coordinator separately in each worker project is unnecessary.
 
-State and ownership use `$XDG_DATA_HOME/opencode-conman`, or `~/.local/share/opencode-conman` when XDG_DATA_HOME is unset, empty or relative. The optional plugin option `dataDir` selects an absolute private directory instead. All participating projects in a service share the first registered store; a conflicting override holds coordination instead of opening another authority. The directory is data storage, not a project to navigate to. Unsafe permissions, corrupt or missing initialized state, and incomplete publication hold coordination without resetting limits or unresolved deliveries. Existing project-local state is neither imported nor deleted.
+State and ownership use `$XDG_DATA_HOME/opencode-backseat`, or `~/.local/share/opencode-backseat` when XDG_DATA_HOME is unset, empty or relative. The optional plugin option `dataDir` selects an absolute private directory instead. All participating projects in a service share the first registered store; a conflicting override holds coordination instead of opening another authority. The directory is data storage, not a project to navigate to. Unsafe permissions, corrupt or missing initialized state, and incomplete publication hold coordination without resetting limits or unresolved deliveries. Existing project-local state is neither imported nor deleted.
 
 Coordination requires the dedicated role's exact identifier, instructions, visible primary mode and ordered permission prefix. OpenCode may append general permissions without making this role unavailable. The plugin allows `execute`, user questions and only the exact coordination tool IDs, including inside compositions; inherited grants do not permit unrelated nested tools. Permission to execute code is not approval for a mutation: native operation-specific approval and configured denials remain authoritative. An identical configured copy receives those same restrictions, not a guarantee of bundled authorship. Differently defined user agents are preserved unchanged and cannot act as the coordinator. Matching coordinator roles cannot be used as workers; unrelated user roles remain available for worker tasks.
 

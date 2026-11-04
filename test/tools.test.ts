@@ -139,7 +139,7 @@ function fixture() {
   const registry = createCoordinationTools(port);
   const context = {
     sessionID: "coordinator",
-    agent: "conman-coordinator",
+    agent: "backseat-coordinator",
     messageID: "message",
     id: "call",
     signal: new AbortController().signal,
@@ -400,7 +400,7 @@ describe("Fine-grained Code Mode queries", () => {
         ...expected,
         expect.objectContaining({
           sessionID: "coordinator",
-          agent: "conman-coordinator",
+          agent: "backseat-coordinator",
           messageID: "message",
           id: "call",
         }),

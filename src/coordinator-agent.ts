@@ -5,7 +5,7 @@ export type CoordinatorPermissionRule = {
 };
 
 export type CoordinatorAgentDefinition = {
-  readonly id: "conman-coordinator";
+  readonly id: "backseat-coordinator";
   readonly name: string;
   readonly mode: "primary";
   readonly hidden: false;
@@ -14,11 +14,11 @@ export type CoordinatorAgentDefinition = {
   readonly permissions: readonly CoordinatorPermissionRule[];
 };
 
-export const COORDINATOR_AGENT_ID = "conman-coordinator" as const;
+export const COORDINATOR_AGENT_ID = "backseat-coordinator" as const;
 
-const system = `You are the conman coordinator: a conversational primary that lists, takes over, creates, assigns and deletes native sessions through the conman plugin. You do not implement work.
+const system = `You are the backseat coordinator: a conversational primary that lists, takes over, creates, assigns and deletes native sessions through the backseat plugin. You do not implement work.
 
-Tools: use only execute and question. Everything else is denied. Inside execute, call only tools.conman.* tools, using the exact path returned by search({namespace:"conman"}); never guess names and never call any other namespace or tool. Operations: list_sessions, list_projects, list_agents, list_tasks, get_task, create_session, adopt_session, take_over_task, dispatch_task, hold_task, share_context, recover_runtime, delete_session. No generic inspect or control tool exists.
+Tools: use only execute and question. Everything else is denied. Inside execute, call only tools.backseat.* tools, using the exact path returned by search({namespace:"backseat"}); never guess names and never call any other namespace or tool. Operations: list_sessions, list_projects, list_agents, list_tasks, get_task, create_session, adopt_session, take_over_task, dispatch_task, hold_task, share_context, recover_runtime, delete_session. No generic inspect or control tool exists.
 
 Discovery:
 - list_sessions lists native sessions across all projects with identity, title, project, location, agent, parentID, topLevel, archived and status, whether or not they are bound or any TUI is attached. Filters: statuses (array of running, waiting, inactive, unknown; default is the first three), projectID, location, taskIDs, agent, search, parentID (null selects root sessions), includeArchived, limit (1 to 200), cursor and order. Multiple statuses are alternatives; all other filters combine.
@@ -63,7 +63,7 @@ Do not write code, read or edit files, browse the web, delegate to other agents,
 
 export const coordinatorAgent: CoordinatorAgentDefinition = {
   id: COORDINATOR_AGENT_ID,
-  name: "Conman Coordinator",
+  name: "Backseat Coordinator",
   mode: "primary",
   hidden: false,
   description:
@@ -73,20 +73,20 @@ export const coordinatorAgent: CoordinatorAgentDefinition = {
     { action: "*", resource: "*", effect: "deny" },
     { action: "execute", resource: "*", effect: "allow" },
     { action: "question", resource: "*", effect: "allow" },
-    { action: "conman_list_sessions", resource: "*", effect: "allow" },
-    { action: "conman_list_projects", resource: "*", effect: "allow" },
-    { action: "conman_list_agents", resource: "*", effect: "allow" },
-    { action: "conman_list_tasks", resource: "*", effect: "allow" },
-    { action: "conman_get_task", resource: "*", effect: "allow" },
-    { action: "conman_create_session", resource: "*", effect: "allow" },
-    { action: "conman_adopt_session", resource: "*", effect: "allow" },
-    { action: "conman_take_over_task", resource: "*", effect: "allow" },
-    { action: "conman_dispatch_task", resource: "*", effect: "allow" },
-    { action: "conman_hold_task", resource: "*", effect: "allow" },
-    { action: "conman_share_context", resource: "*", effect: "allow" },
-    { action: "conman_recover_runtime", resource: "*", effect: "allow" },
-    { action: "conman_delete_session", resource: "*", effect: "allow" },
-    { action: "conman.*", resource: "*", effect: "ask" },
+    { action: "backseat_list_sessions", resource: "*", effect: "allow" },
+    { action: "backseat_list_projects", resource: "*", effect: "allow" },
+    { action: "backseat_list_agents", resource: "*", effect: "allow" },
+    { action: "backseat_list_tasks", resource: "*", effect: "allow" },
+    { action: "backseat_get_task", resource: "*", effect: "allow" },
+    { action: "backseat_create_session", resource: "*", effect: "allow" },
+    { action: "backseat_adopt_session", resource: "*", effect: "allow" },
+    { action: "backseat_take_over_task", resource: "*", effect: "allow" },
+    { action: "backseat_dispatch_task", resource: "*", effect: "allow" },
+    { action: "backseat_hold_task", resource: "*", effect: "allow" },
+    { action: "backseat_share_context", resource: "*", effect: "allow" },
+    { action: "backseat_recover_runtime", resource: "*", effect: "allow" },
+    { action: "backseat_delete_session", resource: "*", effect: "allow" },
+    { action: "backseat.*", resource: "*", effect: "ask" },
   ],
 };
 

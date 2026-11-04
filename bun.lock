@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "opencode-conman",
+      "name": "opencode-backseat",
       "dependencies": {
         "@opencode/client": "2.2.5",
       },

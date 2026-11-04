@@ -26,6 +26,13 @@ export const coordinatorDefinition = {
   request: { settings: {}, headers: {}, body: {} },
 };
 
+function nativeExecutable() {
+  const executable = Bun.which("opencode");
+  if (!executable)
+    throw new Error("Native host tests require opencode on PATH");
+  return executable;
+}
+
 export const inheritedPolicy: CoordinatorPermissionRule[] = [
   { action: "question", resource: "*", effect: "allow" },
   { action: "shell", resource: "*", effect: "ask" },
@@ -46,14 +53,14 @@ export function fixtureApproval(
       if (
         input.sessionID !== coordinatorID ||
         ![
-          "conman.attach",
-          "conman.resume",
-          "conman.adopt",
-          "conman.create",
-          "conman.share",
-          "conman.hold",
-          "conman.takeover",
-          "conman.delete_session",
+          "backseat.attach",
+          "backseat.resume",
+          "backseat.adopt",
+          "backseat.create",
+          "backseat.share",
+          "backseat.hold",
+          "backseat.takeover",
+          "backseat.delete_session",
         ].includes(input.action) ||
         !input.resources.length ||
         input.resources.some((resource) => {
@@ -75,7 +82,7 @@ export interface NativeObservationProof {
 }
 
 const fixtureDefinition = Rpc.define({
-  id: "conman.native-observation-fixture",
+  id: "backseat.native-observation-fixture",
   methods: {
     proof: {
       input: {
@@ -96,7 +103,7 @@ import { realpath } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
 import { FixtureRpc } from "./rpc.js";
 import { createWorkerObserver, workerObservationKeys } from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
-export default Plugin.define({id:"conman",async setup(ctx){
+export default Plugin.define({id:"backseat",async setup(ctx){
   const home=${JSON.stringify(home)}, abort=new AbortController(), completed=new Set(), waiters=new Map();
   let modelCalls=0;
   const trace=value=>appendFileSync(home+"/model-trace.jsonl",JSON.stringify(value)+"\\n");
@@ -104,7 +111,7 @@ export default Plugin.define({id:"conman",async setup(ctx){
   await ctx.session.hook("title",event=>{event.result="Local native observation fixture"});
   await ctx.session.hook("http.request",event=>{
     trace({hook:"http.request",kind:event.kind,model:event.model,ownedURL:event.request.url===endpoint,method:event.request.method});
-    if(event.model.providerID!=="conman-fixture"||event.model.id!=="local"||event.kind!=="primary"||
+    if(event.model.providerID!=="backseat-fixture"||event.model.id!=="local"||event.kind!=="primary"||
       event.request.url!==endpoint||event.request.method!=="POST")
       throw new Error("External model HTTP is forbidden in the local fixture");
     event.request=new Request(endpoint,{method:"POST",headers:{"content-type":"application/json"},
@@ -201,6 +208,14 @@ export interface NativeCoordinatorProof {
   coordinatorTools?: Array<{ name: string; status: string }>;
   policyApproved?: boolean;
   guardErrors?: Array<{ name: string; message: string }>;
+  nestedResult?: {
+    status: string;
+    content: Array<{ type: string; text?: string }>;
+    metadata: {
+      error: boolean;
+      toolCalls: Array<{ tool: string; status: string }>;
+    };
+  };
   forbiddenDispatched?: boolean;
   requests: Array<{ kind: string; tools?: string[] }>;
 }
@@ -210,16 +225,19 @@ export interface NativeCoordinatorProof {
 const nativeFlowGuard = (home: string, endpoint: string, policy: boolean) => `
 import { Plugin } from "@opencode/plugin";
 import { appendFileSync } from "node:fs";
-export default Plugin.define({id:"conman.native-flow-driver",async setup(ctx){
+export default Plugin.define({id:"backseat.native-flow-driver",async setup(ctx){
   const endpoint=${JSON.stringify(endpoint)},home=${JSON.stringify(home)};
   await ctx.session.hook("title",event=>{event.result="Owned coordinator flow"});
   if(${JSON.stringify(policy)}){
     const probe={description:"Owned forbidden execution probe",input:{type:"object",properties:{}}};
-    await ctx.tool.transform(editor=>editor.add({name:"policy_probe",...probe,options:{codemode:false},async execute(){appendFileSync(home+"/policy-probe-dispatched","executed");return "Forbidden body executed";}}));
+    await ctx.tool.transform(editor=>{
+      for(const [name,codemode] of [["policy_probe",false],["nested_probe",true]])
+        editor.add({name,...probe,options:codemode?{namespace:"policy",codemode:true,permission:"backseat_list_sessions"}:{codemode:false},async execute(){appendFileSync(home+"/policy-probe-dispatched","executed");return "Forbidden body executed";}});
+    });
     // Re-expose declarations only in owned fault-injection turns so rejection
     // must come from the independent native execution hook, not catalog removal.
     await ctx.session.hook("context",event=>{
-      if(event.agent!=="conman-coordinator")return;
+      if(event.agent!=="backseat-coordinator")return;
       const user=event.messages.findLast(message=>message.role==="user");
       const text=JSON.stringify(user?.content);
       if(text?.includes("Probe the ordinary execution guard"))event.tools.policy_probe=probe;
@@ -227,7 +245,7 @@ export default Plugin.define({id:"conman.native-flow-driver",async setup(ctx){
     });
   }
   await ctx.session.hook("http.request",event=>{
-    if(event.model.providerID!=="conman-fixture"||event.model.id!=="local"||
+    if(event.model.providerID!=="backseat-fixture"||event.model.id!=="local"||
       !["primary","generate"].includes(event.kind)||event.request.url!==endpoint||event.request.method!=="POST")
       throw new Error("Unowned model route is forbidden");
     appendFileSync(home+"/flow-route.jsonl",JSON.stringify({kind:event.kind})+"\\n");
@@ -241,13 +259,13 @@ export default Plugin.define({id:"conman.native-flow-driver",async setup(ctx){
 const nativeFlowDriver = (options: Record<string, unknown>) => `
 import { Plugin } from "@opencode/plugin/tui";
 import { writeFileSync, existsSync } from "node:fs";
-import { ConmanRpc, reasoningPayload } from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
+import { BackseatRpc, reasoningPayload } from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
 import { createObserverCapability } from ${JSON.stringify(new URL("../src/ownership.ts", import.meta.url).href)};
 import { readNativeObservation } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
 import { decisionIdentity, fingerprint } from ${JSON.stringify(new URL("../src/context.ts", import.meta.url).href)};
 import { followupText } from ${JSON.stringify(new URL("../src/dispatch.ts", import.meta.url).href)};
-export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
-  const o=${JSON.stringify(options)},signal=AbortSignal.timeout(20000),client=ctx.client,rpc=client.rpc(ConmanRpc);
+export default Plugin.define({id:"backseat.native-flow-driver",setup(ctx){
+  const o=${JSON.stringify(options)},signal=AbortSignal.timeout(20000),client=ctx.client,rpc=client.rpc(BackseatRpc);
    const proof={stage:"bootstrap",home:o.home,workerHome:o.workerHome,runtime:{app:ctx.app.version,bun:Bun.version},requests:[]};
    const errorMessage=error=>error?.message??error?.reason??error?.data?.message??String(error);
   writeFileSync(o.pid,JSON.stringify({pid:process.pid}));
@@ -296,11 +314,11 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
      proof.workerBootstrap=await rpc.bootstrap({},{location:{directory:o.workerHome},signal});
      if(proof.workerBootstrap.dataDir!==o.dataDir||Object.keys(proof.workerBootstrap).some(key=>!["dataDir","authority","reason"].includes(key)))throw new Error("Worker bootstrap disclosed unexpected authority state");
     const agents=await client.agent.list({location:{directory:o.workerHome}},{signal});
-    if(!agents.data.some(value=>value.id==="conman-coordinator"&&value.mode==="primary"&&!value.hidden))throw new Error("Bundled coordinator unavailable in second enabled project");
+    if(!agents.data.some(value=>value.id==="backseat-coordinator"&&value.mode==="primary"&&!value.hidden))throw new Error("Bundled coordinator unavailable in second enabled project");
     const agent=agents.data.find(a=>!a.hidden&&a.mode!=="subagent");
     if(agents.location.directory!==o.workerHome||!agent)throw new Error("Native target agent unavailable");
     const coordinators=await client.agent.list({location:{directory:o.home}},{signal});
-    const role=coordinators.data.find(a=>a.id==="conman-coordinator");
+    const role=coordinators.data.find(a=>a.id==="backseat-coordinator");
     if(coordinators.location.directory!==o.home||!role)throw new Error("Bundled coordinator unavailable at owned home");
     const coordinator=await client.session.create({title:"Owned coordinator",agent:role.id,location:{directory:o.home}},{signal});
     const worker=await client.session.create({title:"Owned worker",agent:agent.id,location:{directory:o.workerHome}},{signal});
@@ -310,7 +328,7 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
      const observerScope={dataDir:o.dataDir,coordinatorLocation:o.home};
      const resources=[scopedResource([o.dataDir,coordinator.id,capability.verifier,1])];
     record("attach-denial");
-    const denied={sessionID:coordinator.id,action:"conman.attach",resources,decision:"reject"};expected=denied;
+    const denied={sessionID:coordinator.id,action:"backseat.attach",resources,decision:"reject"};expected=denied;
     let denialError;
     try{await rpc.attach(attachRequest,{location:{directory:o.home},signal})}catch(error){denialError=error;}
     if(!denied.asked||!denialError)throw new Error("Native denial did not reject attach");
@@ -325,7 +343,7 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
      if(unapprovedError?.type!=="rpc.internal"||unapprovedError.message!=="RPC call failed")throw new Error("Denied capability was not rejected by the server");
     proof.denied=true;
     record("attach-approval");
-    const approved={sessionID:coordinator.id,action:"conman.attach",resources,decision:"once"};expected=approved;
+    const approved={sessionID:coordinator.id,action:"backseat.attach",resources,decision:"once"};expected=approved;
     generation=(await rpc.attach(attachRequest,{location:{directory:o.home},signal})).generation;
     if(!approved.asked)throw new Error("Attach bypassed scripted native approval");
      const inspect=()=>rpc.inspect({proof:capability.sign(generation,++sequence,{operation:"inspect",taskID:coordinator.id,revision:0,epoch:0},observerScope)},{location:{directory:o.workerHome},signal});
@@ -335,7 +353,7 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
     const control=async(operation,body,zero=false)=>rpc.control({operation,taskID:goal.id,proof:capability.sign(generation,++sequence,
        {operation,taskID:goal.id,revision:zero?0:binding.revision,epoch:zero?0:binding.epoch,body},observerScope)},{location:{directory:o.home},signal});
     record("adopt");
-     const adoption={sessionID:coordinator.id,action:"conman.adopt",resources:[scopedResource([o.dataDir,goal,worker.id])],decision:"once"};expected=adoption;
+     const adoption={sessionID:coordinator.id,action:"backseat.adopt",resources:[scopedResource([o.dataDir,goal,worker.id])],decision:"once"};expected=adoption;
     const adopted=await control("adopt",{goal,workerID:worker.id},true);
     binding=adopted.snapshot.bindings[0];
      if(!adoption.asked||!adopted.accepted||binding.workerID!==worker.id||binding.location!==o.workerHome)throw new Error("Approved native adoption did not bind owned worker");
@@ -344,13 +362,14 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
      if(o.action==="policy"){
         record("coordinator-list");await run(coordinator.id,"List the coordinated tasks through Code Mode.");
        record("coordinator-hold");
-       const holding={sessionID:coordinator.id,action:"conman.hold",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,{}])],decision:"once"};expected=holding;
+       const holding={sessionID:coordinator.id,action:"backseat.hold",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,{}])],decision:"once"};expected=holding;
         await run(coordinator.id,"Hold only owned-seed-task through Code Mode.");
        proof.policyApproved=holding.asked===true;
        record("ordinary-guard");await run(coordinator.id,"Probe the ordinary execution guard.");
        record("codemode-guard");await run(coordinator.id,"Probe the Code Mode execution guard.");
        const calls=(await history(coordinator.id)).flatMap(message=>message.type==="assistant"?message.content.filter(part=>part.type==="tool"):[]);
-       proof.coordinatorTools=calls.map(part=>({name:part.name,status:part.state.status}));
+        proof.coordinatorTools=calls.map(part=>({name:part.name,status:part.state.status}));
+        proof.nestedResult=calls.find(part=>part.name==="execute"&&part.state.input.code==="await tools.policy.nested_probe({})")?.state;
         proof.guardErrors=calls.filter(part=>part.state.status==="error").map(part=>({name:part.name,message:part.state.error.message}));
        proof.forbiddenDispatched=existsSync(o.home+"/policy-probe-dispatched");
        proof.snapshot=await inspect();record("done");return;
@@ -400,7 +419,7 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
          throw new Error("Resume native reconciliation changed around approval");
      };
      await verifyResume();
-       const resume={sessionID:coordinator.id,action:"conman.resume",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,resumeBody])],decision:"once",verify:verifyResume};expected=resume;
+       const resume={sessionID:coordinator.id,action:"backseat.resume",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,resumeBody])],decision:"once",verify:verifyResume};expected=resume;
      const resumed=await control("resume",resumeBody,false);
     if(!resume.asked||!resumed.accepted)throw new Error("Native resume was not explicitly approved");
      binding=resumed.snapshot.bindings[0];
@@ -453,7 +472,11 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
 export async function captureNativeCoordinator(
   action: "continue" | "complete" | "policy",
 ): Promise<NativeCoordinatorProof> {
-  const root = resolve(import.meta.dir, "../.opencode/conman/native-fixtures");
+  const executable = nativeExecutable();
+  const root = resolve(
+    import.meta.dir,
+    "../.opencode/backseat/native-fixtures",
+  );
   await mkdir(root, { recursive: true, mode: 0o700 });
   const fixture = await mkdtemp(join(root, "flow-"));
   const home = join(fixture, "coordinator"),
@@ -641,10 +664,10 @@ export async function captureNativeCoordinator(
                       : {
                           code:
                             operation === "nested"
-                              ? "await tools.policy_probe({})"
+                              ? "await tools.policy.nested_probe({})"
                               : operation === "hold"
-                                ? 'return await tools.conman.hold_task({taskID:"owned-seed-task"})'
-                                : "return await tools.conman.list_tasks({})",
+                                ? 'return await tools.backseat.hold_task({taskID:"owned-seed-task"})'
+                                : "return await tools.backseat.list_tasks({})",
                         },
                   ),
                 },
@@ -748,7 +771,7 @@ export async function captureNativeCoordinator(
       nativeFlowDriver({
         action,
         home,
-        dataDir: join(home, "conman-state"),
+        dataDir: join(home, "backseat-state"),
         workerHome,
         seed,
         seedContent,
@@ -757,7 +780,7 @@ export async function captureNativeCoordinator(
       }),
     );
     const config = {
-      model: "conman-fixture/local",
+      model: "backseat-fixture/local",
       permissions: [
         ...inheritedPolicy,
         ...(action === "policy"
@@ -765,7 +788,7 @@ export async function captureNativeCoordinator(
           : []),
       ],
       providers: {
-        "conman-fixture": {
+        "backseat-fixture": {
           package: "@opencode/ai/providers/openai-compatible",
           env: [],
           settings: { baseURL: endpoint.replace(/\/chat\/completions$/, "") },
@@ -775,7 +798,7 @@ export async function captureNativeCoordinator(
       plugins: [
         {
           package: resolve(import.meta.dir, ".."),
-          options: { dataDir: join(home, "conman-state") },
+          options: { dataDir: join(home, "backseat-state") },
         },
         { package: probe },
       ],
@@ -789,13 +812,14 @@ export async function captureNativeCoordinator(
         "-f",
         "-e",
         "-c",
-        "exec /usr/bin/opencode --standalone",
+        'exec "$OPENCODE_TEST_EXECUTABLE" --standalone',
         "/dev/null",
       ],
       {
         cwd: home,
         env: {
           PATH: "/usr/bin:/bin",
+          OPENCODE_TEST_EXECUTABLE: executable,
           HOME: home,
           LANG: "C.UTF-8",
           TERM: "xterm-256color",
@@ -824,24 +848,24 @@ export async function captureNativeCoordinator(
       );
       proof.requests = requests;
       await writeFile(
-        `/tmp/opencode/conman-review-frontend-native-flow-${action}-proof.log`,
+        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-proof.log`,
         JSON.stringify(proof),
       );
       return proof;
     } finally {
       await writeFile(
-        `/tmp/opencode/conman-review-frontend-native-flow-${action}-terminal.log`,
+        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-terminal.log`,
         terminal,
       );
       await writeFile(
-        `/tmp/opencode/conman-review-frontend-native-flow-${action}-host.log`,
+        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-host.log`,
         await readFile(
           join(home, "data/opencode/log/opencode.log"),
           "utf8",
         ).catch(() => "Native log unavailable"),
       );
       await writeFile(
-        `/tmp/opencode/conman-review-frontend-native-flow-${action}-requests.log`,
+        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-requests.log`,
         JSON.stringify(requests),
       );
       const pid = JSON.parse(
@@ -880,7 +904,7 @@ import { writeFileSync } from "node:fs";
 import { applyNativeNoColor, coordinationStatusDetails, overview, sharedVersionDetails } from ${JSON.stringify(new URL("../src/ui.ts", import.meta.url).href)};
 import { setupNativeTui } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
 import { FixtureRpc } from "./rpc.js";
-export default Plugin.define({ id: ${JSON.stringify(options.modelTurn || typeof options.discovery === "string" ? "conman" : "conman.native-frame-probe")}, setup(context) {
+export default Plugin.define({ id: ${JSON.stringify(options.modelTurn || typeof options.discovery === "string" ? "backseat" : "backseat.native-frame-probe")}, setup(context) {
   const o = ${JSON.stringify(options)};
   writeFileSync(o.optionsLog, JSON.stringify({ pid: process.pid, keys: Object.keys(context.options), widthType: typeof context.options.width, bun: globalThis.Bun?.version }));
   context.renderer.resize(o.width, o.height);
@@ -897,7 +921,7 @@ export default Plugin.define({ id: ${JSON.stringify(options.modelTurn || typeof 
       text: span.text, fg: span.fg.toInts(), bg: span.bg.toInts(), attributes: span.attributes,
     })));
       writeFileSync(o.frame, JSON.stringify({ pid: process.pid, width: buffer.width, height: buffer.height, text, spans, pages,
-        commands: o.discovery ? context.keymap.commands().filter(command=>command.id?.startsWith("conman.")).map(command=>({id:command.id,title:command.title,slash:command.slash})) : undefined }));
+        commands: o.discovery ? context.keymap.commands().filter(command=>command.id?.startsWith("backseat.")).map(command=>({id:command.id,title:command.title,slash:command.slash})) : undefined }));
   };
   context.renderer.addPostProcessFn(capture);
   if(o.discovery){
@@ -998,7 +1022,10 @@ export async function captureNativeOverview(
   statusReason?: string,
   discovery: boolean | "coordinator" | "coordinator-denied" = false,
 ) {
-  const root = resolve(import.meta.dir, "../.opencode/conman/native-fixtures");
+  const root = resolve(
+    import.meta.dir,
+    "../.opencode/backseat/native-fixtures",
+  );
   await mkdir(root, { recursive: true, mode: 0o700 });
   const home = await mkdtemp(join(root, "host-"));
   const probe = join(home, "probe");
@@ -1033,18 +1060,26 @@ import {Plugin} from "@opencode/plugin";
 import {writeFileSync} from "node:fs";
 import product from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
 import {coordinatorAgent} from ${JSON.stringify(new URL("../src/coordinator-agent.ts", import.meta.url).href)};
-import {ConmanRpc} from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
-export default Plugin.define({id:"conman",async setup(ctx){
+import {BackseatRpc} from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
+export default Plugin.define({id:"backseat",async setup(ctx){
   const close=await product.setup({...ctx,options:{}});
   let attachmentRequests=0;
-  await ctx.permission.hook("evaluate",event=>{if(event.action==="conman.attach")attachmentRequests++;});
+  await ctx.permission.hook("evaluate",event=>{if(event.action==="backseat.attach")attachmentRequests++;});
   await ctx.session.hook("title",event=>{event.result="Owned coordination conversation"});
   await ctx.session.hook("context",async event=>{
     const session=await ctx.session.get({sessionID:event.sessionID});
     const history=await ctx.session.context({sessionID:event.sessionID});
-    const metadata=await ctx.rpc(ConmanRpc).bootstrap({});
+    const metadata=await ctx.rpc(BackseatRpc).bootstrap({});
     const catalog=await ctx.agent.list();
+    let dispatchPermission;
+    if(${JSON.stringify(discovery === "coordinator-denied")}){
+      try{
+        await ctx.permission.assert({sessionID:event.sessionID,agent:event.agent,action:"backseat_dispatch_task",resources:["*"]});
+        dispatchPermission={allowed:true};
+      }catch(error){dispatchPermission={allowed:false,error:error.message};}
+    }
     writeFileSync(${JSON.stringify(proofPath)},JSON.stringify({agent:event.agent,sessionAgent:session.agent,
+      dispatchPermission,
       permissions:catalog.data.find(agent=>agent.id===coordinatorAgent.id)?.permissions,
       attachmentRequests,bootstrapKeys:Object.keys(metadata),userMessages:history.filter(message=>message.type==="user").map(message=>message.text),
       tools:Object.keys(event.tools),instructions:event.system.some(part=>part.type==="text"&&part.text.includes(coordinatorAgent.system))}));
@@ -1056,7 +1091,7 @@ export default Plugin.define({id:"conman",async setup(ctx){
 }});`
         : modelServer
           ? nativeModelProbe(home, modelServer.endpoint)
-          : 'import { Plugin } from "@opencode/plugin"; export default Plugin.define({id:"conman.native-frame-probe",async setup(ctx){await ctx.session.hook("context",()=>{throw new Error("Model requests are forbidden in native rendering fixtures")});}});',
+          : 'import { Plugin } from "@opencode/plugin"; export default Plugin.define({id:"backseat.native-frame-probe",async setup(ctx){await ctx.session.hook("context",()=>{throw new Error("Model requests are forbidden in native rendering fixtures")});}});',
     );
     await writeFile(
       join(probe, "tui.js"),
@@ -1087,7 +1122,7 @@ export default Plugin.define({id:"conman",async setup(ctx){
                 ...(discovery === "coordinator-denied"
                   ? [
                       {
-                        action: "conman_dispatch_task",
+                        action: "backseat_dispatch_task",
                         resource: "*",
                         effect: "deny",
                       },
@@ -1098,9 +1133,9 @@ export default Plugin.define({id:"conman",async setup(ctx){
           : {}),
         ...(modelServer
           ? {
-              model: "conman-fixture/local",
+              model: "backseat-fixture/local",
               providers: {
-                "conman-fixture": {
+                "backseat-fixture": {
                   package: "@opencode/ai/providers/openai-compatible",
                   env: [],
                   settings: {
@@ -1136,13 +1171,14 @@ export default Plugin.define({id:"conman",async setup(ctx){
         "-f",
         "-e",
         "-c",
-        "exec /usr/bin/opencode --standalone",
+        'exec "$OPENCODE_TEST_EXECUTABLE" --standalone',
         "/dev/null",
       ],
       {
         cwd: home,
         env: {
           PATH: "/usr/bin:/bin",
+          OPENCODE_TEST_EXECUTABLE: nativeExecutable(),
           HOME: home,
           LANG: "C.UTF-8",
           TERM: "xterm-256color",
@@ -1171,14 +1207,14 @@ export default Plugin.define({id:"conman",async setup(ctx){
         await readCapture<NativeFrame>(framePath, (value) =>
           value.text.includes("Select agent"),
         );
-        child.stdin?.write("Conman Coordinator");
+        child.stdin?.write("Backseat Coordinator");
         frame = await readCapture<NativeFrame>(framePath, (value) =>
           value.text
             .split("\n")
-            .some((line) => line.trim() === "Conman Coordinator"),
+            .some((line) => line.trim() === "Backseat Coordinator"),
         );
         await writeFile(
-          `/tmp/opencode/conman-dedicated-picker-${width}.json`,
+          `/tmp/opencode/backseat-dedicated-picker-${width}.json`,
           JSON.stringify(frame, null, 2),
         );
         child.stdin?.write("\r");
@@ -1195,6 +1231,8 @@ export default Plugin.define({id:"conman",async setup(ctx){
           attachmentRequests: number;
           bootstrapKeys: string[];
           userMessages: string[];
+          permissions: typeof coordinatorAgent.permissions;
+          dispatchPermission?: { allowed: boolean; error?: string };
         }>(proofPath, (value) => !!value.sessionAgent);
         return { frame, entry, terminal };
       }
@@ -1210,11 +1248,13 @@ export default Plugin.define({id:"conman",async setup(ctx){
             /^\s+coord\s*$/m.test(value.text),
         );
         await writeFile(
-          "/tmp/opencode/conman-command-palette.json",
+          "/tmp/opencode/backseat-command-palette.json",
           JSON.stringify(palette, null, 2),
         );
         if (
-          !palette.commands?.some((command) => command.id === "conman.overview")
+          !palette.commands?.some(
+            (command) => command.id === "backseat.overview",
+          )
         )
           return { frame: palette, terminal };
         child.stdin?.write("\u001b");
@@ -1230,7 +1270,7 @@ export default Plugin.define({id:"conman",async setup(ctx){
             value.text.includes("/coordinate"),
         );
         await writeFile(
-          "/tmp/opencode/conman-command-slash.json",
+          "/tmp/opencode/backseat-command-slash.json",
           JSON.stringify(slash, null, 2),
         );
         return { frame: palette, slash, terminal };
@@ -1285,7 +1325,7 @@ export default Plugin.define({id:"conman",async setup(ctx){
         : undefined;
       if (observation)
         await writeFile(
-          "/tmp/opencode/conman-review-frontend-native-observation-proof.log",
+          "/tmp/opencode/backseat-review-frontend-native-observation-proof.log",
           JSON.stringify(observation),
         );
       return {
@@ -1298,13 +1338,13 @@ export default Plugin.define({id:"conman",async setup(ctx){
     } finally {
       await writeFile(
         modelTurn
-          ? "/tmp/opencode/conman-review-frontend-native-model-terminal.log"
-          : `/tmp/opencode/conman-review-frontend-native-terminal-${width}-${versions ? "versions" : state}${statusReason ? "-status" : ""}${noColor ? "-no-color" : ""}.log`,
+          ? "/tmp/opencode/backseat-review-frontend-native-model-terminal.log"
+          : `/tmp/opencode/backseat-review-frontend-native-terminal-${width}-${versions ? "versions" : state}${statusReason ? "-status" : ""}${noColor ? "-no-color" : ""}.log`,
         terminal,
       );
       if (modelTurn)
         await writeFile(
-          "/tmp/opencode/conman-review-frontend-native-model-host.log",
+          "/tmp/opencode/backseat-review-frontend-native-model-host.log",
           await readFile(
             join(home, "data/opencode/log/opencode.log"),
             "utf8",
@@ -1312,7 +1352,7 @@ export default Plugin.define({id:"conman",async setup(ctx){
         );
       if (modelTurn)
         await writeFile(
-          "/tmp/opencode/conman-review-frontend-native-local-trace.log",
+          "/tmp/opencode/backseat-review-frontend-native-local-trace.log",
           await readFile(join(home, "model-trace.jsonl"), "utf8").catch(
             () => "Native trace unavailable",
           ),
@@ -1321,12 +1361,12 @@ export default Plugin.define({id:"conman",async setup(ctx){
         await readFile(optionsLog, "utf8").catch(() => "{}"),
       ) as { pid?: number; keys?: string[]; widthType?: string; bun?: string };
       await writeFile(
-        "/tmp/opencode/conman-review-frontend-native-probe-options.log",
+        "/tmp/opencode/backseat-review-frontend-native-probe-options.log",
         JSON.stringify(setup),
       );
       if (frame)
         await writeFile(
-          `/tmp/opencode/conman-review-frontend-native-frame-${width}-${versions ? "versions" : state}${statusReason ? "-status" : ""}${noColor ? "-no-color" : ""}.log`,
+          `/tmp/opencode/backseat-review-frontend-native-frame-${width}-${versions ? "versions" : state}${statusReason ? "-status" : ""}${noColor ? "-no-color" : ""}.log`,
           JSON.stringify(frame),
         );
       await stopNative(child, home, frame?.pid ?? setup.pid);

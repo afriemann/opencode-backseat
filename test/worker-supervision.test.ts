@@ -62,7 +62,7 @@ async function observerFixture() {
           location: { directory: "/project/api" },
           data: [
             {
-              id: "conman",
+              id: "backseat",
               source: { type: "local", path: "/project/plugin" },
               features: { server: true },
               state: { status: "active" },
@@ -833,7 +833,7 @@ describe("Native TUI-owned worker supervision", () => {
             location: { directory: n.task.location },
             data: [
               {
-                id: "conman",
+                id: "backseat",
                 source: { type: "local", path: "/project/plugin" },
                 features: { server: true },
                 state: { status: "active" },
@@ -883,7 +883,7 @@ describe("Native TUI-owned worker supervision", () => {
     expect(availability).toEqual(
       modes.map((mode) => ({ mode, available: true })),
     );
-    if (process.env.CONMAN_NATIVE_HOST_TESTS) {
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS) {
       const view = [
         f.task,
         {
@@ -1027,7 +1027,7 @@ describe("Native TUI-owned worker supervision", () => {
           location: { directory: n.task.location },
           data: [
             {
-              id: "conman",
+              id: "backseat",
               source: { type: "local", path: "/project/plugin" },
               features: { server: true },
               state: { status: "failed", error: "Observer plugin failed" },
@@ -1226,7 +1226,7 @@ describe("Native TUI-owned worker supervision", () => {
     }
   });
   it("Continues an eligible task within scope", async () => {
-    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
       const proof = await captureNativeCoordinator("continue");
       expect(proof.error).toBeUndefined();
       expect(proof.stage).toBe("done");
@@ -1652,7 +1652,7 @@ describe("Native TUI-owned worker supervision", () => {
       { criterion: "API verified", evidenceID: "tool-7" },
     ]);
     expect(untagged.sends).toHaveLength(0);
-    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
       const proof = await captureNativeCoordinator("complete");
       expect(proof.error).toBeUndefined();
       expect(proof.stage).toBe("done");

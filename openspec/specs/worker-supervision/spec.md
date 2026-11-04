@@ -124,7 +124,7 @@ The coordinator SHALL use OpenCode's resolved default model for the initiating c
 - **GIVEN** a verified coordinator session and a native default model available at its actual project
 - **WHEN** a background suggestion or bounded validation is requested
 - **THEN** generation explicitly uses that resolved model with only the task-scoped evaluation input.
-- **AND** the conversation's selected model remains unchanged; no Conman model setting, worker-project model, title-agent model or data-directory configuration substitutes for that default.
+- **AND** the conversation's selected model remains unchanged; no Backseat model setting, worker-project model, title-agent model or data-directory configuration substitutes for that default.
 
 #### Scenario: Holds unavailable default-model evaluation
 
