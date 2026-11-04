@@ -1313,6 +1313,31 @@ describe("Native TUI-owned worker supervision", () => {
           },
         });
       expect(native.calls()).toBe(2);
+      if (mode === "accepted") {
+        native.nativeHost.session.list = async () => ({ data: [], cursor: {} });
+        let removals = 0;
+        native.nativeHost.session.remove = async () => {
+          removals++;
+        };
+        expect(stored.bindings[0]?.status).toBe("active");
+        expect(stored.intents[0]?.intent.status).toBe("reserved");
+        await native.backend.deleteSession(native.task.workerID, {
+          sessionID: "coordinator",
+          agent: coordinatorDefinition.id,
+          messageID: "delete-message",
+          id: "delete-call",
+        });
+        const fenced = await native.backend.inspect();
+        expect(fenced.bindings[0]).toMatchObject({
+          status: "held",
+          epoch: stored.bindings[0]!.epoch + 1,
+        });
+        expect(fenced.intents[0]).toEqual({
+          ...stored.intents[0]!,
+          intent: { ...stored.intents[0]!.intent, status: "ambiguous" },
+        });
+        expect(removals).toBe(1);
+      }
       await native.cleanup();
     }
   });

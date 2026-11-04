@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { ConmanRpc } from "../src/rpc.ts";
+import { COORDINATOR_TOOL_IDS } from "../src/tools.ts";
 import { openSharedStorage, resolveDataDirectory } from "../src/storage.ts";
 import { coordinatorAgent } from "../src/coordinator-agent.ts";
 import * as subprocess from "node:child_process";
@@ -496,10 +497,16 @@ async function registeredCoordinator(
     tool: {
       transform: async (transform: (editor: ToolEditor) => void) => {
         transform({
-          add(tool) {
-            nativeTools.set(tool.name, tool);
+          namespace() {},
+          add(tool: NativeTool) {
+            nativeTools.set(
+              tool.options?.namespace
+                ? `${tool.options.namespace}_${tool.name}`
+                : tool.name,
+              tool,
+            );
           },
-        } as ToolEditor);
+        } as unknown as ToolEditor);
         return registration;
       },
       hook: async (
@@ -646,7 +653,7 @@ async function registeredCoordinator(
         agent,
         sessionID: home,
         tools: Object.fromEntries(
-          ["conman_control", "conman_inspect", "question", "skill", "shell"]
+          [...COORDINATOR_TOOL_IDS, "skill", "shell"]
             .filter((name) => !denied.includes(name))
             .map((name) => [
               name,
@@ -677,7 +684,8 @@ describe("Bundled conversational coordinator", () => {
         "shell",
         "read",
         "edit",
-        "execute",
+        "conman_inspect",
+        "conman_control",
         "skill",
         "permission.reply",
         "form.reply",
@@ -687,15 +695,21 @@ describe("Bundled conversational coordinator", () => {
         await expect(f.execute(tool)).rejects.toThrow("Coordinator tool");
       await expect(
         f.execute("shell", {
-          input: { tool: "conman_inspect", agent: "engineer" },
+          input: { tool: "conman_list_sessions", agent: "engineer" },
         }),
       ).rejects.toThrow("Coordinator tool");
       expect(f.dispatched).toEqual([]);
-      for (const tool of ["conman_inspect", "conman_control", "question"])
+      for (const tool of [
+        "execute",
+        "conman_list_sessions",
+        "conman_dispatch_task",
+        "question",
+      ])
         await f.execute(tool);
       expect(f.dispatched).toEqual([
-        "conman_inspect",
-        "conman_control",
+        "execute",
+        "conman_list_sessions",
+        "conman_dispatch_task",
         "question",
       ]);
       await f.execute("read", {
@@ -703,18 +717,20 @@ describe("Bundled conversational coordinator", () => {
       });
       f.setAgent("engineer");
       await expect(
-        f.execute("conman_inspect", {
+        f.execute("conman_list_sessions", {
           agent: coordinatorAgent.id as NativeExecutionEvent["agent"],
         }),
       ).rejects.toThrow("Coordinator");
       f.setAgent(coordinatorAgent.id);
       await expect(
-        f.execute("conman_inspect", {
+        f.execute("conman_list_sessions", {
           sessionID: "" as NativeExecutionEvent["sessionID"],
         }),
       ).rejects.toThrow("Coordinator");
       await f.tools(coordinatorAgent.id, true);
-      await expect(f.execute("conman_inspect")).rejects.toThrow("Coordinator");
+      await expect(f.execute("conman_list_sessions")).rejects.toThrow(
+        "Coordinator",
+      );
       await f.execute("read", {
         agent: "engineer" as NativeExecutionEvent["agent"],
       });
@@ -734,7 +750,7 @@ describe("Bundled conversational coordinator", () => {
     }
     expect(f.disposedHooks).toContain("tool.execute.before");
     await expect(
-      f.execute("conman_inspect", {
+      f.execute("conman_list_sessions", {
         agent: coordinatorAgent.id as NativeExecutionEvent["agent"],
       }),
     ).rejects.toThrow("Coordinator");
@@ -790,7 +806,7 @@ describe("Bundled conversational coordinator", () => {
     );
     try {
       pause = true;
-      const execution = moved.execute("conman_inspect");
+      const execution = moved.execute("conman_list_sessions");
       await ready;
       sessions.set(moved.coordinatorID, `${moved.coordinatorID}/worker`);
       release();
@@ -820,11 +836,9 @@ describe("Bundled conversational coordinator", () => {
           f.catalog
             .get(coordinatorAgent.id)!
             .permissions.push(...inheritedPolicy);
-          expect(await f.tools(coordinatorAgent.id)).toEqual([
-            "conman_control",
-            "conman_inspect",
-            "question",
-          ]);
+          expect(await f.tools(coordinatorAgent.id)).toEqual(
+            [...COORDINATOR_TOOL_IDS].sort(),
+          );
         }
       } finally {
         await f.close();
@@ -880,14 +894,8 @@ describe("Bundled conversational coordinator", () => {
         expect(f.defaults).toEqual([]);
         expect(await f.tools(definition.id)).toEqual(
           exact
-            ? ["conman_control", "conman_inspect", "question"]
-            : [
-                "conman_control",
-                "conman_inspect",
-                "question",
-                "shell",
-                "skill",
-              ],
+            ? [...COORDINATOR_TOOL_IDS].sort()
+            : [...COORDINATOR_TOOL_IDS, "shell", "skill"].sort(),
         );
       } finally {
         await f.close();
@@ -897,10 +905,9 @@ describe("Bundled conversational coordinator", () => {
   it("Preserves native approval for conversational control", async () => {
     const f = await registeredCoordinator();
     try {
-      const native = await f.invoke("conman_inspect");
-      expect(JSON.parse(String(native.content))).toMatchObject({
-        native: { available: false, partial: true, reason: expect.any(String) },
-      });
+      await expect(f.invoke("conman_list_sessions")).rejects.toThrow(
+        "Native service",
+      );
       const permissions =
         f.catalog.get("conman-coordinator")?.permissions ?? [];
       const effect = (action: string) =>
@@ -912,7 +919,12 @@ describe("Bundled conversational coordinator", () => {
               (rule.action === "conman.*" && action.startsWith("conman.")),
           )
           .at(-1)?.effect;
-      for (const tool of ["conman_inspect", "conman_control", "question"])
+      for (const tool of [
+        "execute",
+        "conman_list_sessions",
+        "conman_delete_session",
+        "question",
+      ])
         expect(effect(tool)).toBe("allow");
       for (const action of [
         "conman.attach",
@@ -928,39 +940,32 @@ describe("Bundled conversational coordinator", () => {
         "shell",
         "read",
         "edit",
-        "execute",
         "webfetch",
         "subagent",
         "permission.reply",
         "form.reply",
       ])
         expect(effect(action)).toBe("deny");
-      expect(await f.tools(coordinatorAgent.id)).toEqual([
-        "conman_control",
-        "conman_inspect",
-        "question",
-      ]);
-      const unrelated = [
-        "conman_control",
-        "conman_inspect",
-        "question",
-        "shell",
-        "skill",
-      ];
+      expect(await f.tools(coordinatorAgent.id)).toEqual(
+        [...COORDINATOR_TOOL_IDS].sort(),
+      );
+      const unrelated = [...COORDINATOR_TOOL_IDS, "shell", "skill"].sort();
       expect(await f.tools("engineer")).toEqual(unrelated);
       const bundled = f.catalog.get(coordinatorAgent.id)!;
       f.catalog.set(coordinatorAgent.id, {
         ...bundled,
         permissions: [...bundled.permissions, ...inheritedPolicy],
       });
-      expect(await f.tools(coordinatorAgent.id)).toEqual([
-        "conman_control",
-        "conman_inspect",
-        "question",
-      ]);
+      expect(await f.tools(coordinatorAgent.id)).toEqual(
+        [...COORDINATOR_TOOL_IDS].sort(),
+      );
       expect(
-        await f.tools(coordinatorAgent.id, false, ["conman_control"]),
-      ).toEqual(["conman_inspect", "question"]);
+        await f.tools(coordinatorAgent.id, false, ["conman_dispatch_task"]),
+      ).toEqual(
+        [...COORDINATOR_TOOL_IDS]
+          .filter((id) => id !== "conman_dispatch_task")
+          .sort(),
+      );
       f.catalog.set(coordinatorAgent.id, {
         ...bundled,
         system: "User-defined role",
@@ -1029,93 +1034,69 @@ describe("Bundled conversational coordinator", () => {
     worker.location.directory = unavailable.coordinatorID;
     try {
       expect(
-        JSON.parse(
-          String((await unavailable.invoke("conman_inspect")).content),
-        ),
+        (await unavailable.invoke("conman_list_sessions")).output,
       ).toMatchObject({
-        native: {
-          available: true,
-          partial: false,
-          sessions: [
-            {
-              id: worker.id,
-              location: worker.location.directory,
-              status: "inactive",
-            },
-          ],
-        },
+        available: true,
+        partial: false,
+        sessions: [
+          {
+            id: worker.id,
+            location: worker.location.directory,
+            status: "inactive",
+          },
+        ],
       });
       expect(
-        JSON.parse(
-          String(
-            (await unavailable.invoke("conman_inspect", { view: "projects" }))
-              .content,
-          ),
-        ),
-      ).toMatchObject({
-        native: {
-          available: true,
-          projects: [{ location: worker.location.directory }],
-        },
-      });
+        (await unavailable.invoke("conman_list_projects")).output,
+      ).toMatchObject({ projects: [{ location: worker.location.directory }] });
       expect(
-        JSON.parse(
-          String(
-            (
-              await unavailable.invoke("conman_inspect", {
-                view: "agents",
-                location: worker.location.directory,
-              })
-            ).content,
-          ),
-        ),
-      ).toMatchObject({ native: { available: true, agents: [goal.agent] } });
+        (
+          await unavailable.invoke("conman_list_agents", {
+            location: worker.location.directory,
+          })
+        ).output,
+      ).toMatchObject({ agents: [goal.agent] });
       for (const input of [
         { view: "invalid" },
-        { view: "projects", cursor: "cursor" },
-        { location: goal.location },
-        { view: "projects", location: worker.location.directory },
-        { view: "agents", location: "relative-project" },
+        { cursor: "cursor" },
+        { location: worker.location.directory },
       ])
         await expect(
-          unavailable.invoke("conman_inspect", input),
+          unavailable.invoke("conman_list_projects", input),
         ).rejects.toThrow();
       await expect(
-        unavailable.invoke("conman_control", {
-          operation: "dispatch",
+        unavailable.invoke("conman_list_agents", {
+          location: "relative-project",
+        }),
+      ).rejects.toThrow();
+      await expect(
+        unavailable.invoke("conman_dispatch_task", {
           taskID: goal.id,
-          body: { text: "Approved assignment", scope: goal.scope },
+          text: "Approved assignment",
+          scope: goal.scope,
         }),
       ).rejects.toThrow("recovery required");
       await expect(
-        unavailable.invoke("conman_control", {
+        unavailable.invoke("conman_dispatch_task", {
           operation: "invalid",
           taskID: goal.id,
-          body: {},
         }),
       ).rejects.toThrow();
-      expect(
-        JSON.parse(
-          String(
-            (await unavailable.invoke("conman_inspect", { view: "tasks" }))
-              .content,
-          ),
-        ),
-      ).toMatchObject({
-        authority: "held",
-        reason: expect.any(String),
-        bindings: [],
-      });
+      await expect(unavailable.invoke("conman_list_tasks")).rejects.toThrow(
+        "task store",
+      );
       unavailable.setAgent("engineer");
-      await expect(unavailable.invoke("conman_inspect")).rejects.toThrow();
+      await expect(
+        unavailable.invoke("conman_list_sessions"),
+      ).rejects.toThrow();
     } finally {
       await unavailable.close();
     }
     await expect(
-      unavailable.invoke("conman_control", {
-        operation: "dispatch",
+      unavailable.invoke("conman_dispatch_task", {
         taskID: goal.id,
-        body: { text: "Approved assignment", scope: goal.scope },
+        text: "Approved assignment",
+        scope: goal.scope,
       }),
     ).rejects.toThrow("Project adapter is unavailable");
     for (const role of [
@@ -1231,6 +1212,7 @@ async function backendFixture(
   snapshotCount = 0,
   unresolved = false,
   attach = true,
+  completions: import("../src/state.ts").CompletionRecord[] = [],
 ) {
   const home = "/projects/home";
   let root: unknown = {
@@ -1263,7 +1245,7 @@ async function backendFixture(
           },
         ]
       : [],
-    completions: [],
+    completions,
   };
   const values = new Map<string, unknown>();
   const asks: string[] = [],
@@ -2958,6 +2940,438 @@ describe("Explicit adoption", () => {
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Conversational manual assignment", () => {
+  it("Deletes the approved native subtree and preserves task history", async () => {
+    for (const mode of [
+      "held",
+      "active",
+      "complete",
+      "new-descendant",
+    ] as const) {
+      const b: WorkerBinding = {
+        ...goal,
+        workerID: "delete-root",
+        revision: 1,
+        epoch: 1,
+        status: mode === "complete" ? "complete" : "held",
+        followups: 2,
+        nonprogress: 1,
+      };
+      const ref = {
+        messageID: "verified-message",
+        callID: "verified-call",
+        state: "completed" as const,
+        inputFingerprint: fingerprint("input"),
+        resultFingerprint: fingerprint("result"),
+        inspectedContentFingerprint: fingerprint("content"),
+      };
+      const completion: import("../src/state.ts").CompletionRecord = {
+        taskID: b.id,
+        workerID: b.workerID,
+        revision: b.revision,
+        epoch: b.epoch,
+        generation: 1,
+        support: b.criteria.map((criterion) => ({
+          criterion,
+          evidenceID: ref.callID,
+        })),
+        evidence: {
+          taskID: b.id,
+          workerID: b.workerID,
+          turn: 1,
+          fingerprint: fingerprint("evidence"),
+          native: [ref],
+        },
+        validation: {
+          receiptID: "verified-receipt",
+          status: "accept",
+          rationale: "Verified criterion evidence",
+          identity: {
+            taskID: b.id,
+            workerID: b.workerID,
+            location: b.location,
+            revision: b.revision,
+            epoch: b.epoch,
+            generation: 1,
+            turn: 1,
+            nativeBoundary: ref.messageID,
+            snapshotIncarnation: "incarnation",
+            snapshotSequence: 1,
+            snapshotInvalidationVersion: 0,
+            evidenceFingerprint: fingerprint("evidence"),
+            sharedVersions: [],
+            suggestionFingerprint: fingerprint("suggestion"),
+          },
+          criteria: b.criteria.map((criterion) => ({
+            criterion,
+            status: "accept",
+            rationale: "Verified criterion evidence",
+            evidence: [ref],
+          })),
+        },
+      };
+      const child = {
+        ...b,
+        id: `${b.id}-child`,
+        workerID: "delete-child",
+        status: "held" as const,
+      };
+      const f = await backendFixture(
+        mode === "new-descendant" ? [b, child] : [b],
+        0,
+        mode !== "active",
+        mode === "active",
+        mode === "complete" ? [completion] : [],
+      );
+      if (mode === "active") {
+        const current = (await f.backend.inspect()).bindings[0]!;
+        await f.control("resume", b.id, f.observation(current));
+        expect((await f.backend.inspect()).bindings[0]?.status).toBe("active");
+      }
+      const baseline = parseCoordinatorState(f.root());
+      const approvalCount = f.asks.length;
+      let childVisible = mode !== "new-descendant";
+      f.approve(async () => {
+        childVisible = true;
+      });
+      const get = f.host.session.get;
+      f.host.session.get = async (input) => ({
+        ...(await get(input)),
+        ...(input.sessionID === "delete-child"
+          ? { parentID: "delete-root" }
+          : {}),
+      });
+      f.host.session.list = async (input) => ({
+        data:
+          input?.parentID === "delete-root" && childVisible
+            ? [await f.host.session.get({ sessionID: "delete-child" })]
+            : [],
+        cursor: {},
+      });
+      let removes = 0;
+      f.host.session.remove = async ({ sessionID }) => {
+        expect(sessionID).toBe("delete-root");
+        expect(f.values.get("coordinator:deletions")).toMatchObject({
+          version: 1,
+          records: [{ sessionID: "delete-root", status: "pending" }],
+        });
+        expect(
+          (f.root() as { bindings: WorkerBinding[] }).bindings[0],
+        ).toMatchObject({
+          status: mode === "complete" ? "complete" : "held",
+          epoch: baseline.bindings[0]!.epoch + (mode === "complete" ? 0 : 1),
+        });
+        if (mode === "new-descendant")
+          expect(parseCoordinatorState(f.root()).bindings[1]).toMatchObject({
+            status: "held",
+            epoch: child.epoch + 1,
+          });
+        removes++;
+      };
+      try {
+        const before = parseCoordinatorState(f.root());
+        expect(
+          await f.backend.deleteSession("delete-root", {
+            sessionID: "coordinator",
+            agent: coordinatorAgent.id,
+            messageID: "message",
+            id: "delete-call",
+          }),
+        ).toEqual({
+          sessionID: "delete-root",
+          status: "deleted",
+          affectedTasks: mode === "new-descendant" ? [b.id, child.id] : [b.id],
+        });
+        expect(removes).toBe(1);
+        expect(f.asks.slice(approvalCount)).toEqual(["conman.delete_session"]);
+        expect(
+          await f.backend.inspectDeletions(b.id, {
+            sessionID: "coordinator",
+            agent: coordinatorAgent.id,
+            messageID: "message",
+            id: "inspect-call",
+          }),
+        ).toMatchObject([
+          {
+            sessionID: "delete-root",
+            status: "deleted",
+            observations: [
+              { sessionID: "delete-root", status: "absent" },
+              { sessionID: "delete-child", status: "absent" },
+            ],
+          },
+        ]);
+        expect(parseCoordinatorState(f.root()).intents).toEqual(before.intents);
+        expect(parseCoordinatorState(f.root()).completions).toEqual(
+          before.completions,
+        );
+        expect(parseCoordinatorState(f.root()).bindings[0]).toMatchObject({
+          followups: 2,
+          nonprogress: 1,
+          epoch: baseline.bindings[0]!.epoch + (mode === "complete" ? 0 : 1),
+        });
+      } finally {
+        await f.backend.dispose();
+      }
+    }
+  });
+
+  it("Rejects unsafe deletion and retains uncertain outcomes", async () => {
+    for (const mode of [
+      "self",
+      "ancestor",
+      "cycle",
+      "denied",
+      "uncertain",
+      "abort-before-remove",
+      "publication",
+      "partial",
+      "wrong-parent",
+    ] as const) {
+      const f = await backendFixture(
+        mode === "uncertain"
+          ? [
+              {
+                ...goal,
+                workerID: "delete-root",
+                revision: 1,
+                epoch: 1,
+                status: "held",
+                followups: 0,
+                nonprogress: 0,
+              },
+            ]
+          : [],
+        0,
+        false,
+        false,
+      );
+      const get = f.host.session.get;
+      const cancellation = new AbortController();
+      const set = f.host.storage.set;
+      const journalWrites = spyOn(f.host.storage, "set").mockImplementation(
+        async (key, value) => {
+          const journal = value as { records?: { status: string }[] };
+          if (
+            key === "coordinator:deletions" &&
+            mode === "publication" &&
+            journal.records?.[0]?.status !== "pending"
+          )
+            throw new Error("Journal publication failed");
+          await set(key, value);
+          if (
+            key === "coordinator:deletions" &&
+            mode === "abort-before-remove" &&
+            journal.records?.[0]?.status === "pending"
+          )
+            cancellation.abort(new Error("Deletion cancelled"));
+        },
+      );
+      f.host.session.get = async (input) => ({
+        ...(await get(input)),
+        ...(input.sessionID === "coordinator" &&
+        (mode === "ancestor" || mode === "cycle")
+          ? { parentID: mode === "cycle" ? "coordinator" : "delete-root" }
+          : {}),
+      });
+      f.host.session.list = async () => ({
+        data:
+          mode === "wrong-parent"
+            ? [{ ...(await get({ sessionID: "child" })), parentID: "other" }]
+            : [],
+        cursor: mode === "partial" ? { next: "next" } : {},
+      });
+      let removes = 0;
+      f.host.session.remove = async () => {
+        removes++;
+        throw new Error("Native acknowledgement lost");
+      };
+      if (mode === "denied")
+        f.approve(async () => {
+          throw new Error("Denied");
+        });
+      const identity = {
+        sessionID: "coordinator",
+        agent: coordinatorAgent.id,
+        messageID: "message",
+        id: "delete-call",
+        signal: cancellation.signal,
+      };
+      try {
+        if (mode === "uncertain") {
+          expect(
+            await f.backend.deleteSession("delete-root", identity),
+          ).toMatchObject({ status: "uncertain" });
+          await expect(
+            f.backend.deleteSession("delete-root", identity),
+          ).rejects.toThrow("Unresolved or retained deletion");
+          expect(f.values.get("coordinator:deletions")).toMatchObject({
+            records: [{ status: "uncertain" }],
+          });
+          expect(removes).toBe(1);
+          f.host.session.list = async (input) => ({
+            data:
+              input?.parentID === "new-parent"
+                ? [
+                    {
+                      ...(await get({ sessionID: "delete-root" })),
+                      parentID: "new-parent",
+                    },
+                  ]
+                : [],
+            cursor: {},
+          });
+          await expect(
+            f.backend.deleteSession("new-parent", identity),
+          ).rejects.toThrow("overlap");
+          expect(removes).toBe(1);
+          await f.backend.dispose();
+          const reopened = await createNativeBackend(
+            f.host,
+            new CoordinatorOwnership("/projects/home", "deletion-reload", {
+              inspect: async () => ({ safe: true }),
+              acquire: async () => true,
+              release: async () => {},
+              approveRecovery: async () => {},
+              recover: async () => {},
+            }),
+            "/projects/home",
+          );
+          try {
+            await expect(
+              reopened.deleteSession("delete-root", identity),
+            ).rejects.toThrow("retained deletion");
+            for (const operation of ["dispatch", "resume"] as const)
+              await expect(
+                reopened.nativeControl(
+                  operation,
+                  goal.id,
+                  operation === "dispatch"
+                    ? { text: "Work", scope: goal.scope }
+                    : {},
+                  identity,
+                ),
+              ).rejects.toThrow("retained deletion outcome");
+            expect(
+              await reopened.inspectDeletions(goal.id, identity),
+            ).toMatchObject([
+              {
+                status: "uncertain",
+                observations: [{ sessionID: "delete-root", status: "absent" }],
+              },
+            ]);
+            expect(removes).toBe(1);
+          } finally {
+            await reopened.dispose();
+          }
+        } else if (mode === "publication") {
+          expect(
+            await f.backend.deleteSession("delete-root", identity),
+          ).toMatchObject({ status: "uncertain" });
+          expect(await f.backend.inspect()).toMatchObject({
+            authority: "held",
+          });
+          expect(removes).toBe(1);
+        } else {
+          await expect(
+            f.backend.deleteSession(
+              mode === "self" ? "coordinator" : "delete-root",
+              identity,
+            ),
+          ).rejects.toThrow(
+            mode === "self" || mode === "ancestor"
+              ? "invoking coordinator"
+              : mode === "cycle"
+                ? "ancestry"
+                : mode === "denied"
+                  ? "Denied"
+                  : mode === "abort-before-remove"
+                    ? "Deletion cancelled"
+                    : "Incomplete",
+          );
+          expect(removes).toBe(0);
+          if (mode === "abort-before-remove")
+            expect(f.values.get("coordinator:deletions")).toMatchObject({
+              records: [],
+            });
+        }
+      } finally {
+        journalWrites.mockRestore();
+        await f.backend.dispose();
+      }
+    }
+  });
+  it("Rejects child adoption and takeover before and after approval", async () => {
+    for (const operation of ["adopt", "takeover"] as const) {
+      for (const phase of ["before", "during"] as const) {
+        const selected: WorkerBinding = {
+          ...goal,
+          workerID: "worker-api",
+          revision: 1,
+          epoch: 1,
+          status: "held",
+          followups: 0,
+          nonprogress: 0,
+        };
+        const f = await backendFixture(
+          operation === "adopt" ? [] : [selected],
+          0,
+          false,
+          false,
+        );
+        let parentID: string | undefined =
+          phase === "before" ? "native-parent" : undefined;
+        const get = f.host.session.get;
+        f.host.session.get = async (input) => ({
+          ...(await get(input)),
+          ...(input.sessionID === selected.workerID && parentID
+            ? { parentID }
+            : {}),
+        });
+        f.approve(async () => {
+          parentID = "native-parent";
+        });
+        try {
+          await expect(
+            f.backend.nativeControl(
+              operation,
+              selected.id,
+              operation === "adopt"
+                ? { goal, workerID: selected.workerID }
+                : {},
+              {
+                sessionID: "coordinator",
+                agent: coordinatorAgent.id,
+                messageID: "message",
+                id: "ownership-call",
+              },
+            ),
+          ).rejects.toThrow("top-level");
+          expect(f.effects).toEqual([]);
+          const current = (await f.backend.inspect()).bindings;
+          expect(current).toEqual(operation === "adopt" ? [] : [selected]);
+          expect(f.asks).toHaveLength(phase === "before" ? 0 : 1);
+        } finally {
+          await f.backend.dispose();
+        }
+      }
+    }
+    const root = await backendFixture([binding], 0, false, false);
+    const agents = root.host.agent.list;
+    root.host.agent.list = async (...input) => {
+      const result = await agents(...input);
+      return {
+        ...result,
+        data: result.data.filter((agent) => agent.id === coordinatorAgent.id),
+      };
+    };
+    try {
+      await root.backend.nativeControl("takeover", binding.id, {}, identity);
+      expect((await root.backend.inspect()).bindings[0]?.status).toBe("manual");
+      expect(root.effects).toEqual([]);
+    } finally {
+      await root.backend.dispose();
+    }
+  });
   const identity = {
     sessionID: "coordinator",
     agent: coordinatorAgent.id,

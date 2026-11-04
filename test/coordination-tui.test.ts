@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { coordinatorAgent } from "../src/coordinator-agent.ts";
+import { COORDINATOR_TOOL_IDS } from "../src/tools.ts";
 import {
   applyNativeNoColor,
   CoordinationUI,
@@ -443,11 +444,9 @@ describe("Dedicated coordinator entry", () => {
         sessionAgent: coordinatorAgent.id,
         instructions: true,
       });
-      expect(native.entry?.tools.sort()).toEqual([
-        "conman_control",
-        "conman_inspect",
-        "question",
-      ]);
+      expect(native.entry?.tools.sort()).toEqual(
+        [...COORDINATOR_TOOL_IDS].sort(),
+      );
       expect(native.entry?.attachmentRequests).toBe(0);
       expect(native.entry?.bootstrapKeys.sort()).toEqual([
         "authority",
@@ -646,8 +645,8 @@ describe("Inherited coordinator policy", () => {
       expect(proof.stage).toBe("done");
       expect(proof.policyApproved).toBe(true);
       expect(proof.coordinatorTools).toEqual([
-        { name: "conman_inspect", status: "completed" },
-        { name: "conman_control", status: "completed" },
+        { name: "execute", status: "completed" },
+        { name: "execute", status: "completed" },
         { name: "policy_probe", status: "error" },
         { name: "execute", status: "error" },
       ]);
@@ -655,7 +654,7 @@ describe("Inherited coordinator policy", () => {
         { name: "policy_probe", message: "Coordinator tool is not permitted" },
         { name: "execute", message: "Coordinator tool is not permitted" },
       ]);
-      // The marker checks the ordinary probe body; execute's own error proves Code Mode entry rejection.
+      // The marker must remain absent for both ordinary and nested dispatch.
       expect(proof.forbiddenDispatched).toBe(false);
       const snapshot = proof.snapshot as CoordinatorSnapshot;
       expect(snapshot.bindings[0]?.location).toBe(proof.workerHome);
@@ -673,10 +672,11 @@ describe("Inherited coordinator policy", () => {
         undefined,
         "coordinator-denied",
       );
-      expect([...(denied.entry?.tools ?? [])].sort()).toEqual([
-        "conman_inspect",
-        "question",
-      ]);
+      expect([...(denied.entry?.tools ?? [])].sort()).toEqual(
+        [...COORDINATOR_TOOL_IDS]
+          .filter((id) => id !== "conman_dispatch_task")
+          .sort(),
+      );
     }
   });
 });
@@ -1358,6 +1358,7 @@ describe("Native project and worker selection", () => {
     runtime.inputs.push(
       {
         id: JSON.stringify(["api", task.location]),
+        projectID: "api",
         title: "api",
         location: task.location,
       },

@@ -1,4 +1,4 @@
-import type { OpenCodeClient } from "@opencode/client";
+import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import { isCoordinatorAgent } from "./coordinator-agent.ts";
 import type { WorkerBinding } from "./state.ts";
 import type { DispatchIntent } from "./dispatch.ts";
@@ -68,7 +68,9 @@ export class NativeDiscovery {
     private readonly client: NativeCatalogClient,
     private readonly signal?: AbortSignal,
   ) {}
-  async projects(): Promise<readonly ProjectChoice[]> {
+  async projects(): Promise<
+    readonly (ProjectChoice & { projectID: string })[]
+  > {
     const projects = await this.client.project.list(
       { archived: false },
       this.signal ? { signal: this.signal } : undefined,
@@ -78,6 +80,7 @@ export class NativeDiscovery {
     const choices = projects.flatMap((p) =>
       [...new Set([p.canonical, ...p.sandboxes])].map((location) => ({
         id: JSON.stringify([p.id, location]),
+        projectID: p.id,
         title:
           location === p.canonical
             ? (p.name ?? pathName(location))
@@ -131,6 +134,7 @@ export class NativeDiscovery {
         if (
           w.location.directory === location &&
           w.agent === agent &&
+          w.parentID === undefined &&
           !w.time.archived
         )
           workers.push({
@@ -194,6 +198,10 @@ export interface NativeInventory {
   sessions: {
     id: string;
     title: string;
+    projectID: string;
+    parentID: string | null;
+    topLevel: boolean;
+    archived: boolean;
     location: string;
     agent?: string;
     status: "running" | "waiting-for-input" | "inactive" | "unknown";
@@ -203,13 +211,26 @@ export async function readNativeInventory(
   client: NativeSessionClient,
   cursor?: string,
   signal?: AbortSignal,
+  query: {
+    projectID?: string;
+    location?: string;
+    search?: string;
+    parentID?: string | null;
+    includeArchived?: boolean;
+    order?: "asc" | "desc";
+  } = {},
 ): Promise<NativeInventory> {
   try {
     const request = signal ? { signal } : undefined;
     const page = await client.session.list(
       {
         limit: NATIVE_BOUNDS.catalogRows,
-        archived: false,
+        ...(query.includeArchived ? {} : { archived: false }),
+        ...(query.projectID !== undefined ? { project: query.projectID } : {}),
+        ...(query.location !== undefined ? { directory: query.location } : {}),
+        ...(query.search !== undefined ? { search: query.search } : {}),
+        ...(query.parentID !== undefined ? { parentID: query.parentID } : {}),
+        ...(query.order !== undefined ? { order: query.order } : {}),
         ...(cursor ? { cursor } : {}),
       },
       request,
@@ -219,79 +240,11 @@ export async function readNativeInventory(
       new Set(page.data.map((w) => w.id)).size !== page.data.length
     )
       throw new Error("Incomplete native inventory");
-    const sessions: NativeInventory["sessions"] = [];
-    const active = await client.session.active(request).catch(() => undefined);
-    const permissions = new Map<
-      string,
-      Promise<
-        Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
-      >
-    >();
-    const read = async (
-      worker: (typeof page.data)[number],
-    ): Promise<NativeInventory["sessions"][number]> => {
-      let status: NativeInventory["sessions"][number]["status"] = "unknown";
-      try {
-        if (!active) throw new Error("Native activity unavailable");
-        const location = worker.location.directory;
-        if (!permissions.has(location))
-          permissions.set(
-            location,
-            client.permission.request.list(
-              { location: { directory: location } },
-              request,
-            ),
-          );
-        const state = await readNativeLiveState(
-          client,
-          {
-            workerID: worker.id,
-            location: worker.location.directory,
-            ...(worker.agent ? { agent: worker.agent } : {}),
-          },
-          signal,
-          { active, permissions: permissions.get(location)! },
-        );
-        status = state.asks.length
-          ? "waiting-for-input"
-          : active[worker.id]?.type === "running"
-            ? "running"
-            : state.inbox.length || active[worker.id]
-              ? "unknown"
-              : "inactive";
-      } catch {
-        signal?.throwIfAborted();
-      }
-      return {
-        id: worker.id,
-        title: worker.title ?? worker.id,
-        location: worker.location.directory,
-        ...(worker.agent ? { agent: worker.agent } : {}),
-        status,
-      };
-    };
-    for (
-      let offset = 0;
-      offset < page.data.length;
-      offset += NATIVE_BOUNDS.concurrentReads
-    ) {
-      sessions.push(
-        ...(await Promise.all(
-          page.data
-            .slice(offset, offset + NATIVE_BOUNDS.concurrentReads)
-            .map(read),
-        )),
-      );
-    }
-    const after = await client.session.active(request).catch(() => undefined);
-    for (const session of sessions)
-      if (
-        !active ||
-        !after ||
-        JSON.stringify(active[session.id]) !== JSON.stringify(after[session.id])
-      )
-        session.status = "unknown";
-    signal?.throwIfAborted();
+    const sessions = await refreshNativeSessions(
+      client,
+      page.data.map(sessionMetadata),
+      signal,
+    );
     const next = page.cursor.next ?? undefined;
     return {
       available: true,
@@ -308,6 +261,103 @@ export async function readNativeInventory(
       reason: "Native session inventory unavailable",
     };
   }
+}
+
+function sessionMetadata(
+  worker: SessionInfo,
+): NativeInventory["sessions"][number] {
+  return {
+    id: worker.id,
+    title: worker.title ?? worker.id,
+    projectID: worker.projectID,
+    parentID: worker.parentID ?? null,
+    topLevel: worker.parentID === undefined,
+    archived: worker.time.archived !== undefined,
+    location: worker.location.directory,
+    ...(worker.agent ? { agent: worker.agent } : {}),
+    status: "unknown",
+  };
+}
+
+export async function refreshNativeSessions(
+  client: NativeSessionClient,
+  rows: readonly NativeInventory["sessions"][number][],
+  signal?: AbortSignal,
+): Promise<NativeInventory["sessions"]> {
+  if (rows.length > NATIVE_BOUNDS.catalogRows)
+    throw new Error("Native inventory exceeds its bound");
+  const request = signal ? { signal } : undefined;
+  const sessions: NativeInventory["sessions"] = [];
+  const active = await client.session.active(request).catch(() => undefined);
+  const permissions = new Map<
+    string,
+    Promise<
+      Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
+    >
+  >();
+  const read = async (
+    worker: NativeInventory["sessions"][number],
+  ): Promise<NativeInventory["sessions"][number]> => {
+    let status: NativeInventory["sessions"][number]["status"] = "unknown";
+    let metadata = worker;
+    try {
+      if (!active) throw new Error("Native activity unavailable");
+      const location = worker.location;
+      if (!permissions.has(location))
+        permissions.set(
+          location,
+          client.permission.request.list(
+            { location: { directory: location } },
+            request,
+          ),
+        );
+      const state = await readNativeLiveState(
+        client,
+        {
+          workerID: worker.id,
+          location: worker.location,
+          ...(worker.agent ? { agent: worker.agent } : {}),
+        },
+        signal,
+        { active, permissions: permissions.get(location)! },
+      );
+      metadata = sessionMetadata(state.worker);
+      status = state.asks.length
+        ? "waiting-for-input"
+        : active[worker.id]?.type === "running"
+          ? "running"
+          : state.inbox.length || active[worker.id]
+            ? "unknown"
+            : "inactive";
+    } catch {
+      signal?.throwIfAborted();
+    }
+    return {
+      ...metadata,
+      status,
+    };
+  };
+  for (
+    let offset = 0;
+    offset < rows.length;
+    offset += NATIVE_BOUNDS.concurrentReads
+  ) {
+    sessions.push(
+      ...(await Promise.all(
+        rows.slice(offset, offset + NATIVE_BOUNDS.concurrentReads).map(read),
+      )),
+    );
+  }
+  const after = await client.session.active(request).catch(() => undefined);
+  for (const session of sessions)
+    if (
+      !active ||
+      !after ||
+      JSON.stringify(active[session.id]) !== JSON.stringify(after[session.id])
+    )
+      session.status = "unknown";
+  signal?.throwIfAborted();
+  return sessions;
 }
 
 export async function readNativeDelivery(

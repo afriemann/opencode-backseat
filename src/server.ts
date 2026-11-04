@@ -1,13 +1,10 @@
 import { Plugin } from "@opencode/plugin";
+import { createCoordinationTools, COORDINATOR_TOOL_IDS } from "./tools.ts";
 import {
   createNativeConnection,
   type NativeConnection,
 } from "./native-connection.ts";
-import {
-  NativeDiscovery,
-  readNativeInventory,
-  readNativeDelivery,
-} from "./native-sessions.ts";
+import { readNativeDelivery } from "./native-sessions.ts";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { randomUUID, createPublicKey } from "node:crypto";
@@ -54,6 +51,7 @@ import {
 } from "./storage.ts";
 import {
   adoptWorker,
+  STATE_BOUNDS,
   assertStateBounds,
   initialTaskText,
   createWorker,
@@ -189,7 +187,7 @@ export async function generateTaskJudgment(
 
 export interface NativeBackendHost {
   session: Pick<Plugin.Context["session"], "get" | "create" | "prompt"> &
-    Partial<Pick<Plugin.Context["session"], "context">>;
+    Partial<Pick<Plugin.Context["session"], "context" | "list" | "remove">>;
   agent: Pick<Plugin.Context["agent"], "list">;
   permission: Pick<Plugin.Context["permission"], "assert">;
   storage: Pick<Plugin.Context["storage"], "get" | "set">;
@@ -216,6 +214,20 @@ export interface NativeBackendHost {
   ): Promise<"held">;
 }
 export interface NativeBackend {
+  inspectDeletions(
+    taskID: string,
+    identity: NativeIdentity,
+  ): Promise<
+    {
+      sessionID: string;
+      status: "pending" | "deleted" | "uncertain";
+      affectedTasks: string[];
+      observations: {
+        sessionID: string;
+        status: "present" | "absent" | "unknown";
+      }[];
+    }[]
+  >;
   bootstrap(): CoordinatorBootstrap;
   read(proof: SignedControl): Promise<CoordinatorSnapshot>;
   readObservation(
@@ -223,6 +235,14 @@ export interface NativeBackend {
     proof: SignedControl,
   ): Promise<ObserveResult>;
   inspect(identity?: NativeIdentity): Promise<CoordinatorSnapshot>;
+  deleteSession(
+    sessionID: string,
+    identity: NativeIdentity,
+  ): Promise<{
+    sessionID: string;
+    status: "deleted" | "uncertain";
+    affectedTasks: string[];
+  }>;
   attach(
     input: AttachInput,
     requestAbortSignal?: AbortSignal,
@@ -306,6 +326,60 @@ export async function createNativeBackend(
     return result;
   };
   const key = "coordinator:state";
+  interface DeletionRecord {
+    sessionID: string;
+    members: string[];
+    affectedTasks: string[];
+    status: "pending" | "deleted" | "uncertain";
+  }
+  const deletionKey = "coordinator:deletions";
+  const deletions = async (): Promise<DeletionRecord[]> => {
+    owned();
+    const raw = await host.storage.get(deletionKey);
+    owned();
+    if (raw === undefined) return [];
+    const value = object(raw);
+    exact(value, ["version", "records"]);
+    if (
+      value.version !== 1 ||
+      JSON.stringify(value).length > STATE_BOUNDS.bytes
+    )
+      throw new Error("Unsafe deletion journal");
+    const records = list(value.records, (raw) => {
+      const record = object(raw);
+      exact(record, ["sessionID", "members", "affectedTasks", "status"]);
+      const sessionID = text(record.sessionID),
+        members = list(record.members, text),
+        affectedTasks = list(record.affectedTasks, text);
+      if (
+        !members.includes(sessionID) ||
+        members.length > STATE_BOUNDS.bindings ||
+        affectedTasks.length > STATE_BOUNDS.bindings ||
+        !["pending", "deleted", "uncertain"].includes(String(record.status))
+      )
+        throw new Error("Unsafe deletion record");
+      return {
+        sessionID,
+        members,
+        affectedTasks,
+        status: record.status as DeletionRecord["status"],
+      };
+    });
+    if (
+      records.length > STATE_BOUNDS.bindings ||
+      new Set(records.map((record) => record.sessionID)).size !== records.length
+    )
+      throw new Error("Unsafe deletion inventory");
+    return records;
+  };
+  const writeDeletions = async (records: DeletionRecord[]) => {
+    owned();
+    await host.storage.set(
+      deletionKey,
+      JSON.parse(JSON.stringify({ version: 1, records })),
+    );
+    owned();
+  };
   const alive = () => {
     if (closed) throw new Error("Coordinator disposed");
   };
@@ -569,7 +643,11 @@ export async function createNativeBackend(
       );
     return session;
   };
-  const validateTarget = async (goal: TaskGoal, workerID?: string) => {
+  const validateTarget = async (
+    goal: TaskGoal,
+    workerID?: string,
+    topLevel = false,
+  ) => {
     if ((await host.canonical(goal.location)) !== goal.location)
       throw new Error("Noncanonical approved target");
     const agents = await host.agent.list({
@@ -586,6 +664,8 @@ export async function createNativeBackend(
     if (workerID) {
       const w = await host.session.get({ sessionID: workerID });
       alive();
+      if (topLevel && w.parentID !== undefined)
+        throw new Error("Only top-level sessions can be adopted or taken over");
       if (
         w.id !== workerID ||
         w.agent !== goal.agent ||
@@ -595,6 +675,12 @@ export async function createNativeBackend(
         throw new Error("Mismatched worker target");
     }
     alive();
+  };
+  const topLevelWorker = async (workerID: string) => {
+    const worker = await host.session.get({ sessionID: workerID });
+    alive();
+    if (worker.id !== workerID || worker.parentID !== undefined)
+      throw new Error("Only top-level sessions can be taken over");
   };
   const resumeEligibility = async (
     b: WorkerBinding,
@@ -1125,7 +1211,7 @@ export async function createNativeBackend(
         });
       };
       checkCreationCapacity();
-      await validateTarget(goal, workerID);
+      await validateTarget(goal, workerID, workerID !== undefined);
       const approve = async () => {
         await ask(
           coordinatorID,
@@ -1135,7 +1221,7 @@ export async function createNativeBackend(
           requestAbortSignal,
         );
         mutable();
-        await validateTarget(goal, workerID);
+        await validateTarget(goal, workerID, workerID !== undefined);
         mutable();
         checkCreationCapacity();
       };
@@ -1153,7 +1239,7 @@ export async function createNativeBackend(
       if (workerID)
         await adoptWorker(goal, workerID, {
           async read(id) {
-            await validateTarget(goal, id);
+            await validateTarget(goal, id, true);
             const w = await host.session.get({ sessionID: id });
             return {
               ...w,
@@ -1210,6 +1296,13 @@ export async function createNativeBackend(
       return true;
     }
     const b = binding(taskID);
+    if (
+      ["dispatch", "resume", "reserve"].includes(operation) &&
+      (await deletions()).some((record) => record.members.includes(b.workerID))
+    )
+      throw new Error(
+        "Worker has a retained deletion outcome; inspect rather than resend",
+      );
     if (operation === "dispatch") {
       exact(body, ["text", "scope"]);
       const assignment = text(body.text);
@@ -1264,6 +1357,7 @@ export async function createNativeBackend(
     )
       throw new Error("Task is not automatically owned");
     if (["hold", "resume", "takeover", "share"].includes(operation)) {
+      if (operation === "takeover") await topLevelWorker(b.workerID);
       if (operation === "share") sharingCandidate(b, body);
       if (operation === "resume") {
         if (identity)
@@ -1280,6 +1374,7 @@ export async function createNativeBackend(
         requestAbortSignal,
       );
       mutable();
+      if (operation === "takeover") await topLevelWorker(b.workerID);
     }
     if (
       operation === "hold" ||
@@ -1673,6 +1768,230 @@ export async function createNativeBackend(
         await coordinator(identity.sessionID, identity);
       }
       return snapshot();
+    },
+    inspectDeletions(taskID, identity) {
+      return serial(async () => {
+        owned();
+        await coordinator(identity.sessionID, identity);
+        const selected = binding(taskID);
+        const records = (await deletions()).filter(
+          (record) =>
+            record.affectedTasks.includes(taskID) ||
+            record.members.includes(selected.workerID),
+        );
+        if (!records.length) return [];
+        const signal = AbortSignal.any([
+          shutdown.signal,
+          ...(identity.signal ? [identity.signal] : []),
+        ]);
+        let visible = new Set<string>(),
+          complete = false;
+        try {
+          if (host.session.list) {
+            const page = await host.session.list(
+              { limit: STATE_BOUNDS.bindings },
+              { signal },
+            );
+            if (
+              page.data.length <= STATE_BOUNDS.bindings &&
+              new Set(page.data.map((session) => session.id)).size ===
+                page.data.length
+            ) {
+              visible = new Set(page.data.map((session) => session.id));
+              complete = !page.cursor.next;
+            }
+          }
+        } catch {
+          signal.throwIfAborted();
+        }
+        owned();
+        signal.throwIfAborted();
+        await coordinator(identity.sessionID, identity);
+        return records.map((record) => ({
+          sessionID: record.sessionID,
+          status: record.status,
+          affectedTasks: [...record.affectedTasks],
+          observations: record.members.map((sessionID) => ({
+            sessionID,
+            status: visible.has(sessionID)
+              ? ("present" as const)
+              : complete
+                ? ("absent" as const)
+                : ("unknown" as const),
+          })),
+        }));
+      });
+    },
+    deleteSession(sessionID, identity) {
+      return serial(async () => {
+        owned();
+        text(sessionID);
+        await coordinator(identity.sessionID, identity);
+        const signal = AbortSignal.any([
+          shutdown.signal,
+          ...(identity.signal ? [identity.signal] : []),
+        ]);
+        const live = () => {
+          owned();
+          signal.throwIfAborted();
+        };
+        if (!host.session.list || !host.session.remove)
+          throw new Error("Native session deletion unavailable");
+        const records = await deletions();
+        if (records.some((record) => record.members.includes(sessionID)))
+          throw new Error(
+            "Unresolved or retained deletion; inspect rather than retry",
+          );
+        if (records.length >= STATE_BOUNDS.bindings)
+          throw new Error("Deletion journal capacity exhausted");
+        const protect = async () => {
+          const seen = new Set<string>();
+          let current: string | undefined = identity.sessionID;
+          while (current !== undefined) {
+            live();
+            if (current === sessionID)
+              throw new Error(
+                "Cannot delete the invoking coordinator or its ancestors",
+              );
+            if (seen.has(current) || seen.size >= STATE_BOUNDS.bindings)
+              throw new Error("Unverifiable coordinator ancestry");
+            seen.add(current);
+            const parent = await host.session.get(
+              { sessionID: current },
+              { signal },
+            );
+            if (parent.id !== current)
+              throw new Error("Unverifiable coordinator ancestry");
+            current = parent.parentID;
+          }
+          live();
+        };
+        await protect();
+        const target = await host.session.get({ sessionID }, { signal });
+        if (target.id !== sessionID)
+          throw new Error("Mismatched deletion target");
+        const targetIdentity = (session: typeof target) =>
+          fingerprint([
+            session.id,
+            session.parentID,
+            session.agent,
+            session.projectID,
+            session.location,
+          ]);
+        const members = new Set([sessionID]);
+        const collect = async (parentID: string) => {
+          const children = await host.session.list!(
+            { parentID, limit: STATE_BOUNDS.bindings },
+            { signal },
+          );
+          live();
+          if (
+            children.cursor.next ||
+            children.data.some((child) => child.parentID !== parentID)
+          )
+            throw new Error("Incomplete native subtree inventory");
+          for (const child of children.data) {
+            if (members.has(child.id) || members.size >= STATE_BOUNDS.bindings)
+              throw new Error("Incomplete or cyclic native subtree");
+            members.add(child.id);
+            await collect(child.id);
+          }
+        };
+        const rejectOverlap = () => {
+          if (
+            records.some((record) =>
+              record.members.some((member) => members.has(member)),
+            )
+          )
+            throw new Error(
+              "Retained deletion overlap; inspect rather than retry",
+            );
+        };
+        await collect(sessionID);
+        rejectOverlap();
+        await ask(
+          identity.sessionID,
+          "delete_session",
+          JSON.stringify([
+            dataDir,
+            {
+              sessionID,
+              members: [...members],
+              recursiveNativeSubtree: true,
+              interruptsActive: true,
+              includesConcurrentDescendants: true,
+            },
+          ]),
+          identity,
+          signal,
+        );
+        await protect();
+        const current = await host.session.get({ sessionID }, { signal });
+        if (targetIdentity(current) !== targetIdentity(target))
+          throw new Error("Deletion target changed during approval");
+        members.clear();
+        members.add(sessionID);
+        await collect(sessionID);
+        rejectOverlap();
+        if (members.has(identity.sessionID))
+          throw new Error(
+            "Cannot delete the invoking coordinator or its ancestors",
+          );
+        live();
+        const affected = state.bindings.filter((b) => members.has(b.workerID));
+        for (const b of affected) {
+          // Terminal epochs anchor immutable completion provenance.
+          if (b.status !== "complete") {
+            b.status = "held";
+            b.epoch++;
+          }
+        }
+        for (const stored of state.intents)
+          if (
+            members.has(stored.intent.workerID) &&
+            stored.intent.status === "reserved"
+          )
+            stored.intent.status = "ambiguous";
+        await persist();
+        const record: DeletionRecord = {
+          sessionID,
+          members: [...members],
+          affectedTasks: affected.map((b) => b.id),
+          status: "pending",
+        };
+        records.push(record);
+        await writeDeletions(records);
+        let invoked = false;
+        try {
+          live();
+          invoked = true;
+          await host.session.remove({ sessionID }, { signal });
+          live();
+          record.status = "deleted";
+          await writeDeletions(records);
+        } catch (error) {
+          if (!invoked && !closed && authority === "owned") {
+            // Cancellation releases only the unissued deletion, not its task fence.
+            records.pop();
+            await writeDeletions(records);
+            throw error;
+          }
+          record.status = "uncertain";
+          if (!closed && authority === "owned") {
+            try {
+              await writeDeletions(records);
+            } catch {
+              authority = "held";
+              reason = "Deletion publication failed; inspect retained journal";
+            }
+          }
+        }
+        return {
+          sessionID,
+          status: record.status === "deleted" ? "deleted" : "uncertain",
+          affectedTasks: record.affectedTasks,
+        };
+      });
     },
     attach(input, requestAbortSignal) {
       return serial(async () => {
@@ -2497,6 +2816,7 @@ function unavailableCore(
     read: unavailable,
     readObservation: unavailable,
     inspect: unavailable,
+    deleteSession: unavailable,
     attach: unavailable,
     control: unavailable,
     suggest: unavailable,
@@ -2504,6 +2824,7 @@ function unavailableCore(
     validate: unavailable,
     recover: unavailable,
     nativeControl: unavailable,
+    inspectDeletions: unavailable,
     fenceProject: close,
     dispose: close,
   };
@@ -2653,6 +2974,8 @@ async function createNativeCore(
         create: (...args) => current().session.create(...args),
         prompt: (...args) => current().session.prompt(...args),
         context: (...args) => current().session.context(...args),
+        list: (...args) => current().session.list(...args),
+        remove: (...args) => current().session.remove(...args),
       },
       agent: { list: (...args) => current().agent.list(...args) },
       permission: { assert: (...args) => current().permission.assert(...args) },
@@ -2928,11 +3251,7 @@ export default Plugin.define({
         });
       });
       cleanupSteps.push(() => agents.dispose());
-      const allowedTools = new Set(
-        coordinatorAgent.permissions
-          .filter((rule) => rule.effect === "allow")
-          .map((rule) => rule.action),
-      );
+      const allowedTools = COORDINATOR_TOOL_IDS;
       const matchesExecutionRole = async (sessionID: string, agent: string) => {
         if (agent && agent !== coordinatorAgent.id) return false;
         if (adapter.abort.signal.aborted || !sessionID || !agent)
@@ -3060,179 +3379,43 @@ export default Plugin.define({
           }),
       });
       cleanupSteps.push(() => rpc.dispose());
+      const registry = createCoordinationTools({
+        native,
+        backend,
+        canonical,
+        signal: adapter.abort.signal,
+        async authorize(context) {
+          if (
+            !(await serve(() =>
+              matchesExecutionRole(context.sessionID, context.agent),
+            ))
+          )
+            throw new Error("Select Conman Coordinator for coordination tools");
+        },
+      });
+      cleanupSteps.push(async () => {
+        registry.dispose();
+      });
       const tools = await ctx.tool.transform((editor) => {
-        editor.add({
-          name: "conman_inspect",
+        editor.namespace({
+          name: "conman",
           description:
-            "List native sessions across all projects on this service (default view sessions), project locations (view projects), eligible worker agents at location (view agents), or protected task bindings and delivery identities (view tasks). Session results expose metadata only, with truthful running/waiting/unknown status and explicit partial/cursor results. Native listing needs neither task storage nor TUI attachment. Read-only; never grants approval.",
-          input: {
-            type: "object",
-            properties: {
-              view: {
-                type: "string",
-                enum: ["sessions", "projects", "agents", "tasks"],
-              },
-              location: { type: "string" },
-              cursor: { type: "string" },
-            },
-            additionalProperties: false,
-          },
-          options: { codemode: false },
-          async execute(input: unknown, context) {
-            try {
-              const v = object(input);
-              exact(v, ["view", "location", "cursor"]);
-              const view = v.view ?? "sessions";
-              if (
-                !["sessions", "projects", "agents", "tasks"].includes(
-                  String(view),
-                )
-              )
-                throw new Error("Invalid inventory view");
-              if (
-                v.cursor !== undefined &&
-                (view !== "sessions" || text(v.cursor).length > 4096)
-              )
-                throw new Error("Invalid inventory cursor");
-              if (v.location !== undefined && view !== "agents")
-                throw new Error("Location is only used for agent inventory");
-              if (
-                !(await matchesExecutionRole(context.sessionID, context.agent))
-              )
-                throw new Error(
-                  "Select Conman Coordinator to inspect inventory",
-                );
-              const result = await serve(async () => {
-                if (view === "tasks")
-                  return backend.inspect({
-                    ...context,
-                    signal: requestSignal(context.signal),
-                  });
-                const selected =
-                  view === "agents" ? text(v.location) : undefined;
-                if (
-                  selected !== undefined &&
-                  (await canonical(selected)) !== selected
-                )
-                  throw new Error(
-                    "Select an absolute canonical project location",
-                  );
-                try {
-                  return {
-                    native: await native.read(async (client, lifetime) => {
-                      const signal = AbortSignal.any([
-                        lifetime,
-                        requestSignal(context.signal),
-                      ]);
-                      if (view === "sessions")
-                        return readNativeInventory(
-                          client,
-                          v.cursor === undefined ? undefined : text(v.cursor),
-                          signal,
-                        );
-                      const discovery = new NativeDiscovery(client, signal);
-                      return view === "projects"
-                        ? {
-                            available: true,
-                            partial: false,
-                            projects: await discovery.projects(),
-                          }
-                        : {
-                            available: true,
-                            partial: false,
-                            location: selected,
-                            agents: await discovery.agents(selected!),
-                          };
-                    }),
-                  };
-                } catch (error) {
-                  context.signal.throwIfAborted();
-                  return {
-                    native: {
-                      available: false,
-                      partial: true,
-                      reason:
-                        error instanceof Error
-                          ? error.message
-                          : "Native service unavailable",
-                    },
-                  };
-                }
-              });
-              return {
-                content: JSON.stringify(result),
-              };
-            } catch (error) {
-              log("error", "Native coordination inspection failed");
-              throw error;
-            }
-          },
+            "Native session discovery and explicit task coordination",
         });
-        editor.add({
-          name: "conman_control",
-          description:
-            "Create, adopt, take over or dispatch an explicitly approved task without TUI attachment or automation arming. Requires native operation-bound permission; confirmation fields and worker evidence never grant authority. Supply operation, taskID and body. Create body is {id,title,goal,criteria:string[],constraints:string[],scope:string[],location:absoluteCanonicalDirectory,agent,group?}; adopt body is {goal:thatObject,workerID} and binds without prompting; takeover body {} fences automation without prompting. Dispatch body {text,scope:string[]} declares a nonempty subset of the binding scope and sends the requested assignment to a held/manual binding without consuming automation limits; unresolved delivery blocks another send. Hold/recover use body {}. Resume is only for optional automation and requires native TUI reconciliation. Share body is {snapshot?:{id,version,group,content,recipients:string[]},shared:[{id,version}]} for this recipient task; shared=[] revokes future inputs only.",
-          input: {
-            type: "object",
-            properties: {
-              operation: {
-                type: "string",
-                enum: [
-                  "create",
-                  "adopt",
-                  "dispatch",
-                  "hold",
-                  "resume",
-                  "takeover",
-                  "share",
-                  "recover",
-                ],
-              },
-              taskID: { type: "string" },
-              body: { type: "object" },
-            },
-            required: ["operation", "taskID", "body"],
-            additionalProperties: false,
-          },
-          options: { codemode: false },
-          async execute(input: unknown, context) {
-            try {
-              if (adapter.abort.signal.aborted)
-                throw new Error("Project adapter is unavailable");
-              const identity = {
-                ...context,
-                signal: requestSignal(context.signal),
-              };
-              const v = object(input);
-              exact(v, ["operation", "taskID", "body"]);
-              if (v.operation === "recover") {
-                return {
-                  content: JSON.stringify(
-                    await backend.recover(
-                      { coordinatorID: context.sessionID },
-                      identity,
-                    ),
-                  ),
-                };
+        for (const tool of registry.tools)
+          editor.add({
+            ...tool,
+            async execute(input, context) {
+              try {
+                return await tool.execute(input, context);
+              } catch (error) {
+                log("error", "Native coordination tool failed", {
+                  tool: tool.name,
+                });
+                throw error;
               }
-              if (!CONTROL_OPERATIONS.includes(v.operation as ControlOperation))
-                throw new Error("Invalid operation");
-              return {
-                content: JSON.stringify(
-                  await backend.nativeControl(
-                    v.operation as ControlOperation,
-                    text(v.taskID),
-                    v.body,
-                    identity,
-                  ),
-                ),
-              };
-            } catch (error) {
-              log("error", "Native coordination operation failed");
-              throw error;
-            }
-          },
-        });
+            },
+          });
       });
       cleanupSteps.push(() => tools.dispose());
       log("info", "Native coordinator setup complete");
