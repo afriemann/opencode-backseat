@@ -1,0 +1,11 @@
+- [x] Extract the namespaced structured registry and preserve "Preserves native approval for conversational control" without generic model-facing aliases.
+- [x] Enforce "Rejects disallowed coordinator tool execution" through composition while preserving configured denials and native identity.
+- [x] Extend shared native projection for "Lists sessions across projects without task or TUI prerequisites" and "Reports native running and waiting status without automation evidence".
+- [x] Implement "Filters hierarchical sessions with multiple statuses" with explicit task-dependent availability and documented filter semantics.
+- [x] Implement bounded continuation per design "Discovery and continuation" for "Continues filtered queries without exposing native cursors" and "Reports partial or unknown inventory honestly".
+- [x] Implement catalog and task-detail endpoints for "Lists catalogs and retrieves task details independently".
+- [x] Enforce "Rejects child adoption and takeover before and after approval" in shared backend authority.
+- [x] Journal and fence native subtree removal per design "Deletion" for "Deletes the approved native subtree and preserves task history".
+- [x] Implement "Rejects unsafe deletion and retains uncertain outcomes" without retrying ambiguous removal.
+- [x] Align coordinator instructions and README with the dedicated tool contracts and hierarchy restrictions.
+- [x] Preserve "Rejects coordinator worker assignments" and "Preserves cross-project control under inherited policy" across the extracted registry.

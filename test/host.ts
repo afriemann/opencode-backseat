@@ -53,6 +53,7 @@ export function fixtureApproval(
           "conman.share",
           "conman.hold",
           "conman.takeover",
+          "conman.delete_session",
         ].includes(input.action) ||
         !input.resources.length ||
         input.resources.some((resource) => {
@@ -341,10 +342,10 @@ export default Plugin.define({id:"conman.native-flow-driver",setup(ctx){
      const shared=await inspect();
       if(shared.dataDir!==o.dataDir||JSON.stringify(shared.bindings[0])!==JSON.stringify(binding))throw new Error("Projects did not share the approved store");
      if(o.action==="policy"){
-       record("coordinator-inspect");await run(coordinator.id,"Inspect the coordinated tasks with conman_inspect.");
+        record("coordinator-list");await run(coordinator.id,"List the coordinated tasks through Code Mode.");
        record("coordinator-hold");
        const holding={sessionID:coordinator.id,action:"conman.hold",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,{}])],decision:"once"};expected=holding;
-       await run(coordinator.id,"Hold only owned-seed-task with conman_control.");
+        await run(coordinator.id,"Hold only owned-seed-task through Code Mode.");
        proof.policyApproved=holding.asked===true;
        record("ordinary-guard");await run(coordinator.id,"Probe the ordinary execution guard.");
        record("codemode-guard");await run(coordinator.id,"Probe the Code Mode execution guard.");
@@ -602,31 +603,30 @@ export async function captureNativeCoordinator(
           input.messages.findLast((message) => message.role === "user")
             ?.content,
         );
-        const name = user?.includes("Probe the ordinary execution guard")
-          ? "policy_probe"
+        const operation = user?.includes("Probe the ordinary execution guard")
+          ? "ordinary"
           : user?.includes("Probe the Code Mode execution guard")
-            ? "execute"
+            ? "nested"
             : user?.includes("Hold only owned-seed-task")
-              ? "conman_control"
-              : "conman_inspect";
-        const probe = name === "policy_probe" || name === "execute";
+              ? "hold"
+              : "list";
+        const name = operation === "ordinary" ? "policy_probe" : "execute";
         if (
-          tools.length !== (probe ? 4 : 3) ||
+          tools.length !== (operation === "ordinary" ? 3 : 2) ||
           ![
-            "conman_inspect",
-            "conman_control",
+            "execute",
             "question",
-            ...(probe ? [name] : []),
+            ...(operation === "ordinary" ? [name] : []),
           ].every((name) => tools.includes(name))
         )
           throw new Error(
             "Merged-policy coordinator exposed an unexpected tool catalog",
           );
-        requests.push({ kind: `coordinator-${name}`, tools });
-        if (coordinatorCalls.has(name))
+        requests.push({ kind: `coordinator-${operation}`, tools });
+        if (coordinatorCalls.has(operation))
           delta = { content: "Owned coordinator operation finished." };
         else {
-          coordinatorCalls.add(name);
+          coordinatorCalls.add(operation);
           delta = {
             tool_calls: [
               {
@@ -636,15 +636,16 @@ export async function captureNativeCoordinator(
                 function: {
                   name,
                   arguments: JSON.stringify(
-                    name === "conman_control"
-                      ? {
-                          operation: "hold",
-                          taskID: "owned-seed-task",
-                          body: {},
-                        }
-                      : name === "execute"
-                        ? { code: "await tools.policy_probe({})" }
-                        : {},
+                    operation === "ordinary"
+                      ? {}
+                      : {
+                          code:
+                            operation === "nested"
+                              ? "await tools.policy_probe({})"
+                              : operation === "hold"
+                                ? 'return await tools.conman.hold_task({taskID:"owned-seed-task"})'
+                                : "return await tools.conman.list_tasks({})",
+                        },
                   ),
                 },
               },
@@ -1086,7 +1087,7 @@ export default Plugin.define({id:"conman",async setup(ctx){
                 ...(discovery === "coordinator-denied"
                   ? [
                       {
-                        action: "conman_control",
+                        action: "conman_dispatch_task",
                         resource: "*",
                         effect: "deny",
                       },
