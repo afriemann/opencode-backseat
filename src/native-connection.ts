@@ -8,6 +8,8 @@ import { BackseatRpc } from "./rpc.ts";
 
 const REGISTRATION_BYTES = 16_384;
 const REQUEST_TIMEOUT = 10_000;
+const hasUnsafeOtherWrite = (mode: number): boolean =>
+  (mode & 0o002) !== 0 && (mode & 0o1000) === 0;
 class NativeConnectionError extends Error {}
 const unavailable = (reason: string): Error =>
   new NativeConnectionError(`Native service ${reason}`);
@@ -27,12 +29,21 @@ export async function readNativeRegistration(
   const ancestors: { path: string; dev: number; ino: number }[] = [];
   for (let path = dirname(file); ; path = dirname(path)) {
     const info = await files.lstat(path);
-    if (
-      !info.isDirectory() ||
-      ![0, uid].includes(info.uid) ||
-      (info.mode & 0o022) !== 0
-    )
-      throw unavailable("registration ancestry is unsafe");
+    const directory = `registration directory ${JSON.stringify(path)}`;
+    const mode = (info.mode & 0o7777).toString(8).padStart(4, "0");
+    if (!info.isDirectory())
+      throw unavailable(
+        `${directory} is ${info.isSymbolicLink() ? "a symbolic link, not a directory" : "not a directory"} (mode ${mode}). Review this path's type; registration ancestors must be directories.`,
+      );
+    if (![0, uid].includes(info.uid))
+      throw unavailable(
+        `${directory} is owned by UID ${info.uid} (expected UID 0 or ${uid}). Review this directory's ownership.`,
+      );
+    if (hasUnsafeOtherWrite(info.mode)) {
+      throw unavailable(
+        `${directory} is other-writable without sticky protection (mode ${mode}). Review this directory's permissions.`,
+      );
+    }
     ancestors.push({ path, dev: info.dev, ino: info.ino });
     if (path === dirname(path)) break;
   }
@@ -94,7 +105,7 @@ export async function readNativeRegistration(
         info.dev !== ancestor.dev ||
         info.ino !== ancestor.ino ||
         ![0, uid].includes(info.uid) ||
-        (info.mode & 0o022) !== 0
+        hasUnsafeOtherWrite(info.mode)
       )
         throw unavailable("registration ancestry changed");
     }

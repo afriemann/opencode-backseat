@@ -174,6 +174,113 @@ describe("Automatic same-service native connection", () => {
     }
   });
 
+  it("Explains initial registration-directory rejection", async () => {
+    const uid = process.getuid!();
+    for (const [mode, owner, path, reason, detail] of [
+      [constants.S_IFREG | 0o644, uid, "/safe/leaf", "not a directory", "0644"],
+      [
+        constants.S_IFLNK | 0o777,
+        uid,
+        "/safe/leaf",
+        "symbolic link",
+        "not a directory",
+      ],
+      [
+        constants.S_IFDIR | 0o755,
+        uid + 1,
+        "/safe/leaf",
+        `UID ${uid + 1}`,
+        `UID 0 or ${uid}`,
+      ],
+      [constants.S_IFDIR | 0o777, uid, "/safe/leaf", "other-writable", "0777"],
+      [constants.S_IFDIR | 0o777, uid, "/safe", "other-writable", "0777"],
+    ] as const) {
+      let opened = false;
+      const inspected: string[] = [];
+      const files = {
+        async lstat(candidate: string) {
+          inspected.push(candidate);
+          return Object.assign(Object.create(Stats.prototype) as Stats, {
+            mode: candidate === path ? mode : constants.S_IFDIR | 0o755,
+            uid: candidate === path ? owner : uid,
+            dev: 1,
+            ino: 1,
+          });
+        },
+        async open() {
+          opened = true;
+          throw new Error("Registration contents must not be opened");
+        },
+      } as unknown as NonNullable<Parameters<typeof readNativeRegistration>[1]>;
+      const connection = createNativeConnection({
+        location: "/projects/coordinator",
+        version: "2.2.5",
+        registration: () =>
+          readNativeRegistration("/safe/leaf/service.json", files),
+      });
+      try {
+        const error = await connection
+          .read(async () => "unexpected inventory")
+          .catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(Error);
+        const message = (error as Error).message;
+        expect(message).toContain(JSON.stringify(path));
+        expect(message).toContain(reason);
+        expect(message).toContain(detail);
+        expect(message).toContain("Review");
+        expect(opened).toBe(false);
+        expect(inspected).not.toContain("/safe/leaf/service.json");
+      } finally {
+        connection.dispose();
+      }
+    }
+  });
+
+  it("Supports trusted writable registration ancestry", async () => {
+    for (const mode of [0o775, 0o2775, 0o1777]) {
+      const contents = Buffer.from(JSON.stringify({ pid: process.pid }));
+      const file = Object.assign(Object.create(Stats.prototype) as Stats, {
+        mode: constants.S_IFREG | 0o600,
+        uid: process.getuid!(),
+        nlink: 1,
+        size: contents.length,
+        dev: 1,
+        ino: 2,
+        mtimeMs: 1,
+        ctimeMs: 1,
+      });
+      const directory = Object.assign(Object.create(Stats.prototype) as Stats, {
+        mode: constants.S_IFDIR | mode,
+        uid: process.getuid!(),
+        dev: 1,
+        ino: 1,
+      });
+      const files = {
+        async lstat(path: string) {
+          if (path.endsWith("service.json")) return file;
+          return directory;
+        },
+        async open() {
+          return {
+            async stat() {
+              return file;
+            },
+            async read(buffer: Buffer, offset: number) {
+              return {
+                bytesRead: offset === 0 ? contents.copy(buffer) : 0,
+                buffer,
+              };
+            },
+            async close() {},
+          };
+        },
+      } as unknown as NonNullable<Parameters<typeof readNativeRegistration>[1]>;
+      expect(
+        await readNativeRegistration("/safe/leaf/service.json", files),
+      ).toEqual({ pid: process.pid });
+    }
+  });
+
   it("Rejects unsafe destinations before exposing credentials", async () => {
     for (const unsafe of [
       "none",
@@ -181,11 +288,12 @@ describe("Automatic same-service native connection", () => {
       "owner",
       "link",
       "symlink",
-      "ancestor",
       "changed",
       "post-file",
       "post-name",
       "post-ancestor",
+      "post-mode",
+      "sticky-owner",
       "oversized",
     ] as const) {
       const contents = Buffer.from(
@@ -215,13 +323,31 @@ describe("Automatic same-service native connection", () => {
       if (unsafe === "owner") stat.uid += 1;
       if (unsafe === "link") stat.nlink = 2;
       if (unsafe === "symlink") stat.mode = constants.S_IFLNK | 0o600;
-      if (unsafe === "ancestor") directory.mode |= 0o002;
       if (unsafe === "oversized") stat.size = 20_000;
+      if (unsafe === "sticky-owner") {
+        directory.mode = constants.S_IFDIR | 0o1777;
+      }
       let opened = false,
         closed = false,
         reads = 0;
       const files = {
         async lstat(path: string) {
+          if (unsafe === "sticky-owner" && path === "/safe")
+            return Object.assign(
+              Object.create(Stats.prototype) as Stats,
+              directory,
+              { uid: process.getuid!() + 1 },
+            );
+          if (
+            unsafe === "post-mode" &&
+            reads > 0 &&
+            !path.endsWith("service.json")
+          )
+            return Object.assign(
+              Object.create(Stats.prototype) as Stats,
+              directory,
+              { mode: constants.S_IFDIR | 0o777 },
+            );
           if (
             unsafe === "post-name" &&
             reads > 0 &&
@@ -281,7 +407,8 @@ describe("Automatic same-service native connection", () => {
         if (
           unsafe === "post-file" ||
           unsafe === "post-name" ||
-          unsafe === "post-ancestor"
+          unsafe === "post-ancestor" ||
+          unsafe === "post-mode"
         )
           expect(reads).toBeGreaterThan(0);
         else expect(reads).toBe(0);
