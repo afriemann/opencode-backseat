@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import { coordinatorAgent } from "../src/coordinator-agent.ts";
-import { COORDINATOR_TOOL_IDS } from "../src/tools.ts";
 import {
   applyNativeNoColor,
   CoordinationUI,
@@ -426,7 +425,7 @@ function runtimeFixture() {
 // spec: openspec/specs/coordination-tui/spec.md
 describe("Dedicated coordinator entry", () => {
   it("Starts through the dedicated native agent", async () => {
-    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
       const native = await captureNativeOverview(
         [],
         80,
@@ -444,14 +443,13 @@ describe("Dedicated coordinator entry", () => {
         sessionAgent: coordinatorAgent.id,
         instructions: true,
       });
-      expect(native.entry?.tools.sort()).toEqual(
-        [...COORDINATOR_TOOL_IDS].sort(),
+      expect(native.entry?.tools.filter((name) => name !== "question")).toEqual(
+        ["execute"],
       );
       expect(native.entry?.attachmentRequests).toBe(0);
-      expect(native.entry?.bootstrapKeys.sort()).toEqual([
-        "authority",
-        "dataDir",
-      ]);
+      expect(
+        native.entry?.bootstrapKeys.filter((key) => key !== "reason").sort(),
+      ).toEqual(["authority", "dataDir"]);
       expect(native.entry?.userMessages).toEqual([
         "Inspect the current coordination state.",
       ]);
@@ -466,9 +464,9 @@ describe("Dedicated coordinator entry", () => {
       "agentless",
     ]) {
       const f = runtimeFixture();
-      expect(f.commands.some((command) => command.id === "conman.start")).toBe(
-        false,
-      );
+      expect(
+        f.commands.some((command) => command.id === "backseat.start"),
+      ).toBe(false);
       const get = f.context.client.session.get;
       f.context.client.session.get = async (input) => {
         const session = { ...(await get(input)) };
@@ -495,10 +493,10 @@ describe("Dedicated coordinator entry", () => {
         ],
       });
       try {
-        await f.run("conman.attach");
+        await f.run("backseat.attach");
         expect(!!f.snapshot().observer).toBe(role === coordinatorAgent.id);
         if (role !== coordinatorAgent.id)
-          expect(f.notices.join("\n")).toContain("Conman Coordinator");
+          expect(f.notices.join("\n")).toContain("Backseat Coordinator");
       } finally {
         f.close();
       }
@@ -508,8 +506,8 @@ describe("Dedicated coordinator entry", () => {
     for (const operation of ["hold", "detach"] as const) {
       const current = runtimeFixture();
       try {
-        await current.run("conman.attach");
-        await current.run("conman.rearm");
+        await current.run("backseat.attach");
+        await current.run("backseat.rearm");
         const controlsBefore = current.controls.length;
         let reads = 0;
         const inspect = current.rpc.inspect;
@@ -526,19 +524,19 @@ describe("Dedicated coordinator entry", () => {
           return { accepted: true, reason };
         };
         await current.run(
-          `conman.${operation}`,
+          `backseat.${operation}`,
           operation === "hold" ? task.workerID : undefined,
         );
         expect(current.controls).toHaveLength(controlsBefore + 1);
         expect(reads).toBe(readsAtCommit);
         const enabled = current.commands.find(
-          (command) => command.id === "conman.hold",
+          (command) => command.id === "backseat.hold",
         )?.enabled;
         expect(typeof enabled === "function" ? enabled() : enabled).toBe(false);
         expect(current.notices.some((notice) => notice.includes(reason))).toBe(
           true,
         );
-        await current.run("conman.overview");
+        await current.run("backseat.overview");
         expect(current.controls).toHaveLength(controlsBefore + 1);
         expect(
           current.dialogs
@@ -557,7 +555,7 @@ describe("Dedicated coordinator entry", () => {
         authority: "held",
         reason: "dataDir must be absolute",
       });
-      await invalid.run("conman.status");
+      await invalid.run("backseat.status");
       expect(
         invalid.dialogs
           .at(-1)
@@ -574,18 +572,18 @@ describe("Dedicated coordinator entry", () => {
       runtime.location =
         undefined as unknown as NativeRuntimeContext["location"];
       f.emit({ id: "connected", type: "server.connected", data: {} });
-      await f.run("conman.detach");
+      await f.run("backseat.detach");
       expect(
         f.notices.some((value) => value.includes("location is unavailable")),
       ).toBe(false);
       f.context.location = { directory: "/tmp/opencode" };
-      await f.run("conman.overview");
+      await f.run("backseat.overview");
       expect(
         f.dialogs
           .at(-1)
           ?.options.some((option) => option.title === "Attach to view workers"),
       ).toBe(true);
-      await f.run("conman.status");
+      await f.run("backseat.status");
       expect(
         f.dialogs
           .at(-1)
@@ -595,10 +593,10 @@ describe("Dedicated coordinator entry", () => {
       expect(f.snapshot().observer).toBeUndefined();
       expect(f.controls).toEqual([]);
       expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(false);
-      await f.run("conman.attach");
+      await f.run("backseat.attach");
       expect(f.snapshot().observer).toBeDefined();
       expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(false);
-      await f.run("conman.rearm");
+      await f.run("backseat.rearm");
       expect(f.notices.some((value) => value.startsWith("ready:"))).toBe(true);
     } finally {
       f.close();
@@ -622,8 +620,8 @@ describe("Inherited coordinator policy", () => {
       };
     };
     try {
-      await f.run("conman.attach");
-      await f.run("conman.hold", task.workerID);
+      await f.run("backseat.attach");
+      await f.run("backseat.hold", task.workerID);
       expect(f.controls.at(-1)?.operation).toBe("hold");
       expect(f.controls.at(-1)?.taskID).toBe(task.id);
       expect(f.snapshot().bindings[0]?.location).toBe(task.location);
@@ -639,7 +637,7 @@ describe("Inherited coordinator policy", () => {
       f.close();
     }
     // The Makefile native target runs the owned-host integration alongside this unit path.
-    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
       const proof = await captureNativeCoordinator("policy");
       expect(proof.error).toBeUndefined();
       expect(proof.stage).toBe("done");
@@ -648,12 +646,19 @@ describe("Inherited coordinator policy", () => {
         { name: "execute", status: "completed" },
         { name: "execute", status: "completed" },
         { name: "policy_probe", status: "error" },
-        { name: "execute", status: "error" },
+        { name: "execute", status: "completed" },
       ]);
       expect(proof.guardErrors).toEqual([
         { name: "policy_probe", message: "Coordinator tool is not permitted" },
-        { name: "execute", message: "Coordinator tool is not permitted" },
       ]);
+      expect(proof.nestedResult).toMatchObject({
+        status: "completed",
+        content: [{ type: "text", text: "Coordinator tool is not permitted" }],
+        metadata: {
+          error: true,
+          toolCalls: [{ tool: "policy.nested_probe", status: "error" }],
+        },
+      });
       // The marker must remain absent for both ordinary and nested dispatch.
       expect(proof.forbiddenDispatched).toBe(false);
       const snapshot = proof.snapshot as CoordinatorSnapshot;
@@ -672,11 +677,16 @@ describe("Inherited coordinator policy", () => {
         undefined,
         "coordinator-denied",
       );
-      expect([...(denied.entry?.tools ?? [])].sort()).toEqual(
-        [...COORDINATOR_TOOL_IDS]
-          .filter((id) => id !== "conman_dispatch_task")
-          .sort(),
+      expect(denied.entry?.tools.filter((name) => name !== "question")).toEqual(
+        ["execute"],
       );
+      expect(denied.entry?.permissions).toContainEqual({
+        action: "backseat_dispatch_task",
+        resource: "*",
+        effect: "deny",
+      });
+      expect(denied.entry?.dispatchPermission?.allowed).toBe(false);
+      expect(denied.entry?.dispatchPermission?.error).toBeDefined();
     }
   });
 });
@@ -851,7 +861,7 @@ async function supervisedRuntime(action: "continue" | "complete") {
     permission: {
       async assert(input) {
         await fixtureApproval(home).assert(input);
-        if (input.action === "conman.resume") await duringResumeApproval();
+        if (input.action === "backseat.resume") await duringResumeApproval();
       },
     },
     async canonical(path) {
@@ -981,9 +991,9 @@ async function supervisedRuntime(action: "continue" | "complete") {
       duringResumeApproval = fn;
     },
     async ready() {
-      await f.run("conman.attach");
-      await f.run("conman.resume", task.workerID);
-      await f.run("conman.rearm");
+      await f.run("backseat.attach");
+      await f.run("backseat.resume", task.workerID);
+      await f.run("backseat.rearm");
     },
     async supervise() {
       await f.nativeEmit({
@@ -992,7 +1002,7 @@ async function supervisedRuntime(action: "continue" | "complete") {
         type: "session.idle",
         data: { sessionID: task.workerID },
       });
-      await f.run("conman.overview");
+      await f.run("backseat.overview");
     },
     async cleanup() {
       close();
@@ -1079,7 +1089,7 @@ async function assertResumeApprovalRechecks() {
   for (const failure of ["denied", "changed-context", "new-ask"] as const) {
     const f = await supervisedRuntime("continue");
     try {
-      await f.run("conman.attach");
+      await f.run("backseat.attach");
       const before = (await f.backend.inspect()).bindings[0]!;
       f.onResumeApproval(async () => {
         if (failure === "denied") throw new Error("Native approval denied");
@@ -1098,7 +1108,7 @@ async function assertResumeApprovalRechecks() {
             resources: [task.location],
           });
       });
-      await f.run("conman.resume", task.workerID);
+      await f.run("backseat.resume", task.workerID);
       const after = (await f.backend.inspect()).bindings[0]!;
       if (failure === "new-ask") {
         expect(after.status).toBe("held");
@@ -1139,7 +1149,7 @@ async function assertLocalObserverFailureFences() {
           ...f.backend.bootstrap(),
           dataDir: "/unapproved-store",
         });
-        await f.run("conman.recover");
+        await f.run("backseat.recover");
         expect(f.notices.at(-1)).toMatch(/coordination store/i);
         expect(await f.backend.inspect()).toEqual(before);
         continue;
@@ -1174,11 +1184,11 @@ async function assertLocalObserverFailureFences() {
           };
         };
         f.inputs.push(JSON.stringify({ shared: [] }));
-        await f.run("conman.share", task.workerID);
+        await f.run("backseat.share", task.workerID);
         expect(f.notices.at(-1)).toContain("obsolete");
       } else {
         await f.run(
-          mode === "status-inspect" ? "conman.status" : "conman.overview",
+          mode === "status-inspect" ? "backseat.status" : "backseat.overview",
         );
         const after = await f.backend.inspect();
         expect(after.observer!.sequence).toBeGreaterThanOrEqual(
@@ -1193,21 +1203,21 @@ async function assertLocalObserverFailureFences() {
       f.context.client.session.get = get;
       f.controllerRpc.control = control;
       const enabled = f.commands.find(
-        (command) => command.id === "conman.rearm",
+        (command) => command.id === "backseat.rearm",
       )?.enabled;
       expect(typeof enabled === "function" ? enabled() : enabled).toBe(false);
       const fenced = await f.backend.inspect();
       const controlCount = f.controls.length;
-      await f.run("conman.rearm");
-      await f.run("conman.hold", task.workerID);
+      await f.run("backseat.rearm");
+      await f.run("backseat.hold", task.workerID);
       await f.supervise();
       expect(f.generated).toEqual([]);
       expect(f.admissions).toEqual([]);
       expect(f.controls).toHaveLength(controlCount);
       expect(await f.backend.inspect()).toEqual(fenced);
       await f.observer.idle({ sessionID: task.workerID, background: [] });
-      await f.run("conman.attach");
-      await f.run("conman.rearm");
+      await f.run("backseat.attach");
+      await f.run("backseat.rearm");
       await f.supervise();
       expect(f.generated).toEqual(["suggest", "validate"]);
       expect(f.admissions).toHaveLength(1);
@@ -1222,7 +1232,7 @@ async function assertLocalObserverFailureFences() {
 
 describe("Native project and worker selection", () => {
   it("Selects a project-specific agent and worker", async () => {
-    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
       const discovery = await captureNativeOverview(
         [task],
         80,
@@ -1236,7 +1246,7 @@ describe("Native project and worker selection", () => {
         true,
       );
       expect(discovery.frame.commands).toContainEqual(
-        expect.objectContaining({ id: "conman.overview" }),
+        expect.objectContaining({ id: "backseat.overview" }),
       );
       expect(discovery.frame.text).toContain("Coordinate / search");
       expect(discovery.frame.text).toContain("Coordinate: open worker");
@@ -1354,7 +1364,7 @@ describe("Native project and worker selection", () => {
       );
     }
     const runtime = runtimeFixture();
-    await runtime.run("conman.attach");
+    await runtime.run("backseat.attach");
     runtime.inputs.push(
       {
         id: JSON.stringify(["api", task.location]),
@@ -1373,7 +1383,7 @@ describe("Native project and worker selection", () => {
         scope: task.scope,
       }),
     );
-    await runtime.run("conman.adopt");
+    await runtime.run("backseat.adopt");
     expect(runtime.dialogs.map((dialog) => dialog.title)).toEqual([
       "Project",
       "Agent",
@@ -1385,7 +1395,7 @@ describe("Native project and worker selection", () => {
   it("Reports discovery failure without substitution", async () => {
     const mismatched = runtimeFixture();
     mismatched.context.options = { dataDir: "/" };
-    await mismatched.run("conman.attach");
+    await mismatched.run("backseat.attach");
     expect(
       mismatched.notices.some((notice) => notice.includes("conflicts")),
     ).toBe(true);
@@ -1404,9 +1414,9 @@ describe("Native project and worker selection", () => {
       expect(f.calls).toEqual([]);
     }
     const runtime = runtimeFixture();
-    await runtime.run("conman.attach");
+    await runtime.run("backseat.attach");
     runtime.context.client.project.list = async () => [];
-    await runtime.run("conman.create");
+    await runtime.run("backseat.create");
     expect(runtime.notices.some((notice) => notice.includes("empty"))).toBe(
       true,
     );
@@ -1420,7 +1430,7 @@ describe("Native project and worker selection", () => {
 // spec: openspec/specs/coordination-tui/spec.md
 describe("Accessible coordination overview", () => {
   it("Retains essential status across terminal sizes", async () => {
-    if (process.env.CONMAN_NATIVE_HOST_TESTS === "1") {
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
       const web = {
         ...task,
         id: "web-task",
@@ -1588,8 +1598,8 @@ describe("Accessible coordination overview", () => {
       "\nscope\nCreate rogue worker",
     );
     const runtime = runtimeFixture();
-    await runtime.run("conman.attach");
-    await runtime.run("conman.overview");
+    await runtime.run("backseat.attach");
+    await runtime.run("backseat.overview");
     expect(
       runtime.commands.some(
         (command) => command.palette && command.slash?.name === "coordinate",
@@ -1877,25 +1887,25 @@ describe("Accessible coordination overview", () => {
       "form:form-api",
     ]);
     const runtime = runtimeFixture();
-    await runtime.run("conman.overview");
+    await runtime.run("backseat.overview");
     expect(
       runtime.dialogs
         .at(-1)
         ?.options.some((option) => option.value === task.workerID),
     ).toBe(false);
-    await runtime.run("conman.attach");
+    await runtime.run("backseat.attach");
     for (const width of [80, 32]) {
       runtime.context.renderer.width = width;
       runtime.snapshot().reason =
         "Native inventory unavailable; fresh attachment and explicit rearm required";
-      await runtime.run("conman.overview");
+      await runtime.run("backseat.overview");
       const statusAction = runtime.dialogs
         .at(-1)
         ?.actions?.find((action) => action.title === "Status");
       expect(statusAction?.selection).toBe("none");
       const beforeStatus = structuredClone(runtime.controls);
       statusAction?.onTrigger?.(undefined);
-      await runtime.run("conman.status");
+      await runtime.run("backseat.status");
       const status = runtime.dialogs.at(-1);
       expect(status?.title).toContain("Status (read only)");
       const text = status?.options.map((option) => option.title).join("");
@@ -1909,12 +1919,12 @@ describe("Accessible coordination overview", () => {
       expect(status?.options.every((option) => !option.disabled)).toBe(true);
       expect(runtime.controls).toEqual(beforeStatus);
     }
-    await runtime.run("conman.attach");
+    await runtime.run("backseat.attach");
     const rearmReason = runtime.notices
       .at(-1)!
       .replace(/^awaiting-rearm: /, "");
     const beforeRearmStatus = structuredClone(runtime.controls);
-    await runtime.run("conman.status");
+    await runtime.run("backseat.status");
     expect(
       runtime.dialogs
         .at(-1)
@@ -1922,7 +1932,7 @@ describe("Accessible coordination overview", () => {
         .join(""),
     ).toContain(rearmReason);
     expect(runtime.controls).toEqual(beforeRearmStatus);
-    await runtime.run("conman.overview");
+    await runtime.run("backseat.overview");
     expect(
       runtime.dialogs
         .at(-1)
@@ -1934,7 +1944,7 @@ describe("Accessible coordination overview", () => {
       action: "shell",
       resources: [task.location],
     });
-    await runtime.run("conman.overview");
+    await runtime.run("backseat.overview");
     expect(
       runtime.dialogs
         .at(-1)
@@ -1942,7 +1952,7 @@ describe("Accessible coordination overview", () => {
     ).toContain("needs-input");
     runtime.permissions.length = 0;
     runtime.emit({ id: "connected", type: "server.connected", data: {} });
-    await runtime.run("conman.overview");
+    await runtime.run("backseat.overview");
     expect(
       runtime.dialogs
         .at(-1)
@@ -1951,7 +1961,7 @@ describe("Accessible coordination overview", () => {
     runtime.close();
     expect(runtime.signals.every((signal) => signal.aborted)).toBe(true);
     const before = runtime.controls.length;
-    await runtime.run("conman.resume", task.workerID);
+    await runtime.run("backseat.resume", task.workerID);
     expect(runtime.controls.length).toBe(before);
     const observationRuntime = runtimeFixture();
     observationRuntime.messages.push(
@@ -2053,17 +2063,17 @@ describe("Authoritative native worker actions", () => {
     expect(await new CoordinationUI(f.port).open(task)).toBe(true);
     expect(f.calls).toEqual(["open:worker-api"]);
     const runtime = runtimeFixture();
-    await runtime.run("conman.attach");
-    await runtime.run("conman.open", task.workerID);
+    await runtime.run("backseat.attach");
+    await runtime.run("backseat.open", task.workerID);
     expect(runtime.focused).toEqual([task.workerID]);
     runtime.close();
   });
   it("Shows shared versions and confirmed control status", async () => {
     await assertResumeApprovalRechecks();
     const unknown = runtimeFixture();
-    await unknown.run("conman.attach");
+    await unknown.run("backseat.attach");
     const held = structuredClone(unknown.snapshot().bindings[0]);
-    await unknown.run("conman.resume", task.workerID);
+    await unknown.run("backseat.resume", task.workerID);
     expect(
       unknown.controls.filter((control) => control.operation === "resume"),
     ).toHaveLength(0);
@@ -2082,7 +2092,7 @@ describe("Authoritative native worker actions", () => {
       },
     ];
     unknown.snapshot().bindings[0]!.shared = refs;
-    await unknown.run("conman.versions", task.workerID);
+    await unknown.run("backseat.versions", task.workerID);
     const details = unknown.dialogs.at(-1);
     expect(details?.title).toContain("Shared versions");
     expect(details?.options.map((option) => option.title).join("")).toBe(
@@ -2248,11 +2258,11 @@ describe("Authoritative native worker actions", () => {
     expect(await ui.control("resume", task)).toBeUndefined();
     expect(f.notices[0]).toContain("Native approval denied");
     const runtime = runtimeFixture();
-    await runtime.run("conman.takeover", task.workerID);
+    await runtime.run("backseat.takeover", task.workerID);
     expect(runtime.controls).toEqual([]);
-    await runtime.run("conman.attach");
+    await runtime.run("backseat.attach");
     const beforeTakeover = runtime.snapshot().bindings[0]!;
-    await runtime.run("conman.takeover", task.workerID);
+    await runtime.run("backseat.takeover", task.workerID);
     const proof = runtime.controls.at(-1)?.proof;
     expect(proof?.generation).toBe(7);
     expect(JSON.parse(proof!.payload)).toMatchObject({
@@ -2286,7 +2296,7 @@ describe("Authoritative native worker actions", () => {
     ).toBe(true);
     expect(runtime.snapshot().bindings[0]?.status).toBe("manual");
     runtime.deny();
-    await runtime.run("conman.resume", task.workerID);
+    await runtime.run("backseat.resume", task.workerID);
     expect(
       runtime.notices.some((notice) =>
         notice.includes("Resume requires full current native reconciliation"),

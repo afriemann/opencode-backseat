@@ -27,7 +27,7 @@ export const COORDINATION_TOOLS = [
 export const COORDINATOR_TOOL_IDS = new Set([
   "execute",
   "question",
-  ...COORDINATION_TOOLS.map((name) => `conman_${name}`),
+  ...COORDINATION_TOOLS.map((name) => `backseat_${name}`),
 ]);
 export interface CoordinationToolPort {
   native: NativeConnection;
@@ -720,7 +720,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       description: specs[name].description,
       input: specs[name].input,
       output: outputSchemas[name],
-      options: { namespace: "conman", codemode: true },
+      options: { namespace: "backseat", codemode: true },
       async execute(input: unknown, context) {
         alive(context);
         await port.authorize(context);

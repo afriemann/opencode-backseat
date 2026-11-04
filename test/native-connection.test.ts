@@ -1,5 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { ConmanRpc } from "../src/rpc.ts";
+import { BackseatRpc } from "../src/rpc.ts";
 import {
   createNativeConnection,
   readNativeRegistration,
@@ -153,13 +153,13 @@ describe("Automatic same-service native connection", () => {
       expect(accepted).toBe(false);
     }
     expect(
-      ConmanRpc.methods.identity.input["~standard"].validate({
+      BackseatRpc.methods.identity.input["~standard"].validate({
         nonce: "bad",
         origin: "http://127.0.0.1",
       }),
     ).toHaveProperty("issues");
     expect(
-      ConmanRpc.methods.identity.output["~standard"].validate({ mac: "bad" }),
+      BackseatRpc.methods.identity.output["~standard"].validate({ mac: "bad" }),
     ).toHaveProperty("issues");
     const changed = fixture();
     try {

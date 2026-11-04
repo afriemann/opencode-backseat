@@ -127,7 +127,7 @@ export function resolveDataDirectory(
     environment.XDG_DATA_HOME && isAbsolute(environment.XDG_DATA_HOME)
       ? environment.XDG_DATA_HOME
       : join(environment.home, ".local", "share");
-  return join(base, "opencode-conman");
+  return join(base, "opencode-backseat");
 }
 
 export interface AnchoredDirectory {

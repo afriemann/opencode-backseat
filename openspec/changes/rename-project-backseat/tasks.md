@@ -1,0 +1,6 @@
+- [x] Update existing assertions for "Registers the coordinator in every enabled project", "Preserves native approval for conversational control" and "Shares an XDG-backed store across projects" before implementation.
+- [x] Apply design's coupled identity substitutions across runtime modules and route embedded role substitutions through the instruction owner.
+- [x] Update existing native fixtures and command expectations for "Starts through the dedicated native agent" and "Keeps native supervision explicit".
+- [x] Resolve the installed native test executable in both fixture launchers.
+- [x] Apply package, lockfile, example, README, Makefile and ignore-rule substitutions from the approved inventory.
+- [x] Preserve the remaining modified scenarios through their existing name-matched regression tests, including "Uses the coordinator-project native default" and "Holds unavailable default-model evaluation".

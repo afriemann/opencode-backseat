@@ -18,7 +18,7 @@ import {
   type WorkerSnapshot,
 } from "./state.ts";
 import {
-  ConmanRpc,
+  BackseatRpc,
   reasoningPayload,
   type CoordinatorSnapshot,
   type ControlOperation,
@@ -76,8 +76,8 @@ export type NativeRuntimeClient = NativeCatalogClient &
     };
     event: Pick<NativeClient["event"], "subscribe">;
     rpc(
-      definition: typeof ConmanRpc,
-    ): Omit<RpcClient<typeof ConmanRpc>, "identity">;
+      definition: typeof BackseatRpc,
+    ): Omit<RpcClient<typeof BackseatRpc>, "identity">;
   };
 export interface NativeRuntimeContext {
   location: Plugin.Context["location"];
@@ -400,7 +400,7 @@ export async function readNativeObservation(
 export function setupNativeTui(context: NativeRuntimeContext): () => void {
   const capability = createObserverCapability(); // private key retained only by this closure
   const abort = new AbortController();
-  const rpc = context.client.rpc(ConmanRpc);
+  const rpc = context.client.rpc(BackseatRpc);
   const discovery = new NativeDiscovery(context.client, abort.signal);
   let dataDir: string | undefined;
   let snapshot: CoordinatorSnapshot | undefined;
@@ -1219,7 +1219,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       next.bindings.some((task) => task.workerID === route.sessionID)
     )
       throw new Error(
-        "Open a Conman Coordinator session in this project, not a worker",
+        "Open a Backseat Coordinator session in this project, not a worker",
       );
     const session = await context.client.session.get(
       { sessionID: route.sessionID },
@@ -1240,7 +1240,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       session.time.archived
     )
       throw new Error(
-        "Select Conman Coordinator in this project; the dedicated role is unavailable or this session is ineligible",
+        "Select Backseat Coordinator in this project; the dedicated role is unavailable or this session is ineligible",
       );
     return session.id;
   };
@@ -1388,7 +1388,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
                 title: isCurrent(next)
                   ? "No workers available"
                   : "Attach to view workers",
-                value: "conman:status",
+                value: "backseat:status",
                 disabled: false,
                 description: "Inspect status without creating workers",
               }
@@ -1402,7 +1402,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       ],
       actions,
     });
-    if (selected === "conman:status") await showStatus();
+    if (selected === "backseat:status") await showStatus();
     else if (selected) {
       const task = next.bindings.find((task) => task.workerID === selected);
       if (task) await ui.open(task);
@@ -1420,7 +1420,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
     mode: "global",
     commands: [
       {
-        id: "conman.overview",
+        id: "backseat.overview",
         title: "Coordinate / search",
         group: "Coordination",
         palette: true,
@@ -1428,7 +1428,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         run: () => enqueue(showOverview),
       },
       {
-        id: "conman.status",
+        id: "backseat.status",
         title: "Coordinate: inspect status and identities (read only)",
         group: "Coordination",
         palette: true,
@@ -1436,7 +1436,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         run: () => enqueue(showStatus),
       },
       {
-        id: "conman.versions",
+        id: "backseat.versions",
         title: "Coordinate: inspect full shared versions (read only)",
         group: "Coordination",
         palette: true,
@@ -1444,7 +1444,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         run: (workerID?: string) => enqueue(() => showVersions(workerID)),
       },
       {
-        id: "conman.attach",
+        id: "backseat.attach",
         title: "Coordinate: attach observer (native approval)",
         group: "Coordination",
         palette: true,
@@ -1452,7 +1452,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         run: () => enqueue(attach),
       },
       {
-        id: "conman.rearm",
+        id: "backseat.rearm",
         title: "Coordinate: explicitly rearm reconciled observer",
         group: "Coordination",
         palette: true,
@@ -1460,7 +1460,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         run: () => enqueue(rearm),
       },
       {
-        id: "conman.create",
+        id: "backseat.create",
         title: "Coordinate: create worker",
         group: "Coordination",
         palette: true,
@@ -1468,7 +1468,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         run: () => enqueue(() => selectTarget("create")),
       },
       {
-        id: "conman.adopt",
+        id: "backseat.adopt",
         title: "Coordinate: adopt worker",
         group: "Coordination",
         palette: true,
@@ -1477,7 +1477,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
       },
       ...(["open", "hold", "resume", "takeover", "share"] as const).map(
         (action) => ({
-          id: `conman.${action}`,
+          id: `backseat.${action}`,
           title: `Coordinate: ${action} worker`,
           group: "Coordination",
           palette: true as const,
@@ -1488,7 +1488,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
         }),
       ),
       {
-        id: "conman.detach",
+        id: "backseat.detach",
         title: "Coordinate: detach observer",
         group: "Coordination",
         palette: true,
@@ -1502,7 +1502,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
           }),
       },
       {
-        id: "conman.recover",
+        id: "backseat.recover",
         title: "Coordinate: recover held coordinator (native approval)",
         group: "Coordination",
         palette: true,
@@ -1626,7 +1626,7 @@ export function setupNativeTui(context: NativeRuntimeContext): () => void {
 }
 
 export default Plugin.define({
-  id: "conman",
+  id: "backseat",
   setup(context) {
     const restore = applyNativeNoColor(context.renderer);
     try {

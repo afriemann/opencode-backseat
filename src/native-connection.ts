@@ -4,7 +4,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { ConmanRpc } from "./rpc.ts";
+import { BackseatRpc } from "./rpc.ts";
 
 const REGISTRATION_BYTES = 16_384;
 const REQUEST_TIMEOUT = 10_000;
@@ -168,7 +168,7 @@ export function createNativeConnection(options: {
       mac: createHmac("sha256", secret)
         .update(
           JSON.stringify([
-            "conman-native-instance",
+            "backseat-native-instance",
             nonce,
             origin,
             options.location,
@@ -236,7 +236,7 @@ export function createNativeConnection(options: {
           nonce: randomBytes(32).toString("hex"),
           origin: registered.origin,
         };
-        const proof = await client.rpc(ConmanRpc).identity(challenge, {
+        const proof = await client.rpc(BackseatRpc).identity(challenge, {
           location: { directory: options.location },
           signal,
         });

@@ -73,7 +73,7 @@ import {
   type WorkerBinding,
 } from "./state.ts";
 import {
-  ConmanRpc,
+  BackseatRpc,
   reasoningPayload,
   CONTROL_OPERATIONS,
   type AttachInput,
@@ -543,7 +543,7 @@ export async function createNativeBackend(
         (identity.sessionID !== session.id || identity.agent !== session.agent))
     )
       throw new Error(
-        "Select Conman Coordinator in an enabled project; this session is ineligible",
+        "Select Backseat Coordinator in an enabled project; this session is ineligible",
       );
     const agents = await host.agent.list({ location: { directory } });
     alive();
@@ -553,7 +553,7 @@ export async function createNativeBackend(
         (agent) => agent.id === session.agent && isCoordinatorAgent(agent),
       )
     )
-      throw new Error("Conman Coordinator is unavailable in this project");
+      throw new Error("Backseat Coordinator is unavailable in this project");
     alive();
     if (identity?.signal?.aborted) throw new Error("Native operation aborted");
     const current = await host.session.get({ sessionID: coordinatorID });
@@ -586,7 +586,7 @@ export async function createNativeBackend(
       host.permission.assert({
         sessionID: session.id,
         agent: session.agent,
-        action: `conman.${operation}`,
+        action: `backseat.${operation}`,
         resources: [
           JSON.stringify([
             dataDir,
@@ -2700,7 +2700,7 @@ export async function createWorkerObserver(
             if (!host.plugin)
               throw new Error("Observer plugin inventory unavailable");
             const inventory = await host.plugin.list();
-            const own = inventory.data.filter((p) => p.id === "conman");
+            const own = inventory.data.filter((p) => p.id === "backseat");
             if (
               inventory.data.length > 200 ||
               (await host.canonical(inventory.location.directory)) !==
@@ -2770,7 +2770,7 @@ const log = (
 ) => {
   try {
     process.stderr.write(
-      JSON.stringify({ service: "conman", level, message, ...extra }) + "\n",
+      JSON.stringify({ service: "backseat", level, message, ...extra }) + "\n",
     );
   } catch {
     /* Diagnostic channel must not throw. */
@@ -2926,7 +2926,7 @@ async function createNativeCore(
         ctx.permission.assert({
           sessionID: session.id,
           ...(session.agent ? { agent: session.agent } : {}),
-          action: "conman.recover",
+          action: "backseat.recover",
           resources: [
             JSON.stringify([
               dataDir,
@@ -3058,7 +3058,7 @@ async function createNativeCore(
 }
 
 export default Plugin.define({
-  id: "conman",
+  id: "backseat",
   async setup(ctx) {
     if (
       !/^2\./.test(ctx.app.version) ||
@@ -3328,7 +3328,7 @@ export default Plugin.define({
       };
       const requestSignal = (signal: AbortSignal) =>
         AbortSignal.any([adapter.abort.signal, signal]);
-      const rpc = await ctx.rpc.register(ConmanRpc, {
+      const rpc = await ctx.rpc.register(BackseatRpc, {
         identity: async (input) => serve(async () => native.identity(input)),
         bootstrap: async () => serve(async () => backend.bootstrap()),
         inspect: async (input) => serve(() => backend.read(input.proof)),
@@ -3390,7 +3390,9 @@ export default Plugin.define({
               matchesExecutionRole(context.sessionID, context.agent),
             ))
           )
-            throw new Error("Select Conman Coordinator for coordination tools");
+            throw new Error(
+              "Select Backseat Coordinator for coordination tools",
+            );
         },
       });
       cleanupSteps.push(async () => {
@@ -3398,7 +3400,7 @@ export default Plugin.define({
       });
       const tools = await ctx.tool.transform((editor) => {
         editor.namespace({
-          name: "conman",
+          name: "backseat",
           description:
             "Native session discovery and explicit task coordination",
         });

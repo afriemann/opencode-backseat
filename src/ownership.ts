@@ -471,7 +471,7 @@ type CoreRegistry = {
     closing: boolean;
   };
 };
-const coordinatorCoreKey = Symbol.for("opencode.conman.coordinator-core");
+const coordinatorCoreKey = Symbol.for("opencode.backseat.coordinator-core");
 
 export async function acquireCoordinatorCore<
   T extends { dispose(): Promise<void> },
@@ -589,7 +589,7 @@ export function forceNativeAsk(event: {
   action: string;
   effect: "allow" | "ask" | "deny";
 }): void {
-  if (event.action.startsWith("conman.") && event.effect !== "deny")
+  if (event.action.startsWith("backseat.") && event.effect !== "deny")
     event.effect = "ask";
 }
 
