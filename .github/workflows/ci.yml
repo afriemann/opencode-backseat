@@ -52,6 +52,9 @@ jobs:
       - name: Check prerequisites
         run: make prerequisites
 
+      - name: Prepare unit-test fixture directory
+        run: mkdir -p /tmp/opencode
+
       - name: Run unit tests with coverage
         run: make coverage
 
