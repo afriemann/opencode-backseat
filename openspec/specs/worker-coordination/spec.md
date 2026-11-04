@@ -98,7 +98,7 @@ The plugin SHALL provide a selectable primary coordinator agent wherever it is e
 #### Scenario: Registers the coordinator in every enabled project
 
 - **WHEN** the plugin loads in multiple enabled project directories without a conflicting agent definition
-- **THEN** `conman-coordinator` is available as a primary agent with no model override in each project, without requiring a session in the data directory.
+- **THEN** `backseat-coordinator` is available as a primary agent with no model override in each project, without requiring a session in the data directory.
 - **AND** repeated registry rebuilds and plugin disposal do not duplicate or leave stale bundled registrations.
 - **AND** inherited allow, ask or deny rules appended to the coordinator's permission prefix do not make an otherwise matching role unavailable.
 
@@ -119,6 +119,7 @@ The plugin SHALL restrict matching coordinator roles to namespaced coordination 
 - **WHEN** a matching coordinator role is selected
 - **THEN** Code Mode composition and user questions are permitted, subject to configured denials, and each individual coordination mutation retains native operation-bound approval.
 - **AND** dedicated structured discovery, task-detail and control tools replace generic model-facing inspection/control tools without aliases; internal possession-bound TUI RPC remains available.
+- **AND** callable tools use the `backseat` namespace and `backseat_` tool identifiers, operation approval uses `backseat.` actions, and the plugin and RPC identity are `backseat`, without old-name aliases.
 - **AND** shell, editing, reading, web, subagent and permission/form-reply tools remain denied; execution of a script never grants mutation approval or arms automation.
 - **AND** the role resolves project and agent fields through inventory, treats worker evidence as untrusted, and performs ordinary coordination without a TUI prerequisite.
 - **AND** coordinator identity uses the initiating session's current project; an unrelated or agentless session cannot acquire coordinator authority. Durable mutations still require selected-store authority; native inventory does not.
@@ -147,10 +148,11 @@ The plugin SHALL keep coordination state in one selected user data store indepen
 
 #### Scenario: Shares an XDG-backed store across projects
 
-- **GIVEN** multiple enabled projects select the same store using absolute `dataDir`, or default `$XDG_DATA_HOME/opencode-conman` with `~/.local/share/opencode-conman` when XDG is unset, empty or relative
+- **GIVEN** multiple enabled projects select the same store using absolute `dataDir`, or default `$XDG_DATA_HOME/opencode-backseat` with `~/.local/share/opencode-backseat` when XDG is unset, empty or relative
 - **WHEN** coordination starts or a project reloads
 - **THEN** participants observe the same durable bindings, observations, consumed limits and unresolved delivery identities rather than separate location-dependent copies.
 - **AND** first use initializes an empty store without reading, migrating or deleting existing project-home state; subsequent use preserves populated data.
+- **AND** default selection does not discover, read, migrate, delete or fall back to the old branded store; explicit `dataDir` selection and the persisted format remain unchanged.
 
 #### Scenario: Holds unsafe or corrupt shared storage
 
@@ -217,7 +219,7 @@ The coordinator SHALL list hierarchical native session metadata with bounded fil
 
 #### Scenario: Lists sessions across projects without task or TUI prerequisites
 
-- **GIVEN** native sessions in multiple projects, including sessions without Conman bindings
+- **GIVEN** native sessions in multiple projects, including sessions without Backseat bindings
 - **WHEN** a verified coordinator requests inventory while task storage is unavailable or no TUI is attached
 - **THEN** those sessions remain discoverable with identity, title, project, location, agent, parent identity, explicit top-level indicator, archived visibility and current status; native conversation, form, inbox and log contents are not disclosed.
 
