@@ -118,6 +118,16 @@ const rowSchema = {
   properties: {
     id: stringSchema,
     title: stringSchema,
+    createdAt: {
+      type: "number",
+      description:
+        "Session creation time from native time.created, in Unix milliseconds.",
+    },
+    updatedAt: {
+      type: "number",
+      description:
+        "Last session update from native time.updated, in Unix milliseconds; includes metadata changes, not just conversation activity.",
+    },
     projectID: stringSchema,
     location: stringSchema,
     agent: stringSchema,
@@ -129,6 +139,8 @@ const rowSchema = {
   required: [
     "id",
     "title",
+    "createdAt",
+    "updatedAt",
     "projectID",
     "location",
     "parentID",

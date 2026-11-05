@@ -177,6 +177,71 @@ function fixture() {
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Fine-grained Code Mode queries", () => {
+  it("Returns native session timestamps", async () => {
+    const f = fixture();
+    f.rows.splice(2);
+    f.rows[0]!.time = {
+      created: 1_700_000_000_123,
+      updated: 1_700_000_100_456,
+    };
+    f.rows[1]!.time = {
+      created: 1_700_001_000_789,
+      updated: 1_700_001_100_012,
+    };
+    const get = f.client.session.get;
+    f.client.session.get = async (input) => {
+      const row = await get(input);
+      return {
+        ...row,
+        time: { ...row.time, updated: row.time.updated + 1_000 },
+      };
+    };
+    const first = await f.call("list_sessions", { limit: 1 });
+    const cursor = first.cursor;
+    expect(first).toMatchObject({
+      sessions: [
+        {
+          id: "running",
+          createdAt: 1_700_000_000_123,
+          updatedAt: 1_700_000_101_456,
+        },
+      ],
+      cursor: expect.any(String),
+    });
+    f.rows[1]!.time.updated += 2_000;
+    expect(await f.call("list_sessions", { limit: 1, cursor })).toMatchObject({
+      sessions: [
+        {
+          id: "waiting",
+          createdAt: 1_700_001_000_789,
+          updatedAt: 1_700_001_103_012,
+        },
+      ],
+    });
+  });
+
+  it("Preserves timestamps when status refresh is unavailable", async () => {
+    const f = fixture();
+    f.rows[3]!.time = {
+      created: 1_700_002_000_345,
+      updated: 1_700_002_100_678,
+    };
+    expect(
+      await f.call("list_sessions", { statuses: ["unknown"] }),
+    ).toMatchObject({
+      sessions: [
+        {
+          id: "unknown",
+          createdAt: 1_700_002_000_345,
+          updatedAt: 1_700_002_100_678,
+          status: "unknown",
+        },
+      ],
+      partial: true,
+      unknownCount: 1,
+    });
+  });
+
   it("Filters hierarchical sessions with multiple statuses", async () => {
     const f = fixture();
     expect(await f.call("list_sessions")).toMatchObject({

@@ -1,0 +1,2 @@
+- [x] 1.1 Implement and document “Returns native session timestamps” using design.md's shared mapping decision, with its failing test first.
+- [x] 1.2 Implement “Preserves timestamps when status refresh is unavailable” using design.md's fallback decision, with its failing test first.
