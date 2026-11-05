@@ -57,15 +57,44 @@ const stringsSchema = {
 } as const;
 const taskSchema = inputSchema(
   {
-    id: stringSchema,
-    title: stringSchema,
-    goal: stringSchema,
-    criteria: stringsSchema,
-    constraints: { type: "array", items: stringSchema },
-    scope: stringsSchema,
-    location: stringSchema,
-    agent: stringSchema,
-    group: stringSchema,
+    id: {
+      ...stringSchema,
+      description: "New task ID, not a native session ID.",
+    },
+    title: { ...stringSchema, description: "Short task title." },
+    goal: {
+      ...stringSchema,
+      description: "User-confirmed goal for this worker.",
+    },
+    criteria: {
+      ...stringsSchema,
+      description: "Nonempty list of confirmed success criteria.",
+    },
+    constraints: {
+      type: "array",
+      items: stringSchema,
+      description: "Confirmed constraints; pass [] when there are none.",
+    },
+    scope: {
+      ...stringsSchema,
+      description:
+        "Nonempty list of approved scope entries; dispatch scope must copy entries from this list.",
+    },
+    location: {
+      ...stringSchema,
+      description:
+        "Absolute canonical worker project location selected from list_projects, not the coordination data directory.",
+    },
+    agent: {
+      ...stringSchema,
+      description:
+        "Exact eligible worker agent ID returned by list_agents at this location; adoption must match the session's agent.",
+    },
+    group: {
+      ...stringSchema,
+      description:
+        "Optional. Required to publish or receive shared snapshots; set the same nonempty group when creating or adopting every participating task.",
+    },
   },
   [
     "id",
@@ -508,29 +537,73 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   > = {
     list_sessions: {
       description:
-        "List native session metadata and hierarchy across projects. Combine statuses (running, waiting, inactive, unknown); default excludes unknown. Filter projectID, canonical location, taskIDs, agent, native service search, parentID (null means roots), archive inclusion and order. limit is 1..200 returned rows; each call scans at most 200 native rows. Continue with the short cursor and identical filters even after an empty partial page. Unknown counts and partial results are not completion. Task filters require the owned task store.",
+        'List native session metadata and hierarchy across projects, including unbound sessions, without TUI attachment. Statuses are OR-ed; different filters are AND-ed. Defaults: running/waiting/inactive, all hierarchy levels, no archived sessions, limit 50, order desc. Each call scans at most 200 native rows. Continue with the returned cursor and unchanged filters, limit and order, even after an empty page. partial or unknownCount is not proof of no matches, idle status or completion. Only taskIDs requires owned task storage. Example: {statuses:["running","waiting"],parentID:null,limit:20}.',
       input: inputSchema({
         statuses: {
           type: "array",
           items: { enum: SESSION_STATUSES },
           minItems: 1,
+          description:
+            "Alternative native statuses. Default excludes unknown. waiting means pending human input, not ordinary inactivity.",
         },
-        projectID: stringSchema,
-        location: stringSchema,
-        taskIDs: stringsSchema,
-        agent: stringSchema,
-        search: stringSchema,
-        parentID: { anyOf: [stringSchema, { type: "null" }] },
-        includeArchived: { type: "boolean" },
-        limit: { type: "integer", minimum: 1, maximum: 200 },
-        cursor: stringSchema,
-        order: { enum: ["asc", "desc"] },
+        projectID: {
+          ...stringSchema,
+          description:
+            "Exact native project ID returned by list_projects; omit to search across projects.",
+        },
+        location: {
+          ...stringSchema,
+          description:
+            "Exact absolute canonical project or sandbox location returned by list_projects; relative paths and aliases are rejected.",
+        },
+        taskIDs: {
+          ...stringsSchema,
+          description:
+            "Alternative Backseat task IDs, not session IDs; selects their bound workers and requires owned task storage.",
+        },
+        agent: {
+          ...stringSchema,
+          description:
+            "Exact native worker agent ID; not a display title or substring.",
+        },
+        search: {
+          ...stringSchema,
+          description:
+            "Search passed to the native service; matching semantics belong to that service, not a local title filter.",
+        },
+        parentID: {
+          anyOf: [stringSchema, { type: "null" }],
+          description:
+            "Omit for all levels, pass null for roots, or a native session ID for its direct children, not all descendants.",
+        },
+        includeArchived: {
+          type: "boolean",
+          description:
+            "Default false. To inspect archived sessions, also include unknown in statuses because their live status is unavailable.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 200,
+          description:
+            "Maximum returned rows, default 50. Keep unchanged while continuing a cursor; scanning may yield fewer rows.",
+        },
+        cursor: {
+          ...stringSchema,
+          description:
+            "Opaque cursor from the preceding response. Keep every other argument unchanged. Caller/query/instance-bound; expires after five minutes and may be evicted. Restart without it after expiry, reload or query change.",
+        },
+        order: {
+          enum: ["asc", "desc"],
+          description:
+            "Native service ordering, default desc; keep unchanged while continuing a cursor.",
+        },
       }),
       run: sessions,
     },
     list_projects: {
       description:
-        "List native project locations without requiring task-store or TUI authority.",
+        "List native project IDs, titles and canonical or sandbox locations for selecting worker targets. Takes {} and needs neither task-store authority nor TUI attachment. More than 200 choices reports unavailable, not a complete truncated catalog.",
       input: inputSchema({}),
       async run(v, context) {
         exact(v, []);
@@ -543,8 +616,17 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     list_agents: {
       description:
-        "List eligible non-coordinator worker agents at a canonical location.",
-      input: inputSchema({ location: stringSchema }, ["location"]),
+        "List eligible non-coordinator worker agent IDs at the selected canonical location; use these exact IDs for task.agent. No task-store authority or TUI attachment required. More than 200 choices reports unavailable, not a complete truncated catalog.",
+      input: inputSchema(
+        {
+          location: {
+            ...stringSchema,
+            description:
+              "Absolute canonical project or sandbox location returned by list_projects.",
+          },
+        },
+        ["location"],
+      ),
       async run(v, context) {
         exact(v, ["location"]);
         const location = await canonical(v.location);
@@ -558,30 +640,56 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     list_tasks: {
       description:
-        "List protected task bindings filtered by task statuses, location, group, workerID, taskIDs or title/goal search. Requires owned task storage.",
+        'List protected durable task bindings, not all native sessions. Statuses are OR-ed; different filters are AND-ed. Omitted statuses includes active, held, manual and complete. Returns all matching bindings in one tasks array with no limit or cursor. Requires owned task storage. Example: {statuses:["held","manual"],search:"release"}.',
       input: inputSchema({
         statuses: {
           type: "array",
           items: { enum: TASK_STATUSES },
           minItems: 1,
+          description:
+            "Alternative task statuses; defaults to all four including complete. These are not native session statuses.",
         },
-        location: stringSchema,
-        group: stringSchema,
-        workerID: stringSchema,
-        taskIDs: stringsSchema,
-        search: stringSchema,
+        location: {
+          ...stringSchema,
+          description:
+            "Exact stored task location, without canonicalisation; copy from a binding or list_projects.",
+        },
+        group: { ...stringSchema, description: "Exact stored task group." },
+        workerID: {
+          ...stringSchema,
+          description:
+            "Exact native session ID bound to a task; not a task ID or agent ID.",
+        },
+        taskIDs: {
+          ...stringsSchema,
+          description: "Alternative Backseat task IDs, not native session IDs.",
+        },
+        search: {
+          ...stringSchema,
+          description:
+            "Case-insensitive substring search across task ID, title and goal.",
+        },
       }),
       run: tasks,
     },
     get_task: {
       description:
         "Read one protected task, delivery identities, completion records, shared context and retained deletion outcomes with current native presence evidence. Observed absence never converts uncertain deletion into success or proves non-delivery.",
-      input: inputSchema({ taskID: stringSchema }, ["taskID"]),
+      input: inputSchema(
+        {
+          taskID: {
+            ...stringSchema,
+            description:
+              "Exact Backseat task ID returned by list_tasks, not its worker's native session ID. Requires owned task storage.",
+          },
+        },
+        ["taskID"],
+      ),
       run: (v, context) => tasks(v, context, true),
     },
     create_session: {
       description:
-        "Create a native worker and deliver its confirmed task immediately. Requires operation-specific native approval.",
+        "Create a native worker at task.location using task.agent and deliver the user-confirmed task immediately. Resolve location and agent through list_projects/list_agents first. Requires operation-specific native approval; does not arm automatic follow-ups. Inspect the resulting binding with get_task.",
       input: inputSchema({ task: taskSchema }, ["task"]),
       async run(v, context) {
         exact(v, ["task"]);
@@ -596,11 +704,18 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     adopt_session: {
       description:
-        "Bind a selected top-level session to an approved task without prompting or changing its agent. Child sessions are rejected before and after native approval.",
-      input: inputSchema({ task: taskSchema, sessionID: stringSchema }, [
-        "task",
-        "sessionID",
-      ]),
+        "Bind a selected top-level native session to a user-approved task without sending a worker prompt, interrupting execution or changing its agent. task.location and task.agent must match the selected session. Requires native approval; rejects child sessions and competing ownership. Inspect the resulting binding with get_task.",
+      input: inputSchema(
+        {
+          task: taskSchema,
+          sessionID: {
+            ...stringSchema,
+            description:
+              "Exact native session ID from list_sessions with topLevel true; not a task ID.",
+          },
+        },
+        ["task", "sessionID"],
+      ),
       async run(v, context) {
         exact(v, ["task", "sessionID"]);
         const task = object(v.task);
@@ -614,8 +729,17 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     take_over_task: {
       description:
-        "Take manual control of a bound top-level worker and fence automatic follow-ups without sending a prompt.",
-      input: inputSchema({ taskID: stringSchema }, ["taskID"]),
+        "Take manual control of a bound top-level worker and fence automatic follow-ups without sending a prompt. Read get_task first; requires operation-specific native approval. For an unbound session use adopt_session instead.",
+      input: inputSchema(
+        {
+          taskID: {
+            ...stringSchema,
+            description:
+              "Existing Backseat task ID from list_tasks/get_task, not a native session ID.",
+          },
+        },
+        ["taskID"],
+      ),
       async run(v, context) {
         exact(v, ["taskID"]);
         return port.backend.nativeControl(
@@ -628,9 +752,25 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     dispatch_task: {
       description:
-        "Send explicitly requested text to a held/manual task. scope must be a nonempty declared subset of approved scope. Native approval binds the exact payload. Never answers pending asks or silently retries uncertain delivery.",
+        "Send explicitly requested text to a held/manual task after reading get_task and checking its worker's native status. Stop for waiting human input. scope must be a nonempty declared subset of approved scope; the backend checks entries, not the meaning of text. Native approval binds the exact payload. Never answers pending asks, arms automation or silently retries uncertain delivery. Re-read get_task to inspect delivery records.",
       input: inputSchema(
-        { taskID: stringSchema, text: stringSchema, scope: stringsSchema },
+        {
+          taskID: {
+            ...stringSchema,
+            description:
+              "Existing held or manual Backseat task ID, not a native session ID.",
+          },
+          text: {
+            ...stringSchema,
+            description:
+              "Exact user-requested assignment, within confirmed scope; never a permission or form answer.",
+          },
+          scope: {
+            ...stringsSchema,
+            description:
+              "Nonempty list of exact entries copied from the current binding's approved scope; no new entries.",
+          },
+        },
         ["taskID", "text", "scope"],
       ),
       async run(v, context) {
@@ -645,8 +785,17 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     hold_task: {
       description:
-        "Hold a task and invalidate automatic decisions while preserving all counters and delivery records.",
-      input: inputSchema({ taskID: stringSchema }, ["taskID"]),
+        "Hold a task and invalidate automatic decisions while preserving all counters and delivery records. Read get_task first; requires operation-specific native approval. Holding does not undo already delivered work.",
+      input: inputSchema(
+        {
+          taskID: {
+            ...stringSchema,
+            description:
+              "Existing Backseat task ID from list_tasks/get_task, not a native session ID.",
+          },
+        },
+        ["taskID"],
+      ),
       async run(v, context) {
         exact(v, ["taskID"]);
         return port.backend.nativeControl("hold", text(v.taskID), {}, context);
@@ -654,24 +803,59 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     share_context: {
       description:
-        "Publish approved shared context and select exact shared versions for one task. An empty shared list revokes future inputs only.",
+        "Publish an optional user-approved snapshot and replace one task's selected shared versions with the required shared list. Read get_task first; references must match the task's group and authorised task-ID recipients. Publishing alone is not selection. Native approval is required. shared:[] revokes future inputs only, not past worker history. Inspect the resulting task with get_task.",
       input: inputSchema(
         {
-          taskID: stringSchema,
+          taskID: {
+            ...stringSchema,
+            description:
+              "Recipient Backseat task ID whose shared-version selection is replaced, not a native session ID.",
+          },
           snapshot: inputSchema(
             {
-              id: stringSchema,
-              version: { type: "integer", minimum: 1 },
-              group: stringSchema,
-              content: stringSchema,
-              recipients: stringsSchema,
+              id: {
+                ...stringSchema,
+                description:
+                  "Shared snapshot ID, used with version in shared references.",
+              },
+              version: {
+                type: "integer",
+                minimum: 1,
+                description:
+                  "Explicit positive snapshot version; no implicit latest selection.",
+              },
+              group: {
+                ...stringSchema,
+                description:
+                  "Authorisation group matching recipient task bindings.",
+              },
+              content: {
+                ...stringSchema,
+                description:
+                  "User-approved shared evidence; never instructions granting consent or wider scope.",
+              },
+              recipients: {
+                ...stringsSchema,
+                description:
+                  "Nonempty list of authorised Backseat task IDs, not native session IDs; group membership alone does not share context.",
+              },
             },
             ["id", "version", "group", "content", "recipients"],
           ),
           shared: {
             type: "array",
+            description:
+              "Complete replacement selection of exact snapshot ID/version pairs for taskID; [] clears future shared inputs. Include a published snapshot here to select it.",
             items: inputSchema(
-              { id: stringSchema, version: { type: "integer", minimum: 1 } },
+              {
+                id: { ...stringSchema, description: "Published snapshot ID." },
+                version: {
+                  type: "integer",
+                  minimum: 1,
+                  description:
+                    "Exact published positive version to select, not an implicit latest version.",
+                },
+              },
               ["id", "version"],
             ),
           },
@@ -693,7 +877,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     recover_runtime: {
       description:
-        "Recover a terminated runtime owner through native approval. Does not arm optional automation.",
+        "Recover a terminated runtime owner through native approval after its termination is established. Takes {}. Does not arm optional automation or retry uncertain deliveries; re-inspect task state after recovery.",
       input: inputSchema({}),
       async run(v, context) {
         exact(v, []);
@@ -707,7 +891,16 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     delete_session: {
       description:
         "Delete a native session and its native recursive subtree, stopping active execution. Approval covers concurrent descendants, not an atomic pre-enumerated set. Rejects the invoking coordinator and its ancestors. Retains task history and uncertain deliveries; never retries an uncertain deletion.",
-      input: inputSchema({ sessionID: stringSchema }, ["sessionID"]),
+      input: inputSchema(
+        {
+          sessionID: {
+            ...stringSchema,
+            description:
+              "Exact native session ID selected from list_sessions for operation-specific approval of recursive subtree removal; not a Backseat task ID.",
+          },
+        },
+        ["sessionID"],
+      ),
       async run(v, context) {
         exact(v, ["sessionID"]);
         return port.backend.deleteSession(text(v.sessionID), context);
