@@ -68,7 +68,218 @@ describe("Automatic same-service native connection", () => {
     };
   }
 
+  it("Identifies native request failures without exposing request data", async () => {
+    const records: { event: string; fields: Record<string, unknown> }[] = [];
+    const f = fixture((_level, event, fields) =>
+      records.push({ event, fields: fields! }),
+    );
+    try {
+      await f.connection.read(async (client) => {
+        f.setResponse(async () => Response.json({ data: [], cursor: {} }));
+        expect(
+          await client.session.list({ search: "PRIVATE_REQUEST_SENTINEL" }),
+        ).toEqual({ data: [], cursor: {} });
+        f.setResponse(
+          async () => new Response("PRIVATE_REQUEST_SENTINEL", { status: 503 }),
+        );
+        await expect(client.session.active()).rejects.toBeDefined();
+        for (const code of ["ECONNRESET", "PRIVATE_REQUEST_SENTINEL"]) {
+          f.setResponse(async () => {
+            throw new Error("PRIVATE_REQUEST_SENTINEL", { cause: { code } });
+          });
+          await expect(
+            client.session.get({ sessionID: "PRIVATE_REQUEST_SENTINEL" }),
+          ).rejects.toBeDefined();
+        }
+        f.setResponse(async () => {
+          throw Object.defineProperty(
+            new Error("PRIVATE_REQUEST_SENTINEL"),
+            "code",
+            {
+              get() {
+                throw new Error("PRIVATE_REQUEST_SENTINEL");
+              },
+            },
+          );
+        });
+        await expect(client.session.active()).rejects.toBeDefined();
+        f.setResponse(
+          async () => new Response("PRIVATE_REQUEST_SENTINEL", { status: 503 }),
+        );
+        for (let i = 0; i < 40; i++)
+          await client.session.active().catch(() => undefined);
+        return "unchanged result";
+      });
+      const terminal = records.filter(
+        ({ event }) =>
+          event === "native.request.completed" ||
+          event === "native.request.failed",
+      );
+      expect(terminal).toHaveLength(32);
+      expect(terminal[2]!.fields).toMatchObject({
+        requestCategory: "sessions",
+        httpStatus: 200,
+        requestDurationMs: expect.any(Number),
+      });
+      expect(terminal[3]!.fields).toMatchObject({
+        requestCategory: "activity",
+        httpStatus: 503,
+      });
+      expect(terminal[4]!.fields).toMatchObject({
+        requestCategory: "session",
+        errorCode: "ECONNRESET",
+      });
+      expect(terminal[5]!.fields).toMatchObject({ errorCode: "unknown" });
+      expect(terminal[6]!.fields).toMatchObject({ errorCode: "unknown" });
+      expect(
+        records.find(({ event }) => event === "native.request.suppressed")
+          ?.fields,
+      ).toMatchObject({ requestCategory: "activity", count: 15 });
+      expect(JSON.stringify(records)).not.toContain("PRIVATE_REQUEST_SENTINEL");
+      expect(
+        new Set(terminal.map(({ fields }) => fields.correlation)).size,
+      ).toBe(1);
+    } finally {
+      f.connection.dispose();
+    }
+  });
+
+  it("Reports active requests at the shared deadline", async () => {
+    for (const activeCount of [0, 2]) {
+      const records: { event: string; fields: Record<string, unknown> }[] = [];
+      const f = fixture((_level, event, fields) =>
+        records.push({ event, fields: fields! }),
+      );
+      const deadline = new AbortController();
+      const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(
+        deadline.signal,
+      );
+      try {
+        await expect(
+          f.connection.read(async (client, signal) => {
+            if (!activeCount) {
+              deadline.abort();
+              signal.throwIfAborted();
+            }
+            let started = 0;
+            f.setResponse(
+              async (request) =>
+                new Promise((_resolve, reject) => {
+                  request.signal.addEventListener(
+                    "abort",
+                    () => reject(request.signal.reason),
+                    { once: true },
+                  );
+                  if (++started === activeCount) deadline.abort();
+                }),
+            );
+            return Promise.all(
+              Array.from({ length: activeCount }, () =>
+                client.session.active({ signal }),
+              ),
+            );
+          }),
+        ).rejects.toThrow(
+          "Native service connection unavailable or unsupported",
+        );
+        expect(
+          records.find(({ event }) => event === "native.requests.deadline")
+            ?.fields,
+        ).toMatchObject({ count: activeCount });
+        const snapshots = records.filter(
+          ({ event }) => event === "native.request.active",
+        );
+        expect(snapshots).toHaveLength(activeCount ? 1 : 0);
+        if (activeCount)
+          expect(snapshots[0]!.fields).toMatchObject({
+            requestCategory: "activity",
+            count: 2,
+            requestDurationMs: expect.any(Number),
+          });
+      } finally {
+        timeout.mockRestore();
+        f.connection.dispose();
+      }
+    }
+    const records: string[] = [];
+    const f = fixture((_level, event) => records.push(event));
+    const deadline = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(
+      deadline.signal,
+    );
+    try {
+      expect(await f.connection.read(async () => "done")).toBe("done");
+      const count = records.length;
+      deadline.abort();
+      expect(records).toHaveLength(count);
+    } finally {
+      timeout.mockRestore();
+      f.connection.dispose();
+    }
+  });
+
   it("Logging failure preserves coordination outcomes", async () => {
+    for (const kind of [
+      "success",
+      "status",
+      "rejection",
+      "redirect",
+      "escape",
+      "deadline",
+    ] as const) {
+      const throwing = fixture(() => {
+        throw new Error("Diagnostic sink unavailable");
+      });
+      const deadline = new AbortController();
+      const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(
+        deadline.signal,
+      );
+      const NativeRequest = globalThis.Request;
+      try {
+        const result = throwing.connection.read(async (client, signal) => {
+          if (kind === "escape")
+            globalThis.Request = class extends NativeRequest {
+              override get url() {
+                return "http://example.test/api/info";
+              }
+            };
+          throwing.setResponse(async (request) => {
+            if (kind === "deadline")
+              return new Promise((_resolve, reject) => {
+                request.signal.addEventListener(
+                  "abort",
+                  () => reject(request.signal.reason),
+                  { once: true },
+                );
+                deadline.abort();
+              });
+            if (kind === "rejection")
+              throw new Error("Native transport failure");
+            return Response.json(
+              { data: [] },
+              {
+                status:
+                  kind === "redirect" ? 302 : kind === "status" ? 503 : 200,
+              },
+            );
+          });
+          await client.session.active({ signal });
+          return "unchanged result";
+        });
+        if (kind === "success") expect(await result).toBe("unchanged result");
+        else
+          await expect(result).rejects.toThrow(
+            "Native service connection unavailable or unsupported",
+          );
+        const count = throwing.calls.length;
+        deadline.abort();
+        expect(throwing.calls).toHaveLength(count);
+      } finally {
+        globalThis.Request = NativeRequest;
+        timeout.mockRestore();
+        throwing.connection.dispose();
+      }
+    }
     let attempts = 0;
     const diagnostics = Effect.runSync(
       hostDiagnostics.pipe(
@@ -112,6 +323,43 @@ describe("Automatic same-service native connection", () => {
   });
 
   it("Excludes sensitive diagnostic data", async () => {
+    const records: Record<string, unknown>[] = [];
+    const hostile = fixture((_level, event, fields) => {
+      if (event === "native.request.failed") records.push(fields!);
+    });
+    try {
+      expect(
+        await hostile.connection.read(async (client) => {
+          hostile.setResponse(async () => {
+            throw new Proxy(
+              {},
+              {
+                getOwnPropertyDescriptor() {
+                  throw new Error("PRIVATE_NATIVE_SENTINEL");
+                },
+              },
+            );
+          });
+          await client.session.active().catch(() => undefined);
+          hostile.setResponse(async () => new Response(null, { status: 503 }));
+          await client.session
+            .create({ title: "PRIVATE_NATIVE_SENTINEL" })
+            .catch(() => undefined);
+          return "unchanged result";
+        }),
+      ).toBe("unchanged result");
+      expect(records[0]).toMatchObject({
+        requestCategory: "activity",
+        errorCode: "unknown",
+      });
+      expect(records[1]).toMatchObject({
+        requestCategory: "unknown",
+        httpStatus: 503,
+      });
+      expect(JSON.stringify(records)).not.toContain("PRIVATE_NATIVE_SENTINEL");
+    } finally {
+      hostile.connection.dispose();
+    }
     for (const kind of [
       "disposed",
       "timeout",

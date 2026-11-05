@@ -110,6 +110,19 @@ Host log-level filtering applies. `info` records setup and cleanup, `warn` recor
 
 Records contain a constant service and event, fixed operation/action/phase and failure categories, elapsed milliseconds, aggregate counts and continuation-presence flags. Refresh failure counts represent affected sessions, including sessions sharing a failed permissions snapshot. Native failures distinguish timeout, disposal, cancellation, validation, transport and unknown failures without changing the user-facing error. Phase identifies registration, client construction, service/incarnation verification, revalidation or the native operation.
 
+Native request failures (`native.request.failed`) are warning-level; successful requests (`native.request.completed`) require debug logging. Each native read emits at most 32 individual request records, including service and identity verification; `native.request.suppressed` summarizes additional failures by category on exit. Requests are not retried.
+
+Non-2xx responses are request failures, even when the caller handles the status. Error-code extraction accepts only own string data properties on the exception or its immediate cause. DOMException aborts with inherited numeric codes therefore report `unknown`; deadline snapshots and enclosing failure classifications still distinguish the shared timeout.
+
+| Field               | Meaning                                                                                                                                                              |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requestCategory`   | Fixed request label: `info`, `identity`, `projects`, `agents`, `sessions`, `activity`, `session`, `permissions`, `forms`, `form`, `inbox`, `messages`, or `unknown`. |
+| `requestDurationMs` | Monotonic elapsed time from request observation to response headers or fetch rejection, not body download or SDK parsing.                                            |
+| `httpStatus`        | HTTP response status from 100 through 599, when available.                                                                                                           |
+| `errorCode`         | Allowlisted transport code from the exception or its immediate cause; otherwise `unknown`. No exception text is included.                                            |
+
+At the shared deadline, `native.requests.deadline` reports the number of active fetches. `native.request.active` reports each active category's count and oldest elapsed time. A zero count attributes the timeout to no endpoint: work outside fetch, including body parsing after headers, is not observed. These records preserve the existing read correlation, deadline, cancellation and caller-visible errors.
+
 Correlation tokens are generated only for diagnostics, connect related internal work, and change on each continuation call. They cannot identify individual host sessions. Logs exclude native identifiers, continuation values, paths, URLs, credentials, exception messages/stacks, prompts, titles and payloads. Detailed registration errors remain available to the invoking caller. Failed logging, including late diagnostics after plugin unload, is dropped without retry, stderr fallback or coordination changes.
 
 ## Development

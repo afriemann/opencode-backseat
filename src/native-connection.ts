@@ -27,6 +27,11 @@ export const DIAGNOSTIC_EVENTS = [
   "native.started",
   "native.completed",
   "native.failed",
+  "native.request.completed",
+  "native.request.failed",
+  "native.request.suppressed",
+  "native.requests.deadline",
+  "native.request.active",
   "inventory.completed",
   "inventory.degraded",
   "refresh.completed",
@@ -117,6 +122,210 @@ export function diagnosticContext(
 
 const REGISTRATION_BYTES = 16_384;
 const REQUEST_TIMEOUT = 10_000;
+const REQUEST_DIAGNOSTIC_LIMIT = 32;
+const REQUEST_CATEGORIES = [
+  "info",
+  "identity",
+  "projects",
+  "agents",
+  "sessions",
+  "activity",
+  "session",
+  "permissions",
+  "forms",
+  "form",
+  "inbox",
+  "messages",
+  "unknown",
+] as const;
+type RequestCategory = (typeof REQUEST_CATEGORIES)[number];
+const REQUEST_ERROR_CODES = [
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ABORT_ERR",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "unknown",
+] as const;
+
+function ownData(value: unknown, key: string): unknown {
+  try {
+    if (
+      value === null ||
+      (typeof value !== "object" && typeof value !== "function")
+    )
+      return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    // Error objects and diagnostic inputs may be proxies; their contents are optional.
+    return undefined;
+  }
+}
+
+export function projectRequestDiagnostics(
+  fields: unknown,
+): Record<string, unknown> {
+  const record: Record<string, unknown> = {};
+  for (const [key, values] of [
+    ["requestCategory", REQUEST_CATEGORIES],
+    ["errorCode", REQUEST_ERROR_CODES],
+  ] as const) {
+    const value = ownData(fields, key);
+    if (
+      typeof value === "string" &&
+      (values as readonly string[]).includes(value)
+    )
+      record[key] = value;
+  }
+  const duration = ownData(fields, "requestDurationMs");
+  if (
+    typeof duration === "number" &&
+    Number.isFinite(duration) &&
+    duration >= 0
+  )
+    record.requestDurationMs = duration;
+  const status = ownData(fields, "httpStatus");
+  if (
+    typeof status === "number" &&
+    Number.isInteger(status) &&
+    status >= 100 &&
+    status <= 599
+  )
+    record.httpStatus = status;
+  const count = ownData(fields, "count");
+  if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0)
+    record.count = count;
+  return record;
+}
+
+function requestCategory(method: string, pathname: string): RequestCategory {
+  if (method === "POST" && pathname === `/api/rpc/${BackseatRpc.id}/identity`)
+    return "identity";
+  if (method !== "GET") return "unknown";
+  for (const [path, category] of [
+    ["/api/info", "info"],
+    ["/api/project", "projects"],
+    ["/api/agent", "agents"],
+    ["/api/session", "sessions"],
+    ["/api/session/active", "activity"],
+    ["/api/permission/request", "permissions"],
+  ] as const) {
+    if (pathname === path) return category;
+  }
+  for (const [pattern, category] of [
+    [/^\/api\/session\/[^/]+\/form\/[^/]+$/, "form"],
+    [/^\/api\/session\/[^/]+\/form$/, "forms"],
+    [/^\/api\/session\/[^/]+\/inbox$/, "inbox"],
+    [/^\/api\/session\/[^/]+\/message$/, "messages"],
+    [/^\/api\/session\/[^/]+$/, "session"],
+  ] as const) {
+    if (pattern.test(pathname)) return category;
+  }
+  return "unknown";
+}
+
+function requestErrorCode(error: unknown): string {
+  for (const candidate of [error, ownData(error, "cause")]) {
+    const code = ownData(candidate, "code");
+    if (
+      typeof code === "string" &&
+      (REQUEST_ERROR_CODES as readonly string[]).includes(code)
+    )
+      return code;
+  }
+  return "unknown";
+}
+
+function requestDiagnostics(diagnostics: DiagnosticContext) {
+  const active = new Set<{ category: RequestCategory; started: number }>();
+  const suppressed = new Map<RequestCategory, number>();
+  let terminalCount = 0;
+  let closed = false;
+  const emit = (
+    event: Parameters<DiagnosticEmitter>[1],
+    fields: Record<string, unknown>,
+    level: DiagnosticLevel = "warn",
+  ) => {
+    try {
+      if (!closed)
+        diagnostics.emit(level, event, projectRequestDiagnostics(fields));
+    } catch {
+      /* Diagnostic processing must not replace a native result or error. */
+    }
+  };
+  return {
+    start(method: string, pathname: string) {
+      if (closed) return () => undefined;
+      const entry = {
+        category: requestCategory(method, pathname),
+        started: performance.now(),
+      };
+      active.add(entry);
+      return (
+        status?: number,
+        error?: unknown,
+        failed = false,
+        exception = false,
+      ) => {
+        try {
+          active.delete(entry);
+          if (closed) return;
+          if (terminalCount++ >= REQUEST_DIAGNOSTIC_LIMIT) {
+            if (failed)
+              suppressed.set(
+                entry.category,
+                (suppressed.get(entry.category) ?? 0) + 1,
+              );
+            return;
+          }
+          emit(
+            failed ? "native.request.failed" : "native.request.completed",
+            {
+              requestCategory: entry.category,
+              requestDurationMs: performance.now() - entry.started,
+              httpStatus: status,
+              ...(exception ? { errorCode: requestErrorCode(error) } : {}),
+            },
+            failed ? "warn" : "debug",
+          );
+        } catch {
+          /* Optional timing or classification cannot replace the transport outcome. */
+        }
+      };
+    },
+    deadline() {
+      emit("native.requests.deadline", { count: active.size });
+      const now = performance.now();
+      for (const category of REQUEST_CATEGORIES) {
+        let count = 0;
+        let oldest = now;
+        for (const entry of active)
+          if (entry.category === category) {
+            count++;
+            oldest = Math.min(oldest, entry.started);
+          }
+        if (count)
+          emit("native.request.active", {
+            requestCategory: category,
+            count,
+            requestDurationMs: now - oldest,
+          });
+      }
+    },
+    close() {
+      for (const [category, count] of suppressed)
+        emit("native.request.suppressed", { requestCategory: category, count });
+      closed = true;
+      active.clear();
+      suppressed.clear();
+    },
+  };
+}
 const hasUnsafeOtherWrite = (mode: number): boolean =>
   (mode & 0o002) !== 0 && (mode & 0o1000) === 0;
 class NativeConnectionError extends Error {}
@@ -308,11 +517,20 @@ export function createNativeConnection(options: {
       let deadline: AbortSignal | undefined;
       let callerSignal: AbortSignal | undefined;
       let transportFailed = false;
+      const requests = requestDiagnostics(diagnostics);
+      const onDeadline = () => {
+        try {
+          requests.deadline();
+        } catch {
+          /* Deadline diagnostics cannot interfere with abort delivery. */
+        }
+      };
       diagnostics.emit("debug", "native.started", { phase });
       try {
         lifetime.signal.throwIfAborted();
         const registered = registration(await source(), options.version);
         deadline = AbortSignal.timeout(REQUEST_TIMEOUT);
+        deadline.addEventListener("abort", onDeadline, { once: true });
         const signal = AbortSignal.any([lifetime.signal, deadline]);
         phase = "client";
         const guarded: typeof fetch = Object.assign(
@@ -320,30 +538,44 @@ export function createNativeConnection(options: {
             const request = new Request(input, init);
             callerSignal = request.signal;
             const url = new URL(request.url);
-            if (
-              url.origin !== registered.origin ||
-              url.username ||
-              url.password
-            )
-              throw unavailable("request escaped its origin");
-            const combined = AbortSignal.any([signal, request.signal]);
-            combined.throwIfAborted();
-            let response: Response;
+            let finish: ReturnType<typeof requests.start> | undefined;
             try {
-              response = await transport(
-                new Request(request, { redirect: "error", signal: combined }),
-              );
+              finish = requests.start(request.method, url.pathname);
+            } catch {
+              /* Request bookkeeping is optional; the origin guard is not. */
+            }
+            let status: number | undefined;
+            try {
+              if (
+                url.origin !== registered.origin ||
+                url.username ||
+                url.password
+              )
+                throw unavailable("request escaped its origin");
+              const combined = AbortSignal.any([signal, request.signal]);
+              combined.throwIfAborted();
+              let response: Response;
+              try {
+                response = await transport(
+                  new Request(request, { redirect: "error", signal: combined }),
+                );
+                status = response.status;
+              } catch (error) {
+                transportFailed = true;
+                throw error;
+              }
+              if (
+                (response.status >= 300 && response.status < 400) ||
+                response.redirected
+              )
+                throw unavailable("redirect rejected");
+              combined.throwIfAborted();
+              finish?.(status, undefined, !response.ok);
+              return response;
             } catch (error) {
-              transportFailed = true;
+              finish?.(status, error, true, true);
               throw error;
             }
-            if (
-              (response.status >= 300 && response.status < 400) ||
-              response.redirected
-            )
-              throw unavailable("redirect rejected");
-            combined.throwIfAborted();
-            return response;
           },
           { preconnect: transport.preconnect },
         );
@@ -426,6 +658,9 @@ export function createNativeConnection(options: {
             ? "connection disposed"
             : "connection unavailable or unsupported",
         );
+      } finally {
+        deadline?.removeEventListener("abort", onDeadline);
+        requests.close();
       }
     },
     identity,

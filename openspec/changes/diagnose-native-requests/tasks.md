@@ -1,0 +1,4 @@
+- [x] 1.1 Extend the native boundary for "Identifies native request failures without exposing request data" using design.md decisions.
+- [x] 1.2 Implement "Reports active requests at the shared deadline" in the native guard.
+- [x] 1.3 Extend both projections for "Excludes sensitive diagnostic data" and "Routes diagnostics through host logging".
+- [x] 1.4 Update README.md diagnostics fields and measurement limits from design.md.

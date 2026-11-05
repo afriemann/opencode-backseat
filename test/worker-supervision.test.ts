@@ -67,6 +67,21 @@ describe("Operational diagnostic boundaries", () => {
     emit("warn", "inventory.degraded", { count: 2 });
     expect(records.map((record) => record.level)).toEqual(["Info", "Warn"]);
     expect(JSON.stringify(records)).toContain("backseat");
+    emit("warn", "native.request.failed", {
+      requestCategory: "sessions",
+      requestDurationMs: 12.5,
+      httpStatus: 503,
+      errorCode: "ECONNRESET",
+    });
+    expect(records.flatMap((record) => record.message)).toContainEqual({
+      service: "backseat",
+      event: "native.request.failed",
+      classification: "unknown",
+      requestCategory: "sessions",
+      requestDurationMs: 12.5,
+      httpStatus: 503,
+      errorCode: "ECONNRESET",
+    });
     await promisePlugin(emit).setup({ app: { version: "2.2.4" } } as Parameters<
       ReturnType<typeof promisePlugin>["setup"]
     >[0]);
@@ -127,6 +142,10 @@ describe("Operational diagnostic boundaries", () => {
           durationMs: Infinity,
           count: -1,
           continuation: sentinel,
+          requestCategory: sentinel,
+          errorCode: sentinel,
+          requestDurationMs: Infinity,
+          httpStatus: 600,
         });
       }
       emit("error", "native.failed", {
@@ -134,6 +153,14 @@ describe("Operational diagnostic boundaries", () => {
           value: sentinel,
         }),
       });
+      for (const invalid of [-1, NaN, Infinity, "200", 99, 600, 200.5]) {
+        emit("warn", "native.request.failed", {
+          requestCategory: sentinel,
+          errorCode: sentinel,
+          httpStatus: invalid,
+          requestDurationMs: -1,
+        });
+      }
     } finally {
       await f.cleanup();
       stderr.mockRestore();
@@ -141,6 +168,16 @@ describe("Operational diagnostic boundaries", () => {
     expect(JSON.stringify({ records, legacy })).not.toContain(sentinel);
     expect(records.length).toBeGreaterThan(0);
     const projected = records.flat() as Record<string, unknown>[];
+    const requests = projected.filter(
+      (record) => record.event === "native.request.failed",
+    );
+    expect(requests).toHaveLength(7);
+    for (const record of requests)
+      expect(record).toEqual({
+        service: "backseat",
+        event: "native.request.failed",
+        classification: "unknown",
+      });
     expect(
       projected.filter((record) => record.event === "native.failed"),
     ).toHaveLength(4);
