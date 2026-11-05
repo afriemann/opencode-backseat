@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Effect, Logger, References } from "effect";
+import { DiagnosticToken } from "../src/native-connection.ts";
 import {
   buildContext,
   nativeToolEvidence,
@@ -15,6 +17,8 @@ import { parseCoordinatorState, type WorkerBinding } from "../src/state.ts";
 import { dispatchFollowup, followupText } from "../src/dispatch.ts";
 import {
   createWorkerObserver,
+  hostDiagnostics,
+  promisePlugin,
   createNativeBackend,
   type NativeBackendHost,
   type WorkerObserverHost,
@@ -39,7 +43,122 @@ import { coordinatorDefinition } from "./host.ts";
 
 const hash = (value: unknown) =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
-async function observerFixture() {
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Operational diagnostic boundaries", () => {
+  it("Routes diagnostics through host logging", async () => {
+    const records: { level: string; message: unknown }[] = [];
+    const emit = Effect.runSync(
+      hostDiagnostics.pipe(
+        Effect.provideService(
+          Logger.CurrentLoggers,
+          new Set([
+            Logger.make((entry) => {
+              records.push({ level: entry.logLevel, message: entry.message });
+            }),
+          ]),
+        ),
+        Effect.provideService(References.MinimumLogLevel, "Info"),
+      ),
+    );
+    await Promise.resolve();
+    emit("debug", "tool.started");
+    emit("info", "setup.completed");
+    emit("warn", "inventory.degraded", { count: 2 });
+    expect(records.map((record) => record.level)).toEqual(["Info", "Warn"]);
+    expect(JSON.stringify(records)).toContain("backseat");
+    await promisePlugin(emit).setup({ app: { version: "2.2.4" } } as Parameters<
+      ReturnType<typeof promisePlugin>["setup"]
+    >[0]);
+    expect(JSON.stringify(records)).toContain("setup.degraded");
+    expect(JSON.stringify(records)).toContain("validation");
+    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
+      const capture = await captureNativeOverview(
+        [],
+        80,
+        24,
+        false,
+        {},
+        false,
+        "ready",
+        false,
+        undefined,
+        "coordinator",
+      );
+      expect(capture.hostLog).toContain("setup.completed");
+      expect(capture.hostLog).toContain("backseat");
+    }
+  });
+  it("Excludes sensitive diagnostic data", async () => {
+    const records: unknown[] = [];
+    const legacy: string[] = [];
+    const sentinel = "PRIVATE_DIAGNOSTIC_SENTINEL";
+    const emit = Effect.runSync(
+      hostDiagnostics.pipe(
+        Effect.provideService(
+          Logger.CurrentLoggers,
+          new Set([Logger.make((entry) => records.push(entry.message))]),
+        ),
+        Effect.provideService(References.MinimumLogLevel, "Debug"),
+      ),
+    );
+    const stderr = spyOn(process.stderr, "write").mockImplementation(
+      (chunk) => {
+        legacy.push(String(chunk));
+        return true;
+      },
+    );
+    const f = await observerFixture(emit);
+    try {
+      f.host.session.context = async () => {
+        throw new Error(sentinel);
+      };
+      await f.observer.idle({ sessionID: "worker", background: [] });
+      for (const level of ["debug", "info", "warn", "error"] as const) {
+        emit(level, "native.failed", {
+          error: new Error(sentinel),
+          message: sentinel,
+          service: sentinel,
+          phase: sentinel,
+          classification: sentinel,
+          correlation: sentinel,
+          cursor: sentinel,
+          sessionID: sentinel,
+          durationMs: Infinity,
+          count: -1,
+          continuation: sentinel,
+        });
+      }
+      emit("error", "native.failed", {
+        correlation: Object.assign(Object.create(DiagnosticToken.prototype), {
+          value: sentinel,
+        }),
+      });
+    } finally {
+      await f.cleanup();
+      stderr.mockRestore();
+    }
+    expect(JSON.stringify({ records, legacy })).not.toContain(sentinel);
+    expect(records.length).toBeGreaterThan(0);
+    const projected = records.flat() as Record<string, unknown>[];
+    expect(
+      projected.filter((record) => record.event === "native.failed"),
+    ).toHaveLength(4);
+    for (const record of projected.filter(
+      (record) => record.event === "native.failed",
+    )) {
+      expect(record).toEqual({
+        service: "backseat",
+        event: "native.failed",
+        classification: "unknown",
+      });
+    }
+  });
+});
+
+async function observerFixture(
+  diagnostics?: WorkerObserverHost["diagnostics"],
+) {
   const values = new Map<string, unknown>();
   const sessions = new Map<string, { parentID?: string; directory: string }>([
     ["worker", { directory: "/project/api" }],
@@ -56,6 +175,7 @@ async function observerFixture() {
     },
   ];
   const host: WorkerObserverHost = {
+    ...(diagnostics ? { diagnostics } : {}),
     plugin: {
       async list() {
         return {

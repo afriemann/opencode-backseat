@@ -1,0 +1,4 @@
+- [x] 1.1 Implement the host bridge, Effect manifest/lockfile declarations and fixture adaptation for "Routes diagnostics through host logging" using design Host bridge and Injection decisions.
+- [x] 1.2 Implement closed diagnostic projection, raw-error migration and privacy-sentinel cases for "Excludes sensitive diagnostic data" using design Privacy and correlation.
+- [x] 1.3 Instrument native, tool, RPC and background boundaries and failure-isolation cases for "Logging failure preserves coordination outcomes" using design Classification and filtering and Containment.
+- [x] 1.4 Document host retrieval, levels, fields and correlation limits in README.md.

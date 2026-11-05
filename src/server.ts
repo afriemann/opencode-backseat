@@ -1,7 +1,20 @@
 import { Plugin } from "@opencode/plugin";
-import { createCoordinationTools, COORDINATOR_TOOL_IDS } from "./tools.ts";
+import { Plugin as EffectPlugin } from "@opencode/plugin/effect";
+import { fromPromise } from "@opencode/plugin/promise/adapter";
+import { Effect } from "effect";
+import {
+  createCoordinationTools,
+  COORDINATOR_TOOL_IDS,
+  COORDINATION_TOOLS,
+} from "./tools.ts";
 import {
   createNativeConnection,
+  DIAGNOSTIC_EVENTS,
+  DIAGNOSTIC_PHASES,
+  DIAGNOSTIC_FAILURES,
+  DiagnosticToken,
+  diagnosticContext,
+  type DiagnosticEmitter,
   type NativeConnection,
 } from "./native-connection.ts";
 import { readNativeDelivery } from "./native-sessions.ts";
@@ -2305,6 +2318,7 @@ export async function createNativeBackend(
 }
 
 export interface WorkerObserverHost {
+  diagnostics?: DiagnosticEmitter;
   session: Pick<Plugin.Context["session"], "get" | "context">;
   plugin?: Pick<Plugin.Context["plugin"], "list">;
   storage: NativeBackendHost["storage"];
@@ -2337,6 +2351,7 @@ export async function createWorkerObserver(
   dataDir: string,
   location: string,
 ): Promise<WorkerObserver> {
+  const log = diagnosticContext(host.diagnostics, "observer").emit;
   const incarnation = randomUUID();
   const registry = workerObservationKeys(dataDir, location).observer;
   let closed = false,
@@ -2629,14 +2644,9 @@ export async function createWorkerObserver(
             keys.snapshot,
             JSON.parse(JSON.stringify(snapshot)),
           );
-        } catch (error) {
+        } catch {
           await invalidateInstance().catch(() => undefined);
-          log("warn", "Worker observation unavailable", {
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unknown observation error",
-          });
+          log("warn", "observer.degraded", { classification: "unavailable" });
         }
       });
     },
@@ -2651,7 +2661,10 @@ export async function createWorkerObserver(
         )
           throw new Error("Native observation intake exceeds bound");
       } catch {
-        log("warn", "Native observation intake exceeds bound");
+        log("warn", "observer.degraded", {
+          phase: "intake",
+          classification: "validation",
+        });
         return stop();
       }
       retainedBytes += bytes;
@@ -2743,14 +2756,9 @@ export async function createWorkerObserver(
             if (!(await current())) return;
             await host.storage.set(key, version);
           }
-        } catch (error) {
+        } catch {
           await invalidateInstance().catch(() => undefined);
-          log("warn", "Worker observation invalidated", {
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unknown observation error",
-          });
+          log("warn", "observer.degraded", { classification: "unknown" });
         } finally {
           if (isSuccessfulTerminal(event)) pendingTerminals.delete(version);
         }
@@ -2763,19 +2771,92 @@ export async function createWorkerObserver(
   };
 }
 
-const log = (
-  level: string,
-  message: string,
-  extra?: Record<string, unknown>,
-) => {
-  try {
-    process.stderr.write(
-      JSON.stringify({ service: "backseat", level, message, ...extra }) + "\n",
-    );
-  } catch {
-    /* Diagnostic channel must not throw. */
-  }
-};
+export const hostDiagnostics = Effect.gen(function* () {
+  const run = Effect.runSyncWith(yield* Effect.context<never>());
+  let emitting = false;
+  const levels = {
+    debug: Effect.logDebug,
+    info: Effect.logInfo,
+    warn: Effect.logWarning,
+    error: Effect.logError,
+  };
+  const emit: DiagnosticEmitter = (level, event, fields = {}) => {
+    if (emitting) return;
+    emitting = true;
+    try {
+      if (!Object.hasOwn(levels, level) || !DIAGNOSTIC_EVENTS.includes(event))
+        return;
+      const record: Record<string, unknown> = { service: "backseat", event };
+      for (const [key, values] of [
+        ["phase", DIAGNOSTIC_PHASES],
+        ["classification", DIAGNOSTIC_FAILURES],
+        [
+          "operation",
+          [
+            "setup",
+            "cleanup",
+            "tool",
+            "rpc",
+            "native",
+            "inventory",
+            "refresh",
+            "observer",
+          ],
+        ],
+        [
+          "action",
+          [
+            ...COORDINATION_TOOLS,
+            "identity",
+            "bootstrap",
+            "inspect",
+            "attach",
+            "control",
+            "suggest",
+            "observe",
+            "validate",
+            "recover",
+          ],
+        ],
+      ] as const) {
+        const value = fields[key];
+        if (
+          typeof value === "string" &&
+          (values as readonly string[]).includes(value)
+        )
+          record[key] = value;
+      }
+      if (event.endsWith("failed") && record.classification === undefined)
+        record.classification = "unknown";
+      for (const key of [
+        "durationMs",
+        "count",
+        "unknownCount",
+        "returnedCount",
+        "bufferedCount",
+      ]) {
+        const value = fields[key];
+        if (
+          typeof value === "number" &&
+          Number.isFinite(value) &&
+          value >= 0 &&
+          (key === "durationMs" || Number.isSafeInteger(value))
+        )
+          record[key] = value;
+      }
+      if (typeof fields.continuation === "boolean")
+        record.continuation = fields.continuation;
+      if (fields.correlation instanceof DiagnosticToken)
+        record.correlation = DiagnosticToken.read(fields.correlation);
+      run(levels[level](record));
+    } catch {
+      /* Host diagnostic failures must not alter coordination. */
+    } finally {
+      emitting = false;
+    }
+  };
+  return emit;
+});
 async function canonical(location: string): Promise<string> {
   if (!isAbsolute(location))
     throw new Error("Explicit absolute location required");
@@ -3057,383 +3138,444 @@ async function createNativeCore(
   };
 }
 
-export default Plugin.define({
-  id: "backseat",
-  async setup(ctx) {
-    if (
-      !/^2\./.test(ctx.app.version) ||
-      ctx.app.version
-        .split(".")
-        .slice(0, 3)
-        .some((part) => !/^\d+$/.test(part)) ||
-      Number(ctx.app.version.split(".")[1]) < 2 ||
-      (Number(ctx.app.version.split(".")[1]) === 2 &&
-        Number(ctx.app.version.split(".")[2]) < 5)
-    ) {
-      log("warn", "Unsupported host; coordination held");
-      return;
-    }
-    let dataDir: string | undefined;
-    const location = await canonical(ctx.location.directory);
-    const native = createNativeConnection({
-      location,
-      version: ctx.app.version,
-    });
-    const adapter: ProjectAdapter = {
-      ctx,
-      location,
-      abort: new AbortController(),
-      native,
-    };
-    let lease: Ownership.CoordinatorCoreLease<NativeCore> | undefined;
-    let core: NativeCore;
-    try {
-      const selected = resolveDataDirectory(ctx.options);
-      dataDir = selected;
-      lease = await Ownership.acquireCoordinatorCore(selected, async () => {
-        const anchor = await openAnchoredDirectory(selected);
-        await anchor.close();
-        return createNativeCore(selected, adapter);
+export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
+  Plugin.define({
+    id: "backseat",
+    async setup(ctx) {
+      const log = diagnosticContext(diagnostics, "setup").emit;
+      const observerLog: DiagnosticEmitter = (level, event, fields) =>
+        diagnosticContext(diagnostics, "observer").emit(level, event, fields);
+      log("debug", "setup.started");
+      if (
+        !/^2\./.test(ctx.app.version) ||
+        ctx.app.version
+          .split(".")
+          .slice(0, 3)
+          .some((part) => !/^\d+$/.test(part)) ||
+        Number(ctx.app.version.split(".")[1]) < 2 ||
+        (Number(ctx.app.version.split(".")[1]) === 2 &&
+          Number(ctx.app.version.split(".")[2]) < 5)
+      ) {
+        log("warn", "setup.degraded", { classification: "validation" });
+        return;
+      }
+      let dataDir: string | undefined;
+      const location = await canonical(ctx.location.directory);
+      const native = createNativeConnection({
+        location,
+        version: ctx.app.version,
+        diagnostics,
       });
-      core = lease.core;
-    } catch (error) {
-      core = unavailableCore(
-        dataDir,
-        adapter,
-        error instanceof Error
-          ? error.message
-          : "Coordination store unavailable",
-      );
-    }
-    const existing = core.projects.get(location);
-    if (existing && existing !== adapter) {
-      native.dispose();
-      await lease?.release();
-      throw new Error("Project adapter is already registered");
-    }
-    core.projects.set(location, adapter);
-    const backend = core.backend;
-    const cleanupSteps: Array<() => Promise<void>> = [];
-    let observing: Promise<void> | undefined;
-    let closing: Promise<void> | undefined;
-    const cleanup = () =>
-      (closing ??= (async () => {
-        adapter.abort.abort();
+      const adapter: ProjectAdapter = {
+        ctx,
+        location,
+        abort: new AbortController(),
+        native,
+      };
+      let lease: Ownership.CoordinatorCoreLease<NativeCore> | undefined;
+      let core: NativeCore;
+      try {
+        const selected = resolveDataDirectory(ctx.options);
+        dataDir = selected;
+        lease = await Ownership.acquireCoordinatorCore(selected, async () => {
+          const anchor = await openAnchoredDirectory(selected);
+          await anchor.close();
+          return createNativeCore(selected, adapter);
+        });
+        core = lease.core;
+      } catch (error) {
+        log("warn", "setup.degraded", { classification: "unavailable" });
+        core = unavailableCore(
+          dataDir,
+          adapter,
+          error instanceof Error
+            ? error.message
+            : "Coordination store unavailable",
+        );
+      }
+      const existing = core.projects.get(location);
+      if (existing && existing !== adapter) {
         native.dispose();
-        await observing?.catch(() => undefined);
-        const failures: unknown[] = [];
-        for (const step of [
-          () => backend.fenceProject(location),
-          ...cleanupSteps.toReversed(),
-        ]) {
-          try {
-            await step();
-          } catch (error) {
-            failures.push(error);
-          }
-        }
-        core.projects.delete(location);
-        if (failures.length)
-          throw new AggregateError(
-            failures,
-            "Project cleanup incomplete; runtime ownership retained",
-          );
         await lease?.release();
-      })());
-    try {
-      adapter.observe = () => {
-        if (
-          adapter.abort.signal.aborted ||
-          backend.bootstrap().authority !== "owned"
-        )
-          return Promise.resolve();
-        return (observing ??= (async () => {
-          if (!dataDir) throw new Error("Coordination store is unavailable");
-          const workerObserver = await createWorkerObserver(
-            {
-              session: ctx.session,
-              plugin: ctx.plugin,
-              storage: core.storage,
-              canonical,
-            },
-            dataDir,
-            location,
-          );
-          let observerClosing: Promise<void> | undefined;
-          const stopObserver = () =>
-            (observerClosing ??= workerObserver.dispose());
-          cleanupSteps.push(stopObserver);
+        throw new Error("Project adapter is already registered");
+      }
+      core.projects.set(location, adapter);
+      const backend = core.backend;
+      const cleanupSteps: Array<() => Promise<void>> = [];
+      let observing: Promise<void> | undefined;
+      let closing: Promise<void> | undefined;
+      const cleanup = () =>
+        (closing ??= (async () => {
+          const trace = diagnosticContext(diagnostics, "cleanup");
           try {
-            if (adapter.abort.signal.aborted) {
-              await stopObserver();
-              throw new Error("Project observer startup aborted");
-            }
-            adapter.abort.signal.addEventListener(
-              "abort",
-              () => {
-                void stopObserver().catch(() => undefined);
-              },
-              { once: true },
-            );
-            const idleHook = await ctx.session.hook(
-              "experimental.idle",
-              (event) => workerObserver.idle(event),
-            );
-            cleanupSteps.push(() => idleHook.dispose());
-            if (adapter.abort.signal.aborted) {
-              await stopObserver();
-              throw new Error("Project observer startup aborted");
-            }
-            const pendingEvents = new Set<Promise<void>>();
-            const watching = (async () => {
+            adapter.abort.abort();
+            native.dispose();
+            await observing?.catch(() => undefined);
+            const failures: unknown[] = [];
+            for (const step of [
+              () => backend.fenceProject(location),
+              ...cleanupSteps.toReversed(),
+            ]) {
               try {
-                for await (const event of ctx.event.subscribe({
-                  signal: adapter.abort.signal,
-                })) {
-                  if (pendingEvents.size >= OBSERVATION_BOUNDS.pendingEvents)
-                    throw new Error("Native observation intake exceeds bound");
-                  const work = workerObserver.event(event);
-                  pendingEvents.add(work);
-                  void work.then(
-                    () => pendingEvents.delete(work),
-                    () => {
-                      pendingEvents.delete(work);
-                      void stopObserver().catch(() => undefined);
-                    },
-                  );
-                }
-              } catch {
-                if (!adapter.abort.signal.aborted)
-                  log("warn", "Worker observation stream unavailable");
-                await stopObserver();
-              } finally {
-                try {
-                  await stopObserver();
-                } finally {
-                  await Promise.allSettled([...pendingEvents]);
-                }
+                await step();
+              } catch (error) {
+                failures.push(error);
               }
-            })();
-            void watching.catch((error) =>
-              log("error", "Worker observation shutdown failed", {
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : "Unknown shutdown failure",
-              }),
-            );
-            cleanupSteps.push(() => watching);
-          } catch (error) {
-            try {
-              await stopObserver();
-            } catch (cleanupError) {
-              throw new AggregateError(
-                [error, cleanupError],
-                "Observer startup failed; cleanup incomplete",
-              );
             }
+            core.projects.delete(location);
+            if (failures.length)
+              throw new AggregateError(
+                failures,
+                "Project cleanup incomplete; runtime ownership retained",
+              );
+            await lease?.release();
+            trace.emit("info", "cleanup.completed");
+          } catch (error) {
+            trace.emit("error", "cleanup.failed");
             throw error;
           }
         })());
-      };
-      await adapter.observe();
-      // Register exactly once. Configured deny is final; allow is never approval.
-      const permission = await ctx.permission.hook("evaluate", forceNativeAsk);
-      cleanupSteps.push(() => permission.dispose());
-      const agents = await ctx.agent.transform((editor) => {
-        if (editor.get(coordinatorAgent.id)) return;
-        editor.update(coordinatorAgent.id, (agent) => {
-          Object.assign(agent, coordinatorAgent, {
-            permissions: coordinatorAgent.permissions.map((rule) => ({
-              ...rule,
-            })),
-          });
-        });
-      });
-      cleanupSteps.push(() => agents.dispose());
-      const allowedTools = COORDINATOR_TOOL_IDS;
-      const matchesExecutionRole = async (sessionID: string, agent: string) => {
-        if (agent && agent !== coordinatorAgent.id) return false;
-        if (adapter.abort.signal.aborted || !sessionID || !agent)
-          throw new Error("Coordinator tool identity is unavailable");
-        const session = await ctx.session.get({ sessionID });
-        if (
-          session.id !== sessionID ||
-          session.agent !== agent ||
-          session.time.archived !== undefined
-        )
-          throw new Error("Coordinator tool session identity changed");
-        const directory = await canonical(session.location.directory);
-        const project = core.projects.get(directory);
-        if (
-          directory !== session.location.directory ||
-          !project ||
-          project.abort.signal.aborted
-        )
-          throw new Error("Coordinator tool project is unavailable");
-        const catalog = await ctx.agent.list({ location: { directory } });
-        const definition = catalog.data.find((entry) => entry.id === agent);
-        if (catalog.location.directory !== directory || !definition)
-          throw new Error("Coordinator tool catalog is unavailable");
-        const current = await ctx.session.get({ sessionID });
-        if (
-          adapter.abort.signal.aborted ||
-          project.abort.signal.aborted ||
-          core.projects.get(directory) !== project ||
-          current.id !== sessionID ||
-          current.agent !== agent ||
-          current.projectID !== session.projectID ||
-          current.time.archived !== undefined ||
-          fingerprint(current.location) !== fingerprint(session.location)
-        )
-          throw new Error("Coordinator tool identity changed during lookup");
-        return isCoordinatorAgent(definition);
-      };
-      const contextTools = await ctx.session.hook("context", async (event) => {
-        if (event.agent !== coordinatorAgent.id) return;
-        try {
-          if (!(await matchesExecutionRole(event.sessionID, event.agent)))
-            return;
-          for (const name of Object.keys(event.tools))
-            if (!allowedTools.has(name)) delete event.tools[name];
-        } catch {
-          event.tools = {};
-          log("error", "Coordinator tool catalog unavailable");
-        }
-      });
-      cleanupSteps.push(() => contextTools.dispose());
-      const executionTools = await ctx.tool.hook(
-        "execute.before",
-        async (event) => {
-          let matches: boolean;
-          try {
-            matches = await matchesExecutionRole(event.sessionID, event.agent);
-          } catch {
-            throw new Error(
-              "Coordinator tool identity is unavailable or changed",
-            );
-          }
-          if (matches && !allowedTools.has(event.tool))
-            throw new Error("Coordinator tool is not permitted");
-        },
-      );
-      cleanupSteps.push(() => executionTools.dispose());
-      const serve = async <T>(work: () => Promise<T>): Promise<T> => {
-        if (adapter.abort.signal.aborted)
-          throw new Error("Project adapter is unavailable");
-        const result = await work();
-        if (adapter.abort.signal.aborted)
-          throw new Error("Project adapter unloaded; response withheld");
-        return result;
-      };
-      const requestSignal = (signal: AbortSignal) =>
-        AbortSignal.any([adapter.abort.signal, signal]);
-      const rpc = await ctx.rpc.register(BackseatRpc, {
-        identity: async (input) => serve(async () => native.identity(input)),
-        bootstrap: async () => serve(async () => backend.bootstrap()),
-        inspect: async (input) => serve(() => backend.read(input.proof)),
-        attach: async (input, context) =>
-          serve(async () => {
-            const result = await backend.attach(
-              input,
-              requestSignal(context.signal),
-            );
-            const observations = await Promise.allSettled(
-              [...core.projects.values()].map((project) => project.observe?.()),
-            );
-            for (const observation of observations)
-              if (observation.status === "rejected")
-                log(
-                  "warn",
-                  "Observer startup failed; observation remains held",
-                );
-            return result;
-          }),
-        control: async (input, context) => {
-          if (adapter.abort.signal.aborted)
-            throw new Error("Project adapter is unavailable");
-          const result = await backend.control(
-            input,
-            requestSignal(context.signal),
-          );
-          return adapter.abort.signal.aborted && result.accepted
-            ? {
-                accepted: true,
-                reason:
-                  "Operation committed; serving project unloaded. Do not retry; attach and reconcile explicitly.",
-              }
-            : result;
-        },
-        suggest: async (input) => serve(() => backend.suggest(input)),
-        observe: async (input) =>
-          serve(() => backend.readObservation(input, input.proof)),
-        validate: async (input) => serve(() => backend.validate(input)),
-        recover: async (input, context) =>
-          serve(async () => {
-            await backend.recover(
-              input,
-              undefined,
-              requestSignal(context.signal),
-            );
-            return backend.bootstrap();
-          }),
-      });
-      cleanupSteps.push(() => rpc.dispose());
-      const registry = createCoordinationTools({
-        native,
-        backend,
-        canonical,
-        signal: adapter.abort.signal,
-        async authorize(context) {
-          if (
-            !(await serve(() =>
-              matchesExecutionRole(context.sessionID, context.agent),
-            ))
-          )
-            throw new Error(
-              "Select Backseat Coordinator for coordination tools",
-            );
-        },
-      });
-      cleanupSteps.push(async () => {
-        registry.dispose();
-      });
-      const tools = await ctx.tool.transform((editor) => {
-        editor.namespace({
-          name: "backseat",
-          description:
-            "Native session discovery and explicit task coordination",
-        });
-        for (const tool of registry.tools)
-          editor.add({
-            ...tool,
-            async execute(input, context) {
-              try {
-                return await tool.execute(input, context);
-              } catch (error) {
-                log("error", "Native coordination tool failed", {
-                  tool: tool.name,
-                });
-                throw error;
-              }
-            },
-          });
-      });
-      cleanupSteps.push(() => tools.dispose());
-      log("info", "Native coordinator setup complete");
-      return cleanup;
-    } catch (error) {
       try {
-        await cleanup();
-      } catch (cleanupError) {
-        throw new AggregateError(
-          [error, cleanupError],
-          "Registration failed; cleanup incomplete and runtime ownership retained",
+        adapter.observe = () => {
+          if (
+            adapter.abort.signal.aborted ||
+            backend.bootstrap().authority !== "owned"
+          )
+            return Promise.resolve();
+          return (observing ??= (async () => {
+            if (!dataDir) throw new Error("Coordination store is unavailable");
+            const workerObserver = await createWorkerObserver(
+              {
+                session: ctx.session,
+                plugin: ctx.plugin,
+                storage: core.storage,
+                canonical,
+                diagnostics,
+              },
+              dataDir,
+              location,
+            );
+            let observerClosing: Promise<void> | undefined;
+            const stopObserver = () =>
+              (observerClosing ??= workerObserver.dispose());
+            cleanupSteps.push(stopObserver);
+            try {
+              if (adapter.abort.signal.aborted) {
+                await stopObserver();
+                throw new Error("Project observer startup aborted");
+              }
+              adapter.abort.signal.addEventListener(
+                "abort",
+                () => {
+                  void stopObserver().catch(() => undefined);
+                },
+                { once: true },
+              );
+              const idleHook = await ctx.session.hook(
+                "experimental.idle",
+                (event) => workerObserver.idle(event),
+              );
+              cleanupSteps.push(() => idleHook.dispose());
+              if (adapter.abort.signal.aborted) {
+                await stopObserver();
+                throw new Error("Project observer startup aborted");
+              }
+              const pendingEvents = new Set<Promise<void>>();
+              const watching = (async () => {
+                try {
+                  for await (const event of ctx.event.subscribe({
+                    signal: adapter.abort.signal,
+                  })) {
+                    if (pendingEvents.size >= OBSERVATION_BOUNDS.pendingEvents)
+                      throw new Error(
+                        "Native observation intake exceeds bound",
+                      );
+                    const work = workerObserver.event(event);
+                    pendingEvents.add(work);
+                    void work.then(
+                      () => pendingEvents.delete(work),
+                      () => {
+                        pendingEvents.delete(work);
+                        void stopObserver().catch(() => undefined);
+                      },
+                    );
+                  }
+                } catch {
+                  if (!adapter.abort.signal.aborted)
+                    observerLog("warn", "observer.degraded", {
+                      phase: "stream",
+                      classification: "unavailable",
+                    });
+                  await stopObserver();
+                } finally {
+                  try {
+                    await stopObserver();
+                  } finally {
+                    await Promise.allSettled([...pendingEvents]);
+                  }
+                }
+              })();
+              void watching.catch(() =>
+                observerLog("error", "observer.failed", {
+                  phase: "shutdown",
+                  classification: "unknown",
+                }),
+              );
+              cleanupSteps.push(() => watching);
+            } catch (error) {
+              try {
+                await stopObserver();
+              } catch (cleanupError) {
+                throw new AggregateError(
+                  [error, cleanupError],
+                  "Observer startup failed; cleanup incomplete",
+                );
+              }
+              throw error;
+            }
+          })());
+        };
+        await adapter.observe();
+        // Register exactly once. Configured deny is final; allow is never approval.
+        const permission = await ctx.permission.hook(
+          "evaluate",
+          forceNativeAsk,
         );
-      } finally {
-        log("error", "Native coordinator registration failed");
+        cleanupSteps.push(() => permission.dispose());
+        const agents = await ctx.agent.transform((editor) => {
+          if (editor.get(coordinatorAgent.id)) return;
+          editor.update(coordinatorAgent.id, (agent) => {
+            Object.assign(agent, coordinatorAgent, {
+              permissions: coordinatorAgent.permissions.map((rule) => ({
+                ...rule,
+              })),
+            });
+          });
+        });
+        cleanupSteps.push(() => agents.dispose());
+        const allowedTools = COORDINATOR_TOOL_IDS;
+        const matchesExecutionRole = async (
+          sessionID: string,
+          agent: string,
+        ) => {
+          if (agent && agent !== coordinatorAgent.id) return false;
+          if (adapter.abort.signal.aborted || !sessionID || !agent)
+            throw new Error("Coordinator tool identity is unavailable");
+          const session = await ctx.session.get({ sessionID });
+          if (
+            session.id !== sessionID ||
+            session.agent !== agent ||
+            session.time.archived !== undefined
+          )
+            throw new Error("Coordinator tool session identity changed");
+          const directory = await canonical(session.location.directory);
+          const project = core.projects.get(directory);
+          if (
+            directory !== session.location.directory ||
+            !project ||
+            project.abort.signal.aborted
+          )
+            throw new Error("Coordinator tool project is unavailable");
+          const catalog = await ctx.agent.list({ location: { directory } });
+          const definition = catalog.data.find((entry) => entry.id === agent);
+          if (catalog.location.directory !== directory || !definition)
+            throw new Error("Coordinator tool catalog is unavailable");
+          const current = await ctx.session.get({ sessionID });
+          if (
+            adapter.abort.signal.aborted ||
+            project.abort.signal.aborted ||
+            core.projects.get(directory) !== project ||
+            current.id !== sessionID ||
+            current.agent !== agent ||
+            current.projectID !== session.projectID ||
+            current.time.archived !== undefined ||
+            fingerprint(current.location) !== fingerprint(session.location)
+          )
+            throw new Error("Coordinator tool identity changed during lookup");
+          return isCoordinatorAgent(definition);
+        };
+        const contextTools = await ctx.session.hook(
+          "context",
+          async (event) => {
+            if (event.agent !== coordinatorAgent.id) return;
+            try {
+              if (!(await matchesExecutionRole(event.sessionID, event.agent)))
+                return;
+              for (const name of Object.keys(event.tools))
+                if (!allowedTools.has(name)) delete event.tools[name];
+            } catch {
+              event.tools = {};
+              diagnosticContext(diagnostics, "tool").emit(
+                "error",
+                "catalog.failed",
+                { classification: "unavailable" },
+              );
+            }
+          },
+        );
+        cleanupSteps.push(() => contextTools.dispose());
+        const executionTools = await ctx.tool.hook(
+          "execute.before",
+          async (event) => {
+            let matches: boolean;
+            try {
+              matches = await matchesExecutionRole(
+                event.sessionID,
+                event.agent,
+              );
+            } catch {
+              throw new Error(
+                "Coordinator tool identity is unavailable or changed",
+              );
+            }
+            if (matches && !allowedTools.has(event.tool))
+              throw new Error("Coordinator tool is not permitted");
+          },
+        );
+        cleanupSteps.push(() => executionTools.dispose());
+        const traced = async <T>(
+          action: string,
+          work: () => Promise<T>,
+        ): Promise<T> => {
+          const trace = diagnosticContext(diagnostics, "rpc", action);
+          trace.emit("debug", "rpc.started");
+          try {
+            const result = await work();
+            trace.emit("debug", "rpc.completed");
+            return result;
+          } catch (error) {
+            trace.emit("error", "rpc.failed", {
+              classification: adapter.abort.signal.aborted
+                ? "disposed"
+                : "unknown",
+            });
+            throw error;
+          }
+        };
+        const serve = async <T>(
+          work: () => Promise<T>,
+          action?: string,
+        ): Promise<T> => {
+          const run = async () => {
+            if (adapter.abort.signal.aborted)
+              throw new Error("Project adapter is unavailable");
+            const result = await work();
+            if (adapter.abort.signal.aborted)
+              throw new Error("Project adapter unloaded; response withheld");
+            return result;
+          };
+          return action ? traced(action, run) : run();
+        };
+        const requestSignal = (signal: AbortSignal) =>
+          AbortSignal.any([adapter.abort.signal, signal]);
+        const rpc = await ctx.rpc.register(BackseatRpc, {
+          identity: async (input) =>
+            serve(async () => native.identity(input), "identity"),
+          bootstrap: async () =>
+            serve(async () => backend.bootstrap(), "bootstrap"),
+          inspect: async (input) =>
+            serve(() => backend.read(input.proof), "inspect"),
+          attach: async (input, context) =>
+            serve(async () => {
+              const result = await backend.attach(
+                input,
+                requestSignal(context.signal),
+              );
+              const observations = await Promise.allSettled(
+                [...core.projects.values()].map((project) =>
+                  project.observe?.(),
+                ),
+              );
+              for (const observation of observations)
+                if (observation.status === "rejected")
+                  observerLog("warn", "observer.degraded");
+              return result;
+            }, "attach"),
+          control: async (input, context) =>
+            traced("control", async () => {
+              if (adapter.abort.signal.aborted)
+                throw new Error("Project adapter is unavailable");
+              const result = await backend.control(
+                input,
+                requestSignal(context.signal),
+              );
+              return adapter.abort.signal.aborted && result.accepted
+                ? {
+                    accepted: true,
+                    reason:
+                      "Operation committed; serving project unloaded. Do not retry; attach and reconcile explicitly.",
+                  }
+                : result;
+            }),
+          suggest: async (input) =>
+            serve(() => backend.suggest(input), "suggest"),
+          observe: async (input) =>
+            serve(() => backend.readObservation(input, input.proof), "observe"),
+          validate: async (input) =>
+            serve(() => backend.validate(input), "validate"),
+          recover: async (input, context) =>
+            serve(async () => {
+              await backend.recover(
+                input,
+                undefined,
+                requestSignal(context.signal),
+              );
+              return backend.bootstrap();
+            }, "recover"),
+        });
+        cleanupSteps.push(() => rpc.dispose());
+        const registry = createCoordinationTools({
+          native,
+          backend,
+          canonical,
+          signal: adapter.abort.signal,
+          diagnostics,
+          async authorize(context) {
+            if (
+              !(await serve(() =>
+                matchesExecutionRole(context.sessionID, context.agent),
+              ))
+            )
+              throw new Error(
+                "Select Backseat Coordinator for coordination tools",
+              );
+          },
+        });
+        cleanupSteps.push(async () => {
+          registry.dispose();
+        });
+        const tools = await ctx.tool.transform((editor) => {
+          editor.namespace({
+            name: "backseat",
+            description:
+              "Native session discovery and explicit task coordination",
+          });
+          for (const tool of registry.tools) editor.add(tool);
+        });
+        cleanupSteps.push(() => tools.dispose());
+        log("info", "setup.completed");
+        return cleanup;
+      } catch (error) {
+        try {
+          await cleanup();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            "Registration failed; cleanup incomplete and runtime ownership retained",
+          );
+        } finally {
+          log("error", "setup.failed");
+        }
+        throw error;
       }
-      throw error;
-    }
-  },
+    },
+  });
+
+export default EffectPlugin.define({
+  id: "backseat",
+  effect: (ctx) =>
+    Effect.gen(function* () {
+      const diagnostics = yield* hostDiagnostics;
+      yield* fromPromise(promisePlugin(diagnostics)).effect(ctx);
+    }),
 });

@@ -1057,12 +1057,14 @@ export async function captureNativeOverview(
       typeof discovery === "string"
         ? `
 import {Plugin} from "@opencode/plugin";
+import {Plugin as EffectPlugin} from "@opencode/plugin/effect";
+import {fromPromise} from "@opencode/plugin/promise/adapter";
+import {Effect} from "effect";
 import {writeFileSync} from "node:fs";
 import product from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
 import {coordinatorAgent} from ${JSON.stringify(new URL("../src/coordinator-agent.ts", import.meta.url).href)};
 import {BackseatRpc} from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
-export default Plugin.define({id:"backseat",async setup(ctx){
-  const close=await product.setup({...ctx,options:{}});
+const probe=Plugin.define({id:"backseat.probe",async setup(ctx){
   let attachmentRequests=0;
   await ctx.permission.hook("evaluate",event=>{if(event.action==="backseat.attach")attachmentRequests++;});
   await ctx.session.hook("title",event=>{event.result="Owned coordination conversation"});
@@ -1087,8 +1089,11 @@ export default Plugin.define({id:"backseat",async setup(ctx){
   });
   await ctx.session.hook("http.request",()=>{throw new Error("Model transport is forbidden in native entry verification")});
   await ctx.session.hook("experimental.ws.handshake",()=>{throw new Error("Model WebSocket is forbidden in native entry verification")});
-  return close;
-}});`
+}});
+export default EffectPlugin.define({id:"backseat",effect:ctx=>Effect.gen(function*(){
+  yield* product.effect({...ctx,options:{}});
+  yield* fromPromise(probe).effect(ctx);
+})});`
         : modelServer
           ? nativeModelProbe(home, modelServer.endpoint)
           : 'import { Plugin } from "@opencode/plugin"; export default Plugin.define({id:"backseat.native-frame-probe",async setup(ctx){await ctx.session.hook("context",()=>{throw new Error("Model requests are forbidden in native rendering fixtures")});}});',
@@ -1234,7 +1239,11 @@ export default Plugin.define({id:"backseat",async setup(ctx){
           permissions: typeof coordinatorAgent.permissions;
           dispatchPermission?: { allowed: boolean; error?: string };
         }>(proofPath, (value) => !!value.sessionAgent);
-        return { frame, entry, terminal };
+        const hostLog = await readFile(
+          join(home, "data/opencode/log/opencode.log"),
+          "utf8",
+        );
+        return { frame, entry, terminal, hostLog };
       }
       if (discovery) {
         frame = await readCapture<NativeFrame>(framePath, (value) =>

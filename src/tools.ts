@@ -1,5 +1,10 @@
 import type { Info, ToolContext } from "@opencode/plugin/promise/tool";
-import type { NativeConnection } from "./native-connection.ts";
+import {
+  diagnosticContext,
+  type NativeConnection,
+  type DiagnosticEmitter,
+  type DiagnosticContext,
+} from "./native-connection.ts";
 import type { NativeBackend } from "./server.ts";
 import {
   NativeDiscovery,
@@ -30,6 +35,7 @@ export const COORDINATOR_TOOL_IDS = new Set([
   ...COORDINATION_TOOLS.map((name) => `backseat_${name}`),
 ]);
 export interface CoordinationToolPort {
+  diagnostics?: DiagnosticEmitter;
   native: NativeConnection;
   backend: Pick<
     NativeBackend,
@@ -310,13 +316,16 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   const native = async <T>(
     context: ToolContext,
     operation: Parameters<NativeConnection["read"]>[0],
+    diagnostics?: DiagnosticContext,
   ): Promise<T> => {
     try {
-      return (await port.native.read((client, signal) =>
-        operation(
-          client,
-          AbortSignal.any([signal, port.signal, context.signal]),
-        ),
+      return (await port.native.read(
+        (client, signal) =>
+          operation(
+            client,
+            AbortSignal.any([signal, port.signal, context.signal]),
+          ),
+        diagnostics,
       )) as T;
     } catch (error) {
       pages.clear();
@@ -332,7 +341,11 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     pages.set(id, page);
     return id;
   };
-  const sessions = async (v: Record<string, unknown>, context: ToolContext) => {
+  const sessions = async (
+    v: Record<string, unknown>,
+    context: ToolContext,
+    diagnostics: DiagnosticContext,
+  ) => {
     exact(v, [
       "statuses",
       "projectID",
@@ -411,15 +424,24 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       (row) => row.status === "unknown",
     ).length;
     if (!buffered.length && (!previous || next)) {
-      const page = await native<NativeInventory>(context, (client, signal) =>
-        readNativeInventory(client, next, signal, {
-          ...(projectID ? { projectID } : {}),
-          ...(location ? { location } : {}),
-          ...(search ? { search } : {}),
-          ...(parentID !== undefined ? { parentID } : {}),
-          includeArchived,
-          order,
-        }),
+      const page = await native<NativeInventory>(
+        context,
+        (client, signal) =>
+          readNativeInventory(
+            client,
+            next,
+            signal,
+            {
+              ...(projectID ? { projectID } : {}),
+              ...(location ? { location } : {}),
+              ...(search ? { search } : {}),
+              ...(parentID !== undefined ? { parentID } : {}),
+              includeArchived,
+              order,
+            },
+            diagnostics,
+          ),
+        diagnostics,
       );
       if (!page.available)
         return {
@@ -438,8 +460,11 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         throw new Error("Continuation did not advance; restart listing");
       rows = page.sessions;
     } else if (previous) {
-      rows = await native<Row[]>(context, (client, signal) =>
-        refreshNativeSessions(client, buffered, signal),
+      rows = await native<Row[]>(
+        context,
+        (client, signal) =>
+          refreshNativeSessions(client, buffered, signal, diagnostics),
+        diagnostics,
       );
       unknownCount = rows.filter((row) => row.status === "unknown").length;
       degraded = degraded || unknownCount > 0;
@@ -470,6 +495,12 @@ export function createCoordinationTools(port: CoordinationToolPort): {
             degraded,
           })
         : undefined;
+    diagnostics.emit("debug", "inventory.completed", {
+      returnedCount: result.length,
+      bufferedCount: remaining.length,
+      unknownCount,
+      continuation: Boolean(cursor),
+    });
     return {
       available: true,
       partial: Boolean(cursor) || degraded,
@@ -532,7 +563,11 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     {
       description: string;
       input: ReturnType<typeof inputSchema>;
-      run(v: Record<string, unknown>, context: ToolContext): Promise<unknown>;
+      run(
+        v: Record<string, unknown>,
+        context: ToolContext,
+        diagnostics: DiagnosticContext,
+      ): Promise<unknown>;
     }
   > = {
     list_sessions: {
@@ -605,11 +640,13 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       description:
         "List native project IDs, titles and canonical or sandbox locations for selecting worker targets. Takes {} and needs neither task-store authority nor TUI attachment. More than 200 choices reports unavailable, not a complete truncated catalog.",
       input: inputSchema({}),
-      async run(v, context) {
+      async run(v, context, diagnostics) {
         exact(v, []);
         return {
-          projects: await native(context, (client, signal) =>
-            new NativeDiscovery(client, signal).projects(),
+          projects: await native(
+            context,
+            (client, signal) => new NativeDiscovery(client, signal).projects(),
+            diagnostics,
           ),
         };
       },
@@ -627,13 +664,16 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         },
         ["location"],
       ),
-      async run(v, context) {
+      async run(v, context, diagnostics) {
         exact(v, ["location"]);
         const location = await canonical(v.location);
         return {
           location,
-          agents: await native(context, (client, signal) =>
-            new NativeDiscovery(client, signal).agents(location),
+          agents: await native(
+            context,
+            (client, signal) =>
+              new NativeDiscovery(client, signal).agents(location),
+            diagnostics,
           ),
         };
       },
@@ -670,7 +710,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
             "Case-insensitive substring search across task ID, title and goal.",
         },
       }),
-      run: tasks,
+      run: (v, context) => tasks(v, context),
     },
     get_task: {
       description:
@@ -915,15 +955,33 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       output: outputSchemas[name],
       options: { namespace: "backseat", codemode: true },
       async execute(input: unknown, context) {
-        alive(context);
-        await port.authorize(context);
-        alive(context);
-        const output = await specs[name].run(object(input), {
-          ...context,
-          signal: AbortSignal.any([port.signal, context.signal]),
-        });
-        alive(context);
-        return { output };
+        const diagnostics = diagnosticContext(port.diagnostics, "tool", name);
+        diagnostics.emit("debug", "tool.started");
+        try {
+          alive(context);
+          await port.authorize(context);
+          alive(context);
+          const output = await specs[name].run(
+            object(input),
+            {
+              ...context,
+              signal: AbortSignal.any([port.signal, context.signal]),
+            },
+            diagnostics,
+          );
+          alive(context);
+          diagnostics.emit("debug", "tool.completed");
+          return { output };
+        } catch (error) {
+          diagnostics.emit("error", "tool.failed", {
+            classification: port.signal.aborted
+              ? "disposed"
+              : context.signal.aborted
+                ? "cancelled"
+                : "unknown",
+          });
+          throw error;
+        }
       },
     })),
     dispose() {

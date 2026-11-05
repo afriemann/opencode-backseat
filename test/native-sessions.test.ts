@@ -4,6 +4,7 @@ import {
   readNativeInventory,
   type NativeSessionClient,
 } from "../src/native-sessions.ts";
+import { diagnosticContext } from "../src/native-connection.ts";
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Native session inventory", () => {
@@ -224,5 +225,33 @@ describe("Native session inventory", () => {
       partial: true,
       reason: expect.any(String),
     });
+    for (const phase of ["permissions", "forms"] as const) {
+      const degraded = fixture();
+      const fail = async () => {
+        throw new Error("PRIVATE_ASK_SENTINEL");
+      };
+      if (phase === "permissions")
+        degraded.client.permission.request.list = fail;
+      else degraded.client.session.form.list = fail;
+      const records: Record<string, unknown>[] = [];
+      const result = await readNativeInventory(
+        degraded.client,
+        undefined,
+        undefined,
+        {},
+        diagnosticContext((_level, event, fields) => {
+          if (event === "refresh.degraded") records.push(fields!);
+          throw new Error("Diagnostic sink unavailable");
+        }, "inventory"),
+      );
+      expect(result.sessions.map((row) => row.status)).toEqual([
+        "unknown",
+        "unknown",
+      ]);
+      expect(records).toContainEqual(
+        expect.objectContaining({ phase, count: 2 }),
+      );
+      expect(JSON.stringify(records)).not.toContain("PRIVATE_ASK_SENTINEL");
+    }
   });
 });

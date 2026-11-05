@@ -1,10 +1,119 @@
 import { OpenCode, type OpenCodeClient } from "@opencode/client";
 import { fallback, headers } from "@opencode/client/service";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { BackseatRpc } from "./rpc.ts";
+
+export const DIAGNOSTIC_EVENTS = [
+  "setup.started",
+  "setup.completed",
+  "setup.failed",
+  "setup.degraded",
+  "cleanup.completed",
+  "cleanup.failed",
+  "tool.started",
+  "tool.completed",
+  "tool.failed",
+  "rpc.started",
+  "rpc.completed",
+  "rpc.failed",
+  "native.started",
+  "native.completed",
+  "native.failed",
+  "inventory.completed",
+  "inventory.degraded",
+  "refresh.completed",
+  "refresh.degraded",
+  "observer.degraded",
+  "observer.failed",
+  "catalog.failed",
+] as const;
+export const DIAGNOSTIC_PHASES = [
+  "registration",
+  "client",
+  "service",
+  "incarnation",
+  "revalidation",
+  "operation",
+  "completion",
+  "list",
+  "activity",
+  "permissions",
+  "forms",
+  "refresh",
+  "stream",
+  "shutdown",
+  "intake",
+] as const;
+export const DIAGNOSTIC_FAILURES = [
+  "timeout",
+  "disposed",
+  "cancelled",
+  "validation",
+  "transport",
+  "unavailable",
+  "unknown",
+] as const;
+export type DiagnosticLevel = "debug" | "info" | "warn" | "error";
+export type DiagnosticEmitter = (
+  level: DiagnosticLevel,
+  event: (typeof DIAGNOSTIC_EVENTS)[number],
+  fields?: Record<string, unknown>,
+) => void;
+export type DiagnosticOperation =
+  | "setup"
+  | "cleanup"
+  | "tool"
+  | "rpc"
+  | "native"
+  | "inventory"
+  | "refresh"
+  | "observer";
+
+export class DiagnosticToken {
+  readonly #value = randomUUID();
+  static read(token: DiagnosticToken): string {
+    return token.#value;
+  }
+}
+export interface DiagnosticContext {
+  emit: DiagnosticEmitter;
+}
+export function diagnosticContext(
+  diagnostics: DiagnosticEmitter | undefined,
+  operation: DiagnosticOperation,
+  action?: string,
+): DiagnosticContext {
+  let correlation: DiagnosticToken | undefined;
+  try {
+    correlation = new DiagnosticToken();
+  } catch {
+    /* Diagnostics cannot block work. */
+  }
+  const started = performance.now();
+  return {
+    emit(level, event, fields) {
+      try {
+        diagnostics?.(level, event, {
+          ...fields,
+          operation,
+          action,
+          correlation,
+          durationMs: performance.now() - started,
+        });
+      } catch {
+        /* Injected emitters are not trusted to preserve outcomes. */
+      }
+    },
+  };
+}
 
 const REGISTRATION_BYTES = 16_384;
 const REQUEST_TIMEOUT = 10_000;
@@ -150,6 +259,7 @@ function registration(
 export interface NativeConnection {
   read<T>(
     operation: (client: OpenCodeClient, signal: AbortSignal) => Promise<T>,
+    diagnostics?: DiagnosticContext,
   ): Promise<T>;
   identity(input: { nonce: string; origin: string }): { mac: string };
   dispose(): void;
@@ -160,6 +270,7 @@ export function createNativeConnection(options: {
   version: string;
   registration?: () => Promise<unknown>;
   fetch?: typeof globalThis.fetch;
+  diagnostics?: DiagnosticEmitter;
 }): NativeConnection {
   const lifetime = new AbortController();
   const secret = randomBytes(32);
@@ -190,17 +301,24 @@ export function createNativeConnection(options: {
     };
   };
   return {
-    async read(operation) {
+    async read(operation, context) {
+      const diagnostics =
+        context ?? diagnosticContext(options.diagnostics, "native");
+      let phase: (typeof DIAGNOSTIC_PHASES)[number] = "registration";
+      let deadline: AbortSignal | undefined;
+      let callerSignal: AbortSignal | undefined;
+      let transportFailed = false;
+      diagnostics.emit("debug", "native.started", { phase });
       try {
         lifetime.signal.throwIfAborted();
         const registered = registration(await source(), options.version);
-        const signal = AbortSignal.any([
-          lifetime.signal,
-          AbortSignal.timeout(REQUEST_TIMEOUT),
-        ]);
+        deadline = AbortSignal.timeout(REQUEST_TIMEOUT);
+        const signal = AbortSignal.any([lifetime.signal, deadline]);
+        phase = "client";
         const guarded: typeof fetch = Object.assign(
           async (input: string | URL | Request, init?: RequestInit) => {
             const request = new Request(input, init);
+            callerSignal = request.signal;
             const url = new URL(request.url);
             if (
               url.origin !== registered.origin ||
@@ -210,9 +328,15 @@ export function createNativeConnection(options: {
               throw unavailable("request escaped its origin");
             const combined = AbortSignal.any([signal, request.signal]);
             combined.throwIfAborted();
-            const response = await transport(
-              new Request(request, { redirect: "error", signal: combined }),
-            );
+            let response: Response;
+            try {
+              response = await transport(
+                new Request(request, { redirect: "error", signal: combined }),
+              );
+            } catch (error) {
+              transportFailed = true;
+              throw error;
+            }
             if (
               (response.status >= 300 && response.status < 400) ||
               response.redirected
@@ -240,6 +364,7 @@ export function createNativeConnection(options: {
           ...(authentication ? { headers: authentication } : {}),
           fetch: guarded,
         });
+        phase = "service";
         const info = await client.server.info({ signal });
         if (info.pid !== process.pid || info.version !== options.version)
           throw unavailable("identity does not match this host");
@@ -247,6 +372,7 @@ export function createNativeConnection(options: {
           nonce: randomBytes(32).toString("hex"),
           origin: registered.origin,
         };
+        phase = "incarnation";
         const proof = await client.rpc(BackseatRpc).identity(challenge, {
           location: { directory: options.location },
           signal,
@@ -260,21 +386,39 @@ export function createNativeConnection(options: {
           )
         )
           throw unavailable("incarnation does not match this host");
+        phase = "revalidation";
         if (
           registration(await source(), options.version).fingerprint !==
           registered.fingerprint
         )
           throw unavailable("registration changed");
+        phase = "operation";
         const result = await operation(client, signal);
         signal.throwIfAborted();
+        phase = "revalidation";
         if (
           registration(await source(), options.version).fingerprint !==
           registered.fingerprint
         )
           throw unavailable("registration changed");
         signal.throwIfAborted();
+        diagnostics.emit("debug", "native.completed", { phase: "completion" });
         return result;
       } catch (error) {
+        diagnostics.emit("error", "native.failed", {
+          phase,
+          classification: lifetime.signal.aborted
+            ? "disposed"
+            : deadline?.aborted
+              ? "timeout"
+              : callerSignal?.aborted
+                ? "cancelled"
+                : error instanceof NativeConnectionError
+                  ? "validation"
+                  : transportFailed
+                    ? "transport"
+                    : "unknown",
+        });
         // Native errors may embed URLs, headers or registration contents.
         if (error instanceof NativeConnectionError) throw error;
         throw unavailable(
