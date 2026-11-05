@@ -1,150 +1,94 @@
 # opencode-backseat
 
-Native coordination for parallel OpenCode sessions. Development targets OpenCode 2.2.5; later 2.x hosts require compatibility verification.
+Coordinate parallel OpenCode sessions from one conversation. Backseat helps you
+find sessions, start workers in different projects, and assign work to existing
+sessions without switching between them.
 
-Backseat identifiers have no compatibility aliases. Default storage selection does not discover, read, migrate or delete stores under another product name. An absolute `dataDir` selects an existing store explicitly without changing its format.
+Use the **Backseat Coordinator** agent for everyday coordination. An optional
+terminal overview adds automatic follow-ups for tasks you want to supervise.
 
-Different product identities use independent runtime cores and default stores; they do not reconcile each other's workers. The checkout ignores `/.opencode/backseat/`, not local state directories under other product names.
+## Getting started
 
-## Conversational coordination
+Backseat targets **OpenCode 2.2.5 (V2)** on Linux, with **Bun 1.4.4** and
+`/usr/bin/flock`. Development also requires Node.js 22.5 or later. Compatibility
+with later OpenCode versions has not been verified.
 
-Select **Backseat Coordinator** (`backseat-coordinator`) in OpenCode's agent picker. Ask it to list sessions, take over an existing session, or start a session in a selected project. Ordinary coordination needs no TUI attachment, observer or automation arming.
+1. In a checkout of this repository, run `make install` to install dependencies.
+2. Add the plugin to your project's `opencode.json` or `opencode.jsonc`, replacing
+   the path below with the absolute path to your checkout:
 
-The coordinator discovers sessions across all projects on the same authenticated native service, including sessions with no Backseat task binding. Inventory contains session identity, title, project identity and location, agent, parent session, explicit `topLevel` and `archived` flags, and native `running`, `waiting`, `inactive` or `unknown` status. `waiting` means a pending permission or form, not an idle conversation awaiting another message. Unknown status is not a completion claim. Project and agent catalogs resolve targets without requiring internal identifiers; ambiguous selections still need clarification.
+   ```jsonc
+   {
+     "$schema": "https://opencode.ai/config.json",
+     "plugins": [{ "package": "/absolute/path/to/opencode-backseat" }],
+   }
+   ```
 
-The connection uses OpenCode's native service registration automatically, without endpoint or credential settings. Only a safe local registration identifying the hosting process and plugin incarnation is accepted. Unregistered, incompatible or different services report unavailable rather than starting a service or switching endpoints. Native listing remains available independently of task-store ownership; task mutations still need the selected store's authority and native operation-specific approval.
+3. Select **Backseat Coordinator** (`backseat-coordinator`) in OpenCode's agent
+   picker and tell it what you want to coordinate.
 
-### Code Mode API
+Add the same plugin entry to each project where you want Backseat to manage work.
+You don't need global configuration or a separate coordinator conversation in
+every project. The plugin does not change your default agent or model.
 
-Discover the namespace with `search({namespace: "backseat"})` inside `execute`, then call the exact returned paths. All coordination tools return structured results. Native inventory never includes conversations, form answers, inbox payloads or journal contents. The generic conversational inspection and control multiplexers are not exposed; the optional TUI retains its protected internal RPC.
+## Everyday use
 
-| Tool                                                 | Purpose                                                                       |
-| ---------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `backseat.list_sessions`                             | Filter hierarchical native session metadata and follow private continuations. |
-| `backseat.list_projects`                             | List project IDs and canonical or sandbox locations.                          |
-| `backseat.list_agents`                               | List eligible worker agents at a canonical `location`.                        |
-| `backseat.list_tasks` / `backseat.get_task`          | Filter durable bindings or inspect one task's records.                        |
-| `backseat.create_session` / `backseat.adopt_session` | Create and assign an approved task, or bind an existing top-level session.    |
-| `backseat.take_over_task` / `backseat.dispatch_task` | Fence automation or submit an explicitly requested assignment.                |
-| `backseat.hold_task` / `backseat.share_context`      | Hold a task or select approved shared context versions.                       |
-| `backseat.recover_runtime`                           | Recover runtime ownership without arming automation.                          |
-| `backseat.delete_session`                            | Approve native recursive-subtree deletion with history retention.             |
+Start with requests like these:
 
-`list_sessions` accepts `statuses`, `projectID`, canonical `location`, `taskIDs`, `agent`, native-service `search`, `parentID`, `includeSubagents`, `includeArchived`, `limit`, `order` and `cursor`. Search matching is owned by the native service, without a second local title matcher. Statuses may be combined; the default is `running`, `waiting` and `inactive`, excluding `unknown`. Subagent sessions are excluded by default: omit `includeSubagents` or pass `false` for roots only; pass `true` for roots and child sessions. Explicit `parentID` overrides `includeSubagents`: pass `null` for roots or an ID for its direct children, not recursive descendants. Archived sessions require `includeArchived: true`; unavailable live status remains `unknown`, so include that status when inspecting archived sessions.
+- "Show me the running sessions across my projects."
+- "Start a worker in this project to investigate the failing tests."
+- "Take over the session titled 'API cleanup'."
+- "Ask that worker to run the test suite and report the results."
 
-Each session row includes numeric `createdAt` and `updatedAt`, in Unix milliseconds, from OpenCode's creation and last-update timestamps. `updatedAt` includes renames and metadata changes, not just conversation activity. Successful detail reads refresh these values, including on continuations; failed detail reads retain the available timestamps with unknown status.
+Before starting a worker, agree on the goal, success criteria, constraints, and
+scope. Backseat asks for approval before creating a worker or sending an
+assignment. It can also discover sessions that weren't created through Backseat.
 
-Calls return at most `limit` rows (default 50, maximum 200), scan at most 200 native rows, and perform bounded parallel status reads. `partial`, `unknownCount` and a short `cursor` distinguish incomplete discovery from no matches. A filtered page may be empty and still have a continuation. Pass the returned cursor unchanged and repeat the same filters, `limit` and `order` (default `desc`); never substitute a redacted native cursor. Handles are caller/query/instance bound, expire after five minutes, and may be evicted after 128 retained continuations. Restart listing without a cursor after expiry, reload or a query change. Status is observational, not a transactionally consistent global snapshot.
+Taking over an existing session doesn't send it a message or interrupt its
+current work. Only top-level sessions can be taken over, not their subagents.
+Workers still need you to answer their permission requests and questions.
 
-Plain native discovery needs no task-store authority. `taskIDs`, task catalogs and task mutations require the owned shared store and fail explicitly if unavailable. `list_tasks` accepts `statuses`, `location`, `group`, `workerID`, `taskIDs` and `search`; `get_task` requires `taskID`. Project and agent catalogs exceeding 200 choices report unavailable rather than a silently complete truncated list.
+Listing sessions and assigning work do **not** require the terminal overview or
+automatic supervision. Creating a worker starts its approved task, but does not
+enable automatic follow-ups.
 
-## Worker creation
+Deleting a session requires separate approval and also deletes its child
+sessions. Backseat retains its own task history, so deletion is not a full data
+purge.
 
-A task identifies its goal, success criteria, constraints, scope, project location and available agent. Creation checks the target, requires operation-bound native approval, and starts only that worker with the approved task immediately. Automatic follow-ups remain disabled. Existing workers are not silently reassigned.
+## Optional automatic supervision
 
-Adopting or taking over an existing session requires it to be top-level, checked before and after native approval. Child sessions remain visible in discovery but cannot be independently taken over. Adoption rechecks location and agent, rejects competing bindings including those appearing during approval, and never copies existing history into another task. It sends no prompt, interrupts no running turn and changes no worker agent.
+Use `/coordinate` to open the terminal overview. To enable automatic follow-ups,
+choose **Coordinate: attach observer (native approval)**, then
+**Coordinate: explicitly rearm reconciled observer**. Opening the overview alone
+does not enable automation.
 
-Manual takeover of an existing binding suspends automatic follow-ups and invalidates the task epoch without resetting consumed limits. `dispatch_task` with `{taskID, text, scope}` declares a nonempty subset of the binding's confirmed scope and sends the explicitly requested assignment with native approval of the exact payload. The backend checks declared scope, not the meaning of free text. Repeated assignments need neither resume nor arming and consume no automatic follow-up allowance. The coordinator checks session status before assigning work and stops for pending human input; dispatch never detects or answers a worker's permission or form request.
+Supervision checks progress against the agreed task and can send follow-ups
+within its scope. By default, it allows up to eight active workers and three
+automatic follow-ups per task. It pauses when a worker needs human input or its
+state can't be verified; it does not answer permission requests for you.
 
-Each assignment reserves its native delivery ID durably before sending. Lost acknowledgement or failed publication retains the original ID across reload and blocks another send until native delivery reads establish admission; it is never resent automatically. Manual records use the existing version-1 ledger with distinct provenance. Existing stores remain readable without migration; older plugin readers reject stores containing manual records.
+After a disconnect, reconcile the current state and explicitly rearm supervision.
+Disconnecting prevents new automatic assignments, but does not cancel work
+already sent to a worker.
 
-### Session deletion
+## Troubleshooting
 
-`delete_session({sessionID})` requires operation-specific native approval to stop active execution and recursively delete the native subtree. Approval covers native subtree semantics, including descendants created or reparented concurrently; the native API cannot atomically restrict deletion to a pre-enumerated set. The invoking coordinator and its verified ancestors are protected, and incomplete or cyclic ancestry fails closed.
+- **Coordination is unavailable:** check the OpenCode version and Linux
+  prerequisites. From the checkout, `make prerequisites` checks the platform and
+  `flock`; it does not install missing tools.
+- **A task is held:** inspect its status and resolve any pending permission or
+  question. Don't resend an assignment whose delivery is uncertain.
+- **You need logs:** look for `backseat` in OpenCode's host log. On the verified
+  Linux host this is `~/.local/share/opencode/log/opencode.log`, or the equivalent
+  under `$XDG_DATA_HOME`. Other release channels may use a different log filename.
 
-Deletion fences known affected tasks before removal and retains their bindings, counters, shared/completion history and every delivery identity. It cannot revoke an already admitted or in-flight automatic prompt. The existing store retains at most 200 deletion records, including successful outcomes, without silent pruning. Collected subtrees overlapping retained deletions are rejected before approval and removal.
+Backseat stores coordination state in `$XDG_DATA_HOME/opencode-backseat`, falling
+back to `~/.local/share/opencode-backseat`. Projects share this store; it is not a
+project directory you need to open. If Backseat reports a storage or ownership
+problem, inspect the reported cause rather than deleting its state or lockfile.
 
-`get_task` exposes associated pending, deleted or uncertain outcomes alongside current native presence evidence. A bounded complete native inventory can report observed absence; partial or failed reads remain unknown. Evidence inspection never rewrites an uncertain outcome as successful deletion or proven non-delivery and never repeats removal. A cancellation proven to precede native invocation removes its unissued journal reservation when storage authority remains available; shutdown or publication failure retains conservative uncertainty.
+## Contributing
 
-## Context boundaries
-
-Evaluation inputs contain only the approved task and its worker evidence. Unrelated coordinator history is excluded. Shared snapshots require an explicitly selected version, matching group and authorised recipient; group membership alone does not share anything. Revocation changes future inputs, not past worker history. Evidence and snapshots never grant approval or widen task scope. Missing or oversized input produces a hold rather than silent truncation.
-
-## Supervision and ownership
-
-The supervision core uses task-scoped suggestions, current observer/goal/turn checks and durable intent reservations. It defers known running work and holds unknown background state. Pending human asks invalidate decisions; automatic text never supplies consent. Defaults are eight active workers, three automatic follow-ups per task, a twenty-minute decision expiry and a hold after two consecutive non-progress decisions. Reload and reconnect do not reset consumed limits.
-
-Completion requires inspectable tool evidence for every approved criterion and a trusted native validation step. A worker success claim alone is insufficient. Lost acknowledgement is reconciled by the original prompt ID or held; it is never blindly resent. Disconnect stops future admission, not work already admitted. Reconnect inventories current state and requires explicit rearming.
-
-Suggestion and validation requests require current observer possession and share an eight-request in-flight budget. Retained state is bounded to 200 task bindings, 200 shared snapshot versions, 800 delivery intents, 200 completions and 8 MiB of UTF-8 JSON. New operations are rejected when the budget is full; unresolved delivery identities and completion provenance are never silently pruned. Inspection shows only successfully persisted state. Completion history retains native identities, fingerprints and criterion rationales, not raw tool inputs or results.
-
-Native observation and exact-ID reconciliation inspect at most 200 messages and 1,000 journal events. A longer or unreadable history is held rather than truncated into a false settlement proof. Continuing such work requires an explicitly approved fresh worker/task binding; existing history is not automatically imported.
-
-The ownership core rejects occupied or unsafe authority locations. Stale-owner recovery requires proof the prior owner stopped, native approval and a separate rearm. Disposal drains old effects before releasing only its own lock. Observer control uses a TUI-local Ed25519 private key and an approved server-side public verifier; requests are operation, task revision, epoch, generation and sequence bound. Replay and obsolete authority are rejected.
-
-Loading the package does not approve an observer, arm supervision or authorise a task. Those remain separate native control actions.
-
-## Project-local loading
-
-Fill the portable package placeholder in `examples/opencode.jsonc`, then use that plugin entry in each participating project's `opencode.json(c)`. No global configuration is required. Conversation locations and explicitly selected worker projects are independent of coordination storage.
-
-The plugin bundles the coordinator without changing your default agent or model. Confirm the task's criteria, constraints and scope before creation or adoption. Selecting a coordinator separately in each worker project is unnecessary.
-
-State and ownership use `$XDG_DATA_HOME/opencode-backseat`, or `~/.local/share/opencode-backseat` when XDG_DATA_HOME is unset, empty or relative. The optional plugin option `dataDir` selects an absolute private directory instead. All participating projects in a service share the first registered store; a conflicting override holds coordination instead of opening another authority. The directory is data storage, not a project to navigate to. Unsafe permissions, corrupt or missing initialized state, and incomplete publication hold coordination without resetting limits or unresolved deliveries. Existing project-local state is neither imported nor deleted.
-
-Home and XDG ancestor directories may be group-writable (`0775` or `02775`); no permission changes are required for those modes. Both native service discovery and shared storage require real directories owned by root or your UID. Other-writable ancestors require sticky protection and root/current-UID ownership of their immediate children. The final Backseat directory remains private (`0700`), its state and lock files remain `0600`, and native registration remains UID-private. Existing permissions are never repaired automatically.
-
-This policy trusts group/ACL-authorized ancestor writers. If another UID actually has write and search access to a non-sticky ancestor, it can disrupt or restore subtrees, roll state back, or break lock continuity despite private files and identity checks. Use ancestry without untrusted writers when that protection is required. Native discovery errors identify the rejected ancestor and its type, ownership or non-sticky other-write condition; the shared-storage held error can also indicate corruption or incomplete state.
-
-Coordination requires the dedicated role's exact identifier, instructions, visible primary mode and ordered permission prefix. OpenCode may append general permissions without making this role unavailable. The plugin allows `execute`, user questions and only the exact coordination tool IDs, including inside compositions; inherited grants do not permit unrelated nested tools. Permission to execute code is not approval for a mutation: native operation-specific approval and configured denials remain authoritative. An identical configured copy receives those same restrictions, not a guarantee of bundled authorship. Differently defined user agents are preserved unchanged and cannot act as the coordinator. Matching coordinator roles cannot be used as workers; unrelated user roles remain available for worker tasks.
-
-One coordinator conversation can manage approved workers in other participating projects through the shared store. Recognition uses the conversation's project; every worker keeps its explicitly selected project, agent, scope and native approval requirements. Selecting a coordinator separately in each worker project is unnecessary.
-
-### Optional automatic supervision
-
-Use `/coordinate` only when you want automatic follow-ups or the optional terminal overview. Automatic follow-ups require **Coordinate: attach observer (native approval)** followed by **Coordinate: explicitly rearm reconciled observer**. Attachment and rearming are separate, explicit actions. Resume requires the approved TUI's signed, fresh native reconciliation and operation-bound approval; stale state or pending human requests leave automation held. Bare conversational resume cannot establish eligibility. Denying a replacement observer preserves the approved observer.
-
-Before attachment, the TUI receives only store identity and availability metadata. Full inventory requires approved attachment and a current signed request; conversational inspection requires the actual dedicated native role. A missing, stale, uncorrelated or nonempty worker observation holds supervision. Disconnect stops future admission, not an already admitted operation; reconnect requires fresh inventory and explicit rearming.
-
-Recovery returns availability metadata, not task inventory, and requires separate attachment and rearming. If an operation commits after read eligibility changes, the TUI withholds inventory and reports the committed outcome: do not retry it; attach and reconcile explicitly.
-
-Background suggestions and validation use OpenCode's resolved default model for the initiating coordinator's project, not the conversation's selected model, worker model or title agent. There is no separate plugin model setting. Unavailable default-model lookup or generation holds the evaluation without a fallback or worker dispatch. Each suggestion receives one bounded task-only validation pass. A validation receipt is bound to current scope, generation, native boundary, evidence and shared versions. Completion records validated criterion-to-native-call relationships and bounded rationales, not assistant success claims or caller-supplied criterion tags. Validation never grants consent, and recording does not trigger another model pass.
-
-At narrow terminal widths, use **Coordinate: inspect shared versions** (`Alt+V`) for keyboard-accessible full snapshot identifiers and versions instead of relying on clipped overview descriptions.
-
-When the overview is unavailable, **Status** (`Alt+I`, or the read-only status command in the palette) exposes the full affected task/worker identities and reconciliation reason. These detail rows cannot grant approval or mutate worker state.
-
-## Diagnostics
-
-Backseat writes structured diagnostics through OpenCode's host logger, including the managed background service's log file. On the verified OpenCode 2.2.5 stable Linux host, read `~/.local/share/opencode/log/opencode.log` (or `$XDG_DATA_HOME/opencode/log/opencode.log`). Other channels can use `opencode-<channel>.log`; check the host's log directory. Filter for `backseat` and the event name.
-
-Host log-level filtering applies. `info` records setup and cleanup, `warn` records degraded inventory or observation, and `error` records failed operations. Enable the host's debug level, `OPENCODE_LOG_LEVEL=DEBUG`, when starting an isolated diagnostic host for operation starts/completions and pagination detail. Changing a client process's environment does not reconfigure an already running background service.
-
-Records contain a constant service and event, fixed operation/action/phase and failure categories, elapsed milliseconds, aggregate counts and continuation-presence flags. Refresh failure counts represent affected sessions, including sessions sharing a failed permissions snapshot. Native failures distinguish timeout, disposal, cancellation, validation, transport and unknown failures without changing the user-facing error. Phase identifies registration, client construction, service/incarnation verification, revalidation or the native operation.
-
-Native request failures (`native.request.failed`) are warning-level; successful requests (`native.request.completed`) require debug logging. Each native read emits at most 32 individual request records, including service and identity verification; `native.request.suppressed` summarizes additional failures by category on exit. Requests are not retried.
-
-Non-2xx responses are request failures, even when the caller handles the status. Error-code extraction accepts only own string data properties on the exception or its immediate cause. DOMException aborts with inherited numeric codes therefore report `unknown`; deadline snapshots and enclosing failure classifications still distinguish the shared timeout.
-
-| Field               | Meaning                                                                                                                                                              |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `requestCategory`   | Fixed request label: `info`, `identity`, `projects`, `agents`, `sessions`, `activity`, `session`, `permissions`, `forms`, `form`, `inbox`, `messages`, or `unknown`. |
-| `requestDurationMs` | Monotonic elapsed time from request observation to response headers or fetch rejection, not body download or SDK parsing.                                            |
-| `httpStatus`        | HTTP response status from 100 through 599, when available.                                                                                                           |
-| `errorCode`         | Allowlisted transport code from the exception or its immediate cause; otherwise `unknown`. No exception text is included.                                            |
-
-At the shared deadline, `native.requests.deadline` reports the number of active fetches. `native.request.active` reports each active category's count and oldest elapsed time. A zero count attributes the timeout to no endpoint: work outside fetch, including body parsing after headers, is not observed. These records preserve the existing read correlation, deadline, cancellation and caller-visible errors.
-
-Correlation tokens are generated only for diagnostics, connect related internal work, and change on each continuation call. They cannot identify individual host sessions. Logs exclude native identifiers, continuation values, paths, URLs, credentials, exception messages/stacks, prompts, titles and payloads. Detailed registration errors remain available to the invoking caller. Failed logging, including late diagnostics after plugin unload, is dropped without retry, stderr fallback or coordination changes.
-
-## Development
-
-Native ownership requires Linux, the verified Bun 1.4.4 runtime and a trusted executable `/usr/bin/flock`. Other runtimes remain held until their descriptor behavior is verified.
-Run `make prerequisites` for the basic platform/helper check. The ownership
-adapter also verifies path safety and actual exclusion; this check alone does
-not establish filesystem safety. No helper is automatically installed.
-
-The runtime lock inode is permanent at `dataDir/ownership.lock` alongside the private state envelope.
-A short nonblocking helper acquires kernel ownership through an inherited
-descriptor; the coordinator retains that descriptor. Recovery never deletes
-or replaces the lockfile and never resumes workers automatically. Real Bun
-descriptor-retention and recovery regressions gate reliance on this adapter.
-
-The UI goldens inventory native-dialog content at wide and narrow sizes; they
-are not OpenCode renderer captures. `make native-test` separately exercises
-the installed private host, real rendering and keyboard input, and deterministic
-loopback model responses without external model credentials or the managed service.
-
-Use `make help` to list checks. `make install` installs pinned development packages; `make test` runs behavioral tests. These commands do not activate the plugin in your managed OpenCode service.
-
-An individual suite can be selected with `make test TEST_PATH=./test/worker-coordination.test.ts`. Use `make typecheck`, `make lint`, `make coverage` and `make hooks` for the corresponding project checks.
+See [AGENTS.md](AGENTS.md) for the architecture, source map, development setup,
+and contribution workflow. Run `make help` for available checks.
