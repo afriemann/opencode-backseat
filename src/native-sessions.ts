@@ -3,6 +3,7 @@ import { isCoordinatorAgent } from "./coordinator-agent.ts";
 import type { WorkerBinding } from "./state.ts";
 import type { DispatchIntent } from "./dispatch.ts";
 import type { ProjectChoice, WorkerChoice } from "./ui.ts";
+import type { DiagnosticContext } from "./native-connection.ts";
 
 export type NativeClient = OpenCodeClient;
 export const NATIVE_BOUNDS = Object.freeze({
@@ -23,6 +24,7 @@ export type NativeSessionClient = NativeAskClient & {
     inbox: Pick<NativeClient["session"]["inbox"], "list">;
   };
 };
+type AskFailurePhase = "permissions" | "forms";
 
 export async function readNativeAsks(
   client: NativeAskClient,
@@ -31,15 +33,36 @@ export async function readNativeAsks(
   permissionsSnapshot?: Promise<
     Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
   >,
+  onFailure?: (phase: AskFailurePhase) => void,
 ): Promise<readonly string[]> {
+  const diagnosed = <T>(
+    work: Promise<T>,
+    phase: AskFailurePhase,
+  ): Promise<T> => {
+    if (!onFailure) return work;
+    return work.catch((error) => {
+      try {
+        onFailure(phase);
+      } catch {
+        /* Diagnostics preserve the native failure. */
+      }
+      throw error;
+    });
+  };
   const request = signal ? { signal } : undefined;
   const [permissions, forms] = await Promise.all([
-    permissionsSnapshot ??
-      client.permission.request.list(
-        { location: { directory: binding.location } },
-        request,
-      ),
-    client.session.form.list({ sessionID: binding.workerID }, request),
+    diagnosed(
+      permissionsSnapshot ??
+        client.permission.request.list(
+          { location: { directory: binding.location } },
+          request,
+        ),
+      "permissions",
+    ),
+    diagnosed(
+      client.session.form.list({ sessionID: binding.workerID }, request),
+      "forms",
+    ),
   ]);
   if (
     permissions.location.directory !== binding.location ||
@@ -52,9 +75,12 @@ export async function readNativeAsks(
     .filter((r) => r.sessionID === binding.workerID)
     .map((r) => `permission:${r.id}`);
   for (const form of forms) {
-    const detail = await client.session.form.get(
-      { sessionID: binding.workerID, formID: form.id },
-      request,
+    const detail = await diagnosed(
+      client.session.form.get(
+        { sessionID: binding.workerID, formID: form.id },
+        request,
+      ),
+      "forms",
     );
     if (detail.id !== form.id || detail.sessionID !== binding.workerID)
       throw new Error("Form inventory does not match the selected worker");
@@ -164,6 +190,7 @@ export async function readNativeLiveState(
       Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
     >;
   },
+  onAskFailure?: (phase: AskFailurePhase) => void,
 ): Promise<{
   worker: Awaited<ReturnType<NativeClient["session"]["get"]>>;
   active: Awaited<ReturnType<NativeClient["session"]["active"]>>;
@@ -176,7 +203,13 @@ export async function readNativeLiveState(
     snapshot
       ? Promise.resolve(snapshot.active)
       : client.session.active(request),
-    readNativeAsks(client, binding, signal, snapshot?.permissions),
+    readNativeAsks(
+      client,
+      binding,
+      signal,
+      snapshot?.permissions,
+      onAskFailure,
+    ),
     client.session.inbox.list({ sessionID: binding.workerID }, request),
   ]);
   if (
@@ -219,7 +252,9 @@ export async function readNativeInventory(
     includeArchived?: boolean;
     order?: "asc" | "desc";
   } = {},
+  diagnostics?: DiagnosticContext,
 ): Promise<NativeInventory> {
+  let phase = "list";
   try {
     const request = signal ? { signal } : undefined;
     const page = await client.session.list(
@@ -240,12 +275,19 @@ export async function readNativeInventory(
       new Set(page.data.map((w) => w.id)).size !== page.data.length
     )
       throw new Error("Incomplete native inventory");
+    phase = "refresh";
     const sessions = await refreshNativeSessions(
       client,
       page.data.map(sessionMetadata),
       signal,
+      diagnostics,
     );
     const next = page.cursor.next ?? undefined;
+    diagnostics?.emit("debug", "inventory.completed", {
+      phase,
+      count: sessions.length,
+      continuation: Boolean(next),
+    });
     return {
       available: true,
       partial: Boolean(next) || sessions.some((s) => s.status === "unknown"),
@@ -254,6 +296,11 @@ export async function readNativeInventory(
     };
   } catch {
     signal?.throwIfAborted();
+    diagnostics?.emit("warn", "inventory.degraded", {
+      phase,
+      classification: "unavailable",
+      continuation: Boolean(cursor),
+    });
     return {
       available: false,
       partial: true,
@@ -283,11 +330,16 @@ export async function refreshNativeSessions(
   client: NativeSessionClient,
   rows: readonly NativeInventory["sessions"][number][],
   signal?: AbortSignal,
+  diagnostics?: DiagnosticContext,
 ): Promise<NativeInventory["sessions"]> {
   if (rows.length > NATIVE_BOUNDS.catalogRows)
     throw new Error("Native inventory exceeds its bound");
   const request = signal ? { signal } : undefined;
   const sessions: NativeInventory["sessions"] = [];
+  const askFailures: Record<AskFailurePhase, number> = {
+    permissions: 0,
+    forms: 0,
+  };
   const active = await client.session.active(request).catch(() => undefined);
   const permissions = new Map<
     string,
@@ -320,6 +372,9 @@ export async function refreshNativeSessions(
         },
         signal,
         { active, permissions: permissions.get(location)! },
+        (phase) => {
+          askFailures[phase]++;
+        },
       );
       metadata = sessionMetadata(state.worker);
       status = state.asks.length
@@ -357,6 +412,26 @@ export async function refreshNativeSessions(
     )
       session.status = "unknown";
   signal?.throwIfAborted();
+  const unknownCount = sessions.filter(
+    (session) => session.status === "unknown",
+  ).length;
+  for (const phase of ["permissions", "forms"] as const)
+    if (askFailures[phase])
+      diagnostics?.emit("warn", "refresh.degraded", {
+        phase,
+        count: askFailures[phase],
+        classification: "unavailable",
+      });
+  diagnostics?.emit(
+    unknownCount ? "warn" : "debug",
+    unknownCount ? "refresh.degraded" : "refresh.completed",
+    {
+      phase: !active || !after ? "activity" : "refresh",
+      ...(unknownCount ? { classification: "unavailable" } : {}),
+      count: sessions.length,
+      unknownCount,
+    },
+  );
   return sessions;
 }
 

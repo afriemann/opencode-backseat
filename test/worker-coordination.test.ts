@@ -50,7 +50,8 @@ import {
   type SignedControl,
   type OwnershipPort,
 } from "../src/ownership.ts";
-import nativePlugin, {
+import {
+  promisePlugin,
   createNativeBackend,
   createWorkerObserver,
   type NativeBackendHost,
@@ -64,6 +65,8 @@ import type {
   Info as NativeTool,
   ToolEditor,
 } from "@opencode/plugin/promise/tool";
+
+const nativePlugin = promisePlugin(() => {});
 
 type NativeAgent = NonNullable<ReturnType<AgentEditor["get"]>>;
 type NativeExecutionEvent = Pick<
@@ -2255,7 +2258,8 @@ describe("Filesystem coordinator authority", () => {
       try {
         const output = await runChild(`
           import {spyOn} from "bun:test";
-          import nativePlugin from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
+          import {promisePlugin} from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
+          const nativePlugin=promisePlugin(()=>{});
           import * as ownership from ${JSON.stringify(new URL("../src/ownership.ts", import.meta.url).href)};
           const directory=${JSON.stringify(directory)};
           let finish, failing=false, unhandled=0, releases=0;

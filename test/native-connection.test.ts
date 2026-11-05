@@ -6,10 +6,15 @@ import {
 } from "../src/native-connection.ts";
 import { constants, Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
+import { Effect, Logger } from "effect";
+import { hostDiagnostics } from "../src/server.ts";
+import * as crypto from "node:crypto";
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Automatic same-service native connection", () => {
-  function fixture() {
+  function fixture(
+    diagnostics?: Parameters<typeof createNativeConnection>[0]["diagnostics"],
+  ) {
     const calls: Request[] = [];
     let registration: unknown = {
       pid: process.pid,
@@ -49,6 +54,7 @@ describe("Automatic same-service native connection", () => {
       version: "2.2.5",
       registration: async () => registration,
       fetch: transport,
+      ...(diagnostics ? { diagnostics } : {}),
     });
     return {
       connection,
@@ -61,6 +67,113 @@ describe("Automatic same-service native connection", () => {
       },
     };
   }
+
+  it("Logging failure preserves coordination outcomes", async () => {
+    let attempts = 0;
+    const diagnostics = Effect.runSync(
+      hostDiagnostics.pipe(
+        Effect.provideService(
+          Logger.CurrentLoggers,
+          new Set([
+            Logger.make(() => {
+              attempts++;
+              throw new Error("Diagnostic sink unavailable");
+            }),
+          ]),
+        ),
+      ),
+    );
+    const f = fixture(diagnostics);
+    try {
+      const token = spyOn(crypto, "randomUUID").mockImplementationOnce(() => {
+        throw new Error("Entropy unavailable");
+      });
+      try {
+        expect(await f.connection.read(async () => "unchanged result")).toBe(
+          "unchanged result",
+        );
+        expect(token).toHaveBeenCalled();
+      } finally {
+        token.mockRestore();
+      }
+      await expect(
+        f.connection.read(async () => {
+          throw new Error("Sensitive native failure");
+        }),
+      ).rejects.toThrow("Native service connection unavailable or unsupported");
+      f.connection.dispose();
+      await expect(
+        f.connection.read(async () => "unreachable"),
+      ).rejects.toThrow("Native service connection disposed");
+      expect(attempts).toBeGreaterThan(0);
+    } finally {
+      f.connection.dispose();
+    }
+  });
+
+  it("Excludes sensitive diagnostic data", async () => {
+    for (const kind of [
+      "disposed",
+      "timeout",
+      "cancelled",
+      "transport",
+      "validation",
+      "unknown",
+    ] as const) {
+      const failures: Record<string, unknown>[] = [];
+      const f = fixture((_level, event, fields) => {
+        if (event === "native.failed") failures.push(fields!);
+      });
+      const deadline = new AbortController();
+      const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(
+        deadline.signal,
+      );
+      const caller = new AbortController();
+      if (kind === "disposed") f.connection.dispose();
+      if (kind === "validation") f.setRegistration(undefined);
+      if (kind === "transport")
+        f.setResponse(async () => {
+          throw new Error("PRIVATE_NATIVE_SENTINEL");
+        });
+      try {
+        await expect(
+          f.connection.read(async (client) => {
+            if (kind === "timeout") deadline.abort();
+            if (kind === "cancelled") {
+              f.setResponse(async () => {
+                caller.abort();
+                throw caller.signal.reason;
+              });
+              return client.server.info({ signal: caller.signal });
+            }
+            throw new Error("PRIVATE_NATIVE_SENTINEL");
+          }),
+        ).rejects.toThrow(
+          kind === "disposed"
+            ? "Native service connection disposed"
+            : kind === "validation"
+              ? "Native service registration unavailable"
+              : "Native service connection unavailable or unsupported",
+        );
+        expect(failures).toHaveLength(1);
+        expect(failures[0]).toMatchObject({
+          classification: kind,
+          phase:
+            kind === "disposed" || kind === "validation"
+              ? "registration"
+              : kind === "transport"
+                ? "service"
+                : "operation",
+        });
+        expect(JSON.stringify(failures)).not.toContain(
+          "PRIVATE_NATIVE_SENTINEL",
+        );
+      } finally {
+        timeout.mockRestore();
+        f.connection.dispose();
+      }
+    }
+  });
 
   it("Connects automatically to the current native service", async () => {
     const f = fixture();

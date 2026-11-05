@@ -102,6 +102,16 @@ At narrow terminal widths, use **Coordinate: inspect shared versions** (`Alt+V`)
 
 When the overview is unavailable, **Status** (`Alt+I`, or the read-only status command in the palette) exposes the full affected task/worker identities and reconciliation reason. These detail rows cannot grant approval or mutate worker state.
 
+## Diagnostics
+
+Backseat writes structured diagnostics through OpenCode's host logger, including the managed background service's log file. On the verified OpenCode 2.2.5 stable Linux host, read `~/.local/share/opencode/log/opencode.log` (or `$XDG_DATA_HOME/opencode/log/opencode.log`). Other channels can use `opencode-<channel>.log`; check the host's log directory. Filter for `backseat` and the event name.
+
+Host log-level filtering applies. `info` records setup and cleanup, `warn` records degraded inventory or observation, and `error` records failed operations. Enable the host's debug level, `OPENCODE_LOG_LEVEL=DEBUG`, when starting an isolated diagnostic host for operation starts/completions and pagination detail. Changing a client process's environment does not reconfigure an already running background service.
+
+Records contain a constant service and event, fixed operation/action/phase and failure categories, elapsed milliseconds, aggregate counts and continuation-presence flags. Refresh failure counts represent affected sessions, including sessions sharing a failed permissions snapshot. Native failures distinguish timeout, disposal, cancellation, validation, transport and unknown failures without changing the user-facing error. Phase identifies registration, client construction, service/incarnation verification, revalidation or the native operation.
+
+Correlation tokens are generated only for diagnostics, connect related internal work, and change on each continuation call. They cannot identify individual host sessions. Logs exclude native identifiers, continuation values, paths, URLs, credentials, exception messages/stacks, prompts, titles and payloads. Detailed registration errors remain available to the invoking caller. Failed logging, including late diagnostics after plugin unload, is dropped without retry, stderr fallback or coordination changes.
+
 ## Development
 
 Native ownership requires Linux, the verified Bun 1.4.4 runtime and a trusted executable `/usr/bin/flock`. Other runtimes remain held until their descriptor behavior is verified.
