@@ -16,7 +16,7 @@
         "effect": "4.0.6",
         "eslint": "10.14.0",
         "prettier": "3.9.10",
-        "solid-js": "1.9.17",
+        "solid-js": "1.9.18",
         "typescript": "6.0.3",
         "typescript-eslint": "8.72.1",
       },
@@ -267,11 +267,11 @@
 
     "@opentui/core-linux-arm64": ["@opentui/core-linux-arm64@0.8.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-b6D/VP9y0Z18tO86GSTp9BBykgR6r5CQM1ol9UMJfUt+PjN5HGksbOCDTMIQufXvt4WIUFHrSBProysJRFzbYw=="],
 
-    "@opentui/core-linux-arm64-musl": ["@opentui/core-linux-arm64-musl@0.8.0", "", { "os": "linux", "cpu": "arm64", "libc": "musl" }, "sha512-8ZPl/2DChcS7XIVRPIazigXaMNyxa2bwvuzPprNbzT0+cVJLIoGC19pjiV3bI3oVXBPVMNqgIcppOrEHBhlouw=="],
+    "@opentui/core-linux-arm64-musl": ["@opentui/core-linux-arm64-musl@0.8.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-8ZPl/2DChcS7XIVRPIazigXaMNyxa2bwvuzPprNbzT0+cVJLIoGC19pjiV3bI3oVXBPVMNqgIcppOrEHBhlouw=="],
 
     "@opentui/core-linux-x64": ["@opentui/core-linux-x64@0.8.0", "", { "os": "linux", "cpu": "x64" }, "sha512-aXBNIdE6iMf58/Tdnd6UzXeFjYfaHzQ6E0nukjLe2ir41/meJJYEAHUQ62EBr/gxvuCNZHTBQB4T9BzF7PdENQ=="],
 
-    "@opentui/core-linux-x64-musl": ["@opentui/core-linux-x64-musl@0.8.0", "", { "os": "linux", "cpu": "x64", "libc": "musl" }, "sha512-xGEYw6wkX0sPwPx6RosQZanuWF0+5cIup2alhHHQQfKJkcLS8r8NBWlcy2LK9CoEWH6SBtNXC+9Y5IrryCOvJQ=="],
+    "@opentui/core-linux-x64-musl": ["@opentui/core-linux-x64-musl@0.8.0", "", { "os": "linux", "cpu": "x64" }, "sha512-xGEYw6wkX0sPwPx6RosQZanuWF0+5cIup2alhHHQQfKJkcLS8r8NBWlcy2LK9CoEWH6SBtNXC+9Y5IrryCOvJQ=="],
 
     "@opentui/core-win32-arm64": ["@opentui/core-win32-arm64@0.8.0", "", { "os": "win32", "cpu": "arm64" }, "sha512-XtK0QMyIiqeDmrIyyAXqqp7TKaRGaWnBlbnEsNrkRLrgP+aLwRhRSHdafxi+RMqj3h9qOlb1MgnPal1kx7wP4g=="],
 
@@ -771,7 +771,7 @@
 
     "socks-proxy-agent": ["socks-proxy-agent@8.0.5", "", { "dependencies": { "agent-base": "^7.1.2", "debug": "^4.3.4", "socks": "^2.8.3" } }, "sha512-HehCEsotFqbPW9sJ8WVYB6UbmIMv7kUUORIF2Nncq4VQvBfNBLibW9YZR5dlYCSUhwcD628pRllm7n+E+YTzJw=="],
 
-    "solid-js": ["solid-js@1.9.17", "", { "dependencies": { "csstype": "^3.1.0", "seroval": "~1.6.8", "seroval-plugins": "~1.6.8" } }, "sha512-4GAmLOWPfNV8H9Jfn2LSFTpNEG6jiOKPiwd5lnLGQtehHaX6l3TOLzJqQ7mqwB/3k1Yy3zyumFVopmc/tm34ow=="],
+    "solid-js": ["solid-js@1.9.18", "", { "dependencies": { "csstype": "^3.1.0", "seroval": "~1.6.11", "seroval-plugins": "~1.6.8" } }, "sha512-CHGO5YFk6Y9m/1YSxVtKnXfrW7JD3Tmof8HmR4z6TmCPsS8efo8LnzIR8CQh3cUvffqYm6DWyBFfk8dQw1CNQQ=="],
 
     "spdx-exceptions": ["spdx-exceptions@2.5.0", "", {}, "sha512-PiU42r+xO4UbUS1buo3LPJkjlO7430Xn5SVAhdpzzsPHsjbYVflnnFdATgabnLude+Cqu25p6N+g2lw/PFsa4w=="],
 
