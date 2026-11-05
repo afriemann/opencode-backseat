@@ -196,7 +196,10 @@ describe("Fine-grained Code Mode queries", () => {
         time: { ...row.time, updated: row.time.updated + 1_000 },
       };
     };
-    const first = await f.call("list_sessions", { limit: 1 });
+    const first = await f.call("list_sessions", {
+      limit: 1,
+      includeSubagents: true,
+    });
     const cursor = first.cursor;
     expect(first).toMatchObject({
       sessions: [
@@ -209,7 +212,13 @@ describe("Fine-grained Code Mode queries", () => {
       cursor: expect.any(String),
     });
     f.rows[1]!.time.updated += 2_000;
-    expect(await f.call("list_sessions", { limit: 1, cursor })).toMatchObject({
+    expect(
+      await f.call("list_sessions", {
+        limit: 1,
+        includeSubagents: true,
+        cursor,
+      }),
+    ).toMatchObject({
       sessions: [
         {
           id: "waiting",
@@ -247,7 +256,6 @@ describe("Fine-grained Code Mode queries", () => {
     expect(await f.call("list_sessions")).toMatchObject({
       sessions: [
         { id: "running", projectID: "project", parentID: null, topLevel: true },
-        { id: "waiting", parentID: "running", topLevel: false },
         { id: "inactive" },
       ],
       partial: true,
@@ -256,6 +264,7 @@ describe("Fine-grained Code Mode queries", () => {
     expect(
       await f.call("list_sessions", {
         statuses: ["running", "waiting"],
+        includeSubagents: true,
         projectID: "project",
         location: "/projects/one",
       }),
@@ -297,6 +306,7 @@ describe("Fine-grained Code Mode queries", () => {
       { limit: 201 },
       { location: "relative" },
       { includeArchived: "yes" },
+      { includeSubagents: "yes" },
     ])
       await expect(f.call("list_sessions", input)).rejects.toThrow();
     f.hold();
@@ -314,7 +324,97 @@ describe("Fine-grained Code Mode queries", () => {
     });
   });
 
+  it("Excludes subagents by default with explicit hierarchy selection", async () => {
+    const f = fixture();
+    for (const includeSubagents of [undefined, false, true]) {
+      const input = includeSubagents === undefined ? {} : { includeSubagents };
+      const result = await f.call("list_sessions", input);
+      expect(
+        (result.sessions as { id: string }[]).map((row) => row.id),
+      ).toEqual(
+        includeSubagents
+          ? ["running", "waiting", "inactive"]
+          : ["running", "inactive"],
+      );
+      if (includeSubagents)
+        expect(f.queries.at(-1)).not.toHaveProperty("parentID");
+      else expect(f.queries.at(-1)).toHaveProperty("parentID", null);
+      for (const [parentID, expected] of [
+        [null, ["running", "inactive"]],
+        ["running", ["waiting"]],
+        ["waiting", []],
+      ] as const) {
+        const selected = await f.call("list_sessions", { ...input, parentID });
+        expect(
+          (selected.sessions as { id: string }[]).map((row) => row.id),
+        ).toEqual([...expected]);
+        expect(f.queries.at(-1)).toHaveProperty("parentID", parentID);
+      }
+    }
+    const limited = await f.call("list_sessions", { limit: 2 });
+    expect((limited.sessions as { id: string }[]).map((row) => row.id)).toEqual(
+      ["running", "inactive"],
+    );
+  });
+
   it("Continues filtered queries without exposing native cursors", async () => {
+    for (const { input, expectedSecond, expectedNext } of [
+      { input: {}, expectedSecond: ["inactive"], expectedNext: ["next-root"] },
+      {
+        input: { includeSubagents: true },
+        expectedSecond: ["waiting"],
+        expectedNext: ["inactive"],
+      },
+      {
+        input: { parentID: "running" },
+        expectedSecond: [],
+        expectedNext: undefined,
+      },
+    ]) {
+      const hierarchy = fixture();
+      hierarchy.cursor("next-native-page");
+      const first = await hierarchy.call("list_sessions", {
+        ...input,
+        limit: 1,
+      });
+      await expect(
+        hierarchy.call("list_sessions", {
+          ...input,
+          limit: 1,
+          cursor: first.cursor,
+          includeSubagents: !(
+            "includeSubagents" in input && input.includeSubagents
+          ),
+        }),
+      ).rejects.toThrow("Continuation");
+      const nextRoot = {
+        ...hierarchy.rows[0]!,
+        id: "next-root",
+      };
+      hierarchy.rows.push(nextRoot);
+      hierarchy.client.session.list = async (query) => {
+        hierarchy.queries.push(query);
+        return { data: [nextRoot], cursor: {} };
+      };
+      const second = await hierarchy.call("list_sessions", {
+        ...input,
+        limit: 1,
+        cursor: first.cursor,
+        ...(!("includeSubagents" in input) ? { includeSubagents: false } : {}),
+      });
+      expect(
+        (second.sessions as { id: string }[]).map((row) => row.id),
+      ).toEqual(expectedSecond);
+      if (!expectedNext) continue;
+      const next = await hierarchy.call("list_sessions", {
+        ...input,
+        limit: 1,
+        cursor: second.cursor,
+      });
+      expect((next.sessions as { id: string }[]).map((row) => row.id)).toEqual(
+        expectedNext,
+      );
+    }
     const f = fixture();
     const nativeCursor = "native-private-cursor-".repeat(30);
     f.cursor(nativeCursor);
@@ -358,6 +458,7 @@ describe("Fine-grained Code Mode queries", () => {
     const changed = fixture();
     const running = await changed.call("list_sessions", {
       statuses: ["running", "waiting"],
+      includeSubagents: true,
       limit: 1,
     });
     changed.client.permission.request.list = async () => ({
@@ -367,6 +468,7 @@ describe("Fine-grained Code Mode queries", () => {
     expect(
       await changed.call("list_sessions", {
         statuses: ["running", "waiting"],
+        includeSubagents: true,
         limit: 1,
         cursor: running.cursor,
       }),
@@ -397,15 +499,23 @@ describe("Fine-grained Code Mode queries", () => {
     evicted.registry.dispose();
     await expect(evicted.call("list_sessions")).rejects.toThrow("unavailable");
     const absolute = fixture();
-    const initial = await absolute.call("list_sessions", { limit: 1 });
+    const initial = await absolute.call("list_sessions", {
+      limit: 1,
+      includeSubagents: true,
+    });
     absolute.advance(299_999);
     const continued = await absolute.call("list_sessions", {
       limit: 1,
+      includeSubagents: true,
       cursor: initial.cursor,
     });
     absolute.expire();
     await expect(
-      absolute.call("list_sessions", { limit: 1, cursor: continued.cursor }),
+      absolute.call("list_sessions", {
+        limit: 1,
+        includeSubagents: true,
+        cursor: continued.cursor,
+      }),
     ).rejects.toThrow("Continuation");
   });
 

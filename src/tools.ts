@@ -366,6 +366,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       "agent",
       "search",
       "parentID",
+      "includeSubagents",
       "includeArchived",
       "limit",
       "cursor",
@@ -388,7 +389,16 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     const projectID = optionalText(v.projectID),
       agent = optionalText(v.agent),
       search = optionalText(v.search);
-    const parentID = v.parentID === null ? null : optionalText(v.parentID);
+    if (
+      v.includeSubagents !== undefined &&
+      typeof v.includeSubagents !== "boolean"
+    )
+      throw new Error("Invalid subagent selection");
+    const includeSubagents = v.includeSubagents === true;
+    const parentID =
+      v.parentID === null
+        ? null
+        : (optionalText(v.parentID) ?? (includeSubagents ? undefined : null));
     if (
       v.includeArchived !== undefined &&
       typeof v.includeArchived !== "boolean"
@@ -409,6 +419,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       agent,
       search,
       parentID,
+      includeSubagents,
       includeArchived,
       limit,
       order,
@@ -584,7 +595,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   > = {
     list_sessions: {
       description:
-        'List native session metadata and hierarchy across projects, including unbound sessions, without TUI attachment. Statuses are OR-ed; different filters are AND-ed. Defaults: running/waiting/inactive, all hierarchy levels, no archived sessions, limit 50, order desc. Each call scans at most 200 native rows. Continue with the returned cursor and unchanged filters, limit and order, even after an empty page. partial or unknownCount is not proof of no matches, idle status or completion. Only taskIDs requires owned task storage. Example: {statuses:["running","waiting"],parentID:null,limit:20}.',
+        'List native session metadata and hierarchy across projects, including unbound sessions, without TUI attachment. Statuses are OR-ed; different filters are AND-ed. Defaults: running/waiting/inactive, root sessions only, no archived sessions, limit 50, order desc. includeSubagents true includes all hierarchy levels unless parentID explicitly selects roots or direct children. Each call scans at most 200 native rows. Continue with the returned cursor and unchanged filters, limit and order, even after an empty page. partial or unknownCount is not proof of no matches, idle status or completion. Only taskIDs requires owned task storage. Example: {statuses:["running","waiting"],parentID:null,limit:20}.',
       input: inputSchema({
         statuses: {
           type: "array",
@@ -621,7 +632,13 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         parentID: {
           anyOf: [stringSchema, { type: "null" }],
           description:
-            "Omit for all levels, pass null for roots, or a native session ID for its direct children, not all descendants.",
+            "Overrides includeSubagents: pass null for roots, or a native session ID for its direct children, not all descendants. Omit to use includeSubagents.",
+        },
+        includeSubagents: {
+          type: "boolean",
+          default: false,
+          description:
+            "Default false selects root sessions only. True includes roots and child sessions. Explicit parentID overrides this flag; keep unchanged while continuing a cursor.",
         },
         includeArchived: {
           type: "boolean",

@@ -1,0 +1,3 @@
+- [x] 1.1 Implement and pass the red-step test for "Excludes subagents by default with explicit hierarchy selection" using design.md normalization decisions.
+- [x] 1.2 Extend and pass "Continues filtered queries without exposing native cursors" for hierarchy selection.
+- [x] 1.3 Update README and coordinator discovery instructions to match the public schema and delta scenarios.
