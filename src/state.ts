@@ -25,6 +25,7 @@ export const STATE_BOUNDS = {
   bindings: 200,
   snapshots: 200,
   intents: 800,
+  sessionDeliveries: 800,
   completions: 200,
   bytes: 8 * 1024 * 1024,
 } as const;
@@ -40,6 +41,12 @@ export function assertStateBounds(value: unknown): void {
       throw new Error("Durable inventory capacity exhausted");
   if (Buffer.byteLength(JSON.stringify(value), "utf8") > STATE_BOUNDS.bytes)
     throw new Error("Durable inventory byte capacity exhausted");
+  if (
+    v.sessionDeliveries !== undefined &&
+    (!Array.isArray(v.sessionDeliveries) ||
+      v.sessionDeliveries.length > STATE_BOUNDS.sessionDeliveries)
+  )
+    throw new Error("Durable session delivery capacity exhausted");
 }
 // These hashes correlate local input bytes; they never manufacture native provenance.
 export function fingerprint(value: unknown): string {
@@ -471,13 +478,43 @@ export interface CompletionRecord {
   };
   validation: import("./evaluator.ts").StrictValidationResult;
 }
+export interface SessionDelivery {
+  id: string;
+  sessionID: string;
+  location: string;
+  agent: string;
+  parentID?: string;
+  coordinatorID: string;
+  serviceID: string;
+  operation:
+    | "prompt"
+    | "synthetic"
+    | "shell"
+    | "compact"
+    | "command"
+    | "skill"
+    | "create"
+    | "import";
+  fingerprint: string;
+  createdAt: number;
+  status: "reserved" | "admitted" | "ambiguous";
+  invocation?: { messageID: string; callID: string; createdAt: number };
+}
 export interface CoordinatorState {
-  version: 1;
+  version: 1 | 2;
   bindings: WorkerBinding[];
   snapshots: import("./context.ts").SharedSnapshot[];
   intents: StoredIntent[];
   completions: CompletionRecord[];
   observer?: import("./ownership.ts").ObserverRecord;
+  sessionDeliveries?: SessionDelivery[];
+  deliveryCutoff?: number;
+  supervision?: {
+    coordinatorID: string;
+    coordinatorLocation: string;
+    coordinatorFingerprint: string;
+    generation: number;
+  };
 }
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -733,6 +770,64 @@ export function parseSupport(
     return { criterion: text(v.criterion), evidenceID: text(v.evidenceID) };
   });
 }
+function parseSessionDelivery(value: unknown): SessionDelivery {
+  const v = object(value);
+  exact(v, [
+    "id",
+    "sessionID",
+    "location",
+    "agent",
+    "parentID",
+    "coordinatorID",
+    "serviceID",
+    "operation",
+    "fingerprint",
+    "createdAt",
+    "status",
+    "invocation",
+  ]);
+  if (
+    ![
+      "prompt",
+      "synthetic",
+      "shell",
+      "compact",
+      "command",
+      "skill",
+      "create",
+      "import",
+    ].includes(String(v.operation)) ||
+    !["reserved", "admitted", "ambiguous"].includes(String(v.status))
+  )
+    throw new Error("Invalid session delivery operation or status");
+  const id = text(v.id);
+  if (id.length > 200) throw new Error("Oversized session delivery ID");
+  const invocation =
+    v.invocation === undefined ? undefined : object(v.invocation);
+  if (invocation) exact(invocation, ["messageID", "callID", "createdAt"]);
+  return {
+    id,
+    sessionID: text(v.sessionID),
+    location: text(v.location),
+    agent: text(v.agent),
+    ...(v.parentID === undefined ? {} : { parentID: text(v.parentID) }),
+    coordinatorID: text(v.coordinatorID),
+    serviceID: text(v.serviceID),
+    operation: v.operation as SessionDelivery["operation"],
+    fingerprint: digest(v.fingerprint),
+    createdAt: integer(v.createdAt),
+    status: v.status as SessionDelivery["status"],
+    ...(invocation
+      ? {
+          invocation: {
+            messageID: text(invocation.messageID),
+            callID: text(invocation.callID),
+            createdAt: integer(invocation.createdAt),
+          },
+        }
+      : {}),
+  };
+}
 export function parseCoordinatorState(value: unknown): CoordinatorState {
   if (value === undefined)
     return {
@@ -750,11 +845,25 @@ export function parseCoordinatorState(value: unknown): CoordinatorState {
     "intents",
     "completions",
     "observer",
+    "sessionDeliveries",
+    "supervision",
+    "deliveryCutoff",
   ]);
-  if (v.version !== 1) throw new Error("Unsupported durable state");
+  if (
+    (v.version !== 1 && v.version !== 2) ||
+    (v.version === 1 &&
+      (v.sessionDeliveries !== undefined ||
+        v.supervision !== undefined ||
+        v.deliveryCutoff !== undefined)) ||
+    (v.version === 2 && !Array.isArray(v.sessionDeliveries))
+  )
+    throw new Error("Unsupported durable state");
   assertStateBounds(v);
+  const deliveryCutoff =
+    v.deliveryCutoff === undefined ? undefined : integer(v.deliveryCutoff);
   const state: CoordinatorState = {
-    version: 1,
+    version: v.version,
+    ...(deliveryCutoff === undefined ? {} : { deliveryCutoff }),
     bindings: list(v.bindings, parseBinding),
     snapshots: list(v.snapshots, parseSnapshot),
     intents: list(v.intents, (entry) => {
@@ -832,6 +941,32 @@ export function parseCoordinatorState(value: unknown): CoordinatorState {
       };
     }),
   };
+  if (v.version === 2) {
+    state.sessionDeliveries = list(v.sessionDeliveries, parseSessionDelivery);
+    const ids = [
+      ...state.intents.map((entry) => entry.intent.id),
+      ...state.sessionDeliveries.map((entry) => entry.id),
+    ];
+    if (new Set(ids).size !== ids.length)
+      throw new Error("Ambiguous durable delivery identity");
+  }
+  if (v.supervision !== undefined) {
+    const s = object(v.supervision);
+    exact(s, [
+      "coordinatorID",
+      "coordinatorLocation",
+      "coordinatorFingerprint",
+      "generation",
+    ]);
+    state.supervision = {
+      coordinatorID: text(s.coordinatorID),
+      coordinatorLocation: text(s.coordinatorLocation),
+      coordinatorFingerprint: digest(s.coordinatorFingerprint),
+      generation: integer(s.generation, 1),
+    };
+    if (v.observer !== undefined)
+      throw new Error("Conflicting observer authority");
+  }
   if (v.observer !== undefined) {
     const o = object(v.observer);
     exact(o, [

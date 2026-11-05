@@ -1,4 +1,16 @@
 import { Plugin } from "@opencode/plugin";
+import {
+  readNativeObservation,
+  createServerSupervisionPort,
+  ServerSupervision,
+} from "./supervision.ts";
+import {
+  prepareNativeOperation,
+  prepareNativeSend,
+  type NativeSend,
+  type SessionOperation,
+} from "./native-operations.ts";
+export type { SessionOperation } from "./native-operations.ts";
 import { Plugin as EffectPlugin } from "@opencode/plugin/effect";
 import { fromPromise } from "@opencode/plugin/promise/adapter";
 import { Effect } from "effect";
@@ -18,7 +30,10 @@ import {
   type DiagnosticEmitter,
   type NativeConnection,
 } from "./native-connection.ts";
-import { readNativeDelivery } from "./native-sessions.ts";
+import {
+  readNativeDelivery,
+  readNativeSessionDelivery,
+} from "./native-sessions.ts";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { randomUUID, createPublicKey } from "node:crypto";
@@ -48,13 +63,7 @@ import {
   parseStrictValidationResult,
 } from "./evaluator.ts";
 import { followupText } from "./dispatch.ts";
-import {
-  CoordinatorOwnership,
-  ObserverAuthority,
-  forceNativeAsk,
-  type ObserverRecord,
-  type SignedControl,
-} from "./ownership.ts";
+import { CoordinatorOwnership, forceNativeAsk } from "./ownership.ts";
 import * as Ownership from "./ownership.ts";
 import {
   openAnchoredDirectory,
@@ -83,16 +92,12 @@ import {
   takeoverWorker,
   text,
   type CoordinatorState,
+  type SessionDelivery,
   type TaskGoal,
   type WorkerBinding,
 } from "./state.ts";
 import {
   BackseatRpc,
-  reasoningPayload,
-  CONTROL_OPERATIONS,
-  type AttachInput,
-  type AttachResult,
-  type ControlInput,
   type ControlOperation,
   type ControlResult,
   type CoordinatorSnapshot,
@@ -139,6 +144,19 @@ export interface NativeIdentity {
   messageID: string;
   id: string;
   signal?: AbortSignal;
+}
+export interface SessionSend extends NativeSend {
+  sessionID: string;
+  location: string;
+  agent: string;
+  text: string;
+  scope?: readonly string[];
+}
+export interface SessionSendResult {
+  sessionID: string;
+  sendID: string;
+  status: "admitted" | "uncertain";
+  reason?: string;
 }
 
 type JudgmentHost = {
@@ -200,6 +218,30 @@ export async function generateTaskJudgment(
 }
 
 export interface NativeBackendHost {
+  observeNative?(
+    binding: WorkerBinding,
+    snapshots: readonly import("./context.ts").SharedSnapshot[],
+    observed: import("./state.ts").WorkerSnapshot,
+    coordinatorLocation: string,
+    signal: AbortSignal,
+  ): Promise<import("./lifecycle.ts").WorkerObservation>;
+  refreshObservers?(): Promise<readonly string[]>;
+  readInvocation?(
+    identity: NativeIdentity,
+    coordinatorLocation: string,
+  ): Promise<{ messageID: string; createdAt: number }>;
+  nativeSend?(
+    input: SessionSend,
+    sendID: string,
+    coordinatorLocation: string,
+    signal: AbortSignal,
+  ): Promise<unknown>;
+  nativeOperation?(
+    input: SessionOperation,
+    phase: "subject" | "execute",
+    coordinatorLocation: string,
+    signal: AbortSignal,
+  ): Promise<unknown>;
   session: Pick<Plugin.Context["session"], "get" | "create" | "prompt"> &
     Partial<Pick<Plugin.Context["session"], "context" | "list" | "remove">>;
   agent: Pick<Plugin.Context["agent"], "list">;
@@ -217,6 +259,10 @@ export interface NativeBackendHost {
     intent: import("./dispatch.ts").DispatchIntent,
     coordinatorLocation: string,
   ): Promise<"admitted" | "unknown">;
+  readSessionDelivery?(
+    delivery: SessionDelivery,
+    coordinatorLocation: string,
+  ): Promise<"admitted" | "unknown">;
   closeStorage?(): Promise<void>;
   readRecovery?(key: string): Promise<unknown>;
   canonical(location: string): Promise<string>;
@@ -228,6 +274,21 @@ export interface NativeBackendHost {
   ): Promise<"held">;
 }
 export interface NativeBackend {
+  wakeSupervision(sessionID: string, ask?: boolean): Promise<void>;
+  resumeTask(taskID: string, identity: NativeIdentity): Promise<ControlResult>;
+  startSupervision(identity: NativeIdentity): Promise<{
+    generation: number;
+    coordinatorID: string;
+    status: "held";
+  }>;
+  sessionOperation(
+    input: SessionOperation,
+    identity: NativeIdentity,
+  ): Promise<unknown>;
+  sendSession(
+    input: SessionSend,
+    identity: NativeIdentity,
+  ): Promise<SessionSendResult>;
   inspectDeletions(
     taskID: string,
     identity: NativeIdentity,
@@ -243,11 +304,6 @@ export interface NativeBackend {
     }[]
   >;
   bootstrap(): CoordinatorBootstrap;
-  read(proof: SignedControl): Promise<CoordinatorSnapshot>;
-  readObservation(
-    input: ObserveInput,
-    proof: SignedControl,
-  ): Promise<ObserveResult>;
   inspect(identity?: NativeIdentity): Promise<CoordinatorSnapshot>;
   deleteSession(
     sessionID: string,
@@ -257,14 +313,6 @@ export interface NativeBackend {
     status: "deleted" | "uncertain";
     affectedTasks: string[];
   }>;
-  attach(
-    input: AttachInput,
-    requestAbortSignal?: AbortSignal,
-  ): Promise<AttachResult>;
-  control(
-    input: ControlInput,
-    requestAbortSignal?: AbortSignal,
-  ): Promise<ControlResult>;
   suggest(input: SuggestInput): Promise<SuggestResult>;
   observe(input: ObserveInput): Promise<ObserveResult>;
   validate(input: ValidateInput): Promise<StrictValidationResult>;
@@ -294,8 +342,11 @@ export async function createNativeBackend(
   let authority: CoordinatorSnapshot["authority"] = "held";
   let reason = "Runtime authority unavailable";
   let closed = false;
-  let observer: ObserverAuthority | undefined;
-  let attached = false;
+  let serverAttached = false;
+  let runtime: ServerSupervision | undefined;
+  const internalReasoning = new WeakSet<object>();
+  const generationRecord = () => state.supervision;
+  const supervisionAttached = () => serverAttached;
   let recovered = false;
   let tail: Promise<unknown> = Promise.resolve();
   const issued = new Map<
@@ -418,8 +469,8 @@ export async function createNativeBackend(
       state = structuredClone(persisted);
       authority = "held";
       reason = "Durable write failed; reconciliation required";
-      observer?.revoke();
-      attached = false;
+      serverAttached = false;
+      runtime?.close();
       throw error;
     }
   };
@@ -495,7 +546,7 @@ export async function createNativeBackend(
   ) => {
     const receipt = receipts.get(text(receiptID));
     if (
-      !attached ||
+      !supervisionAttached() ||
       !receipt ||
       receipt.consumed ||
       receipt.result.status !== "accept" ||
@@ -511,11 +562,11 @@ export async function createNativeBackend(
       !observed.snapshot ||
       observed.snapshot.background.length ||
       !(await evidenceIsCurrent(b, receipt.evidence, observed.snapshot)) ||
-      state.observer?.generation !== receipt.result.identity.generation ||
+      generationRecord()?.generation !== receipt.result.identity.generation ||
       fingerprint(
         decisionIdentity(
           b,
-          state.observer.generation,
+          generationRecord()!.generation,
           receipt.evidence,
           observed.snapshot,
           receipt.suggestion,
@@ -643,24 +694,26 @@ export async function createNativeBackend(
       throw new Error("Native operation aborted");
   };
   const attachedCoordinator = async () => {
-    if (
-      !attached ||
-      !observer ||
-      !state.observer ||
-      state.observer.dataDir !== dataDir
-    )
-      throw new Error("Observer authority is not eligible");
-    const session = await coordinator(state.observer.coordinatorID);
-    if (session.location.directory !== state.observer.coordinatorLocation)
-      throw new Error(
-        "Observer authority is not eligible: coordinator location changed",
-      );
-    return session;
+    if (state.supervision) {
+      if (!serverAttached) throw new Error("Server supervision is not started");
+      const current = await coordinator(state.supervision.coordinatorID);
+      if (
+        fingerprint([
+          current.id,
+          current.agent,
+          current.projectID,
+          current.location,
+        ]) !== state.supervision.coordinatorFingerprint
+      )
+        throw new Error("Server coordinator identity changed");
+      return current;
+    }
+    throw new Error("Server supervision is not started");
   };
   const validateTarget = async (
-    goal: TaskGoal,
+    goal: Pick<TaskGoal, "location" | "agent">,
     workerID?: string,
-    topLevel = false,
+    allowArchived = false,
   ) => {
     if ((await host.canonical(goal.location)) !== goal.location)
       throw new Error("Noncanonical approved target");
@@ -678,23 +731,32 @@ export async function createNativeBackend(
     if (workerID) {
       const w = await host.session.get({ sessionID: workerID });
       alive();
-      if (topLevel && w.parentID !== undefined)
-        throw new Error("Only top-level sessions can be adopted or taken over");
       if (
         w.id !== workerID ||
         w.agent !== goal.agent ||
-        w.time.archived !== undefined ||
+        (!allowArchived && w.time.archived !== undefined) ||
         (await host.canonical(w.location.directory)) !== goal.location
       )
         throw new Error("Mismatched worker target");
     }
     alive();
   };
-  const topLevelWorker = async (workerID: string) => {
+  const selectedWorker = async (workerID: string, allowArchived = false) => {
     const worker = await host.session.get({ sessionID: workerID });
     alive();
-    if (worker.id !== workerID || worker.parentID !== undefined)
-      throw new Error("Only top-level sessions can be taken over");
+    if (
+      worker.id !== workerID ||
+      (!allowArchived && worker.time.archived !== undefined)
+    )
+      throw new Error("Unavailable selected worker");
+    return {
+      id: worker.id,
+      projectID: worker.projectID,
+      agent: worker.agent,
+      parentID: worker.parentID ?? null,
+      location: worker.location,
+      archived: worker.time.archived ?? null,
+    };
   };
   const resumeEligibility = async (
     b: WorkerBinding,
@@ -713,9 +775,8 @@ export async function createNativeBackend(
       "asks",
     ]);
     if (
-      !attached ||
-      !state.observer ||
-      r.generation !== state.observer.generation ||
+      !serverAttached ||
+      r.generation !== state.supervision?.generation ||
       r.workerID !== b.workerID ||
       r.revision !== b.revision ||
       r.epoch !== b.epoch ||
@@ -734,9 +795,7 @@ export async function createNativeBackend(
         state.bindings.filter((w) => w.status === "active").length >=
           AUTOMATION_LIMITS.activeWorkers)
     ) {
-      throw new Error(
-        "Resume requires current approved native TUI reconciliation",
-      );
+      throw new Error("Resume requires current approved native reconciliation");
     }
     await validateTarget(b, b.workerID);
     const observed = await readObserved(b);
@@ -752,6 +811,28 @@ export async function createNativeBackend(
     }
     if (!(await readNativeContext(b, observed.snapshot)))
       throw new Error("Worker input failed, interrupted, pending or changed");
+    if (state.supervision) {
+      if (!host.observeNative)
+        throw new Error("Native supervision observation unavailable");
+      const read = await host.observeNative(
+        b,
+        selectedSnapshots(b),
+        observed.snapshot,
+        state.supervision.coordinatorLocation,
+        shutdown.signal,
+      );
+      owned();
+      await attachedCoordinator();
+      if (
+        read.state !== "settled" ||
+        read.asks.length ||
+        !read.snapshot ||
+        fingerprint(read.snapshot) !== r.snapshotFingerprint
+      )
+        throw new Error(
+          "Resume requires fresh settled native state without pending requests",
+        );
+    }
     const current = await readObserved(b);
     if (
       !current.snapshot ||
@@ -850,36 +931,24 @@ export async function createNativeBackend(
       return undefined;
     return messages;
   };
-  const authorizeReasoning = async (
-    operation: "suggest" | "validate",
-    input: SuggestInput | ValidateInput,
-  ) => {
+  const authorizeReasoning = async (input: SuggestInput | ValidateInput) => {
     owned();
     await attachedCoordinator();
-    const expected =
-      operation === "suggest"
-        ? reasoningPayload("suggest", input as SuggestInput)
-        : reasoningPayload("validate", input as ValidateInput);
+    const expected = "identity" in input ? input.identity : input;
     const b = binding(expected.taskID);
-    if (
-      !attached ||
-      !observer ||
-      !state.observer ||
-      b.status !== "active" ||
-      input.generation !== state.observer.generation ||
-      input.proof?.generation !== input.generation ||
-      b.revision !== expected.revision ||
-      b.epoch !== expected.epoch
-    )
-      throw new Error(
-        "Reasoning requires private possession and current eligible worker",
-      );
-    const payload = await observer.authorize(input.proof, expected);
-    if (fingerprint(payload.body) !== fingerprint(expected.body))
-      throw new Error("Mismatched reasoning input fingerprint");
-    owned();
-    await attachedCoordinator();
-    return b;
+    if (internalReasoning.has(input)) {
+      if (
+        !serverAttached ||
+        !state.supervision ||
+        b.status !== "active" ||
+        input.generation !== state.supervision.generation ||
+        b.revision !== expected.revision ||
+        b.epoch !== expected.epoch
+      )
+        throw new Error("Server reasoning generation or binding changed");
+      return b;
+    }
+    throw new Error("Reasoning requires the current server runtime");
   };
   const evidenceIsCurrent = async (
     b: WorkerBinding,
@@ -980,53 +1049,19 @@ export async function createNativeBackend(
     });
     return { snapshots, shared };
   };
-  const observerFor = async (
-    coordinatorID: string,
-    requestAbortSignal?: AbortSignal,
-  ): Promise<ObserverAuthority> => {
-    const session = await coordinator(coordinatorID);
-    return new ObserverAuthority(
-      coordinatorID,
-      {
-        async load() {
-          return state.observer;
-        },
-        async approve(record) {
-          await ask(
-            coordinatorID,
-            "attach",
-            JSON.stringify([
-              dataDir,
-              record.coordinatorID,
-              record.verifier,
-              record.generation,
-            ]),
-            undefined,
-            requestAbortSignal,
-          );
-          const current = await coordinator(coordinatorID);
-          if (
-            record.dataDir !== dataDir ||
-            current.location.directory !== record.coordinatorLocation
-          )
-            throw new Error(
-              "Coordinator location changed before observer approval",
-            );
-          owned();
-        },
-        async save(record: ObserverRecord) {
-          owned();
-          state.observer = structuredClone(record);
-          await persist();
-        },
-      },
-      { dataDir, coordinatorLocation: session.location.directory },
-    );
-  };
   const load = async () => {
     const loaded = parseCoordinatorState(await host.storage.get(key));
     alive();
     persisted = structuredClone(loaded);
+    if (
+      loaded.supervision &&
+      ((await host.canonical(loaded.supervision.coordinatorLocation)) !==
+        loaded.supervision.coordinatorLocation ||
+        loaded.bindings.some(
+          (binding) => binding.workerID === loaded.supervision!.coordinatorID,
+        ))
+    )
+      throw new Error("Invalid durable server supervision target");
     if (loaded.observer) {
       if (
         loaded.observer.dataDir !== dataDir ||
@@ -1058,6 +1093,19 @@ export async function createNativeBackend(
     state = loaded;
     await persist();
   };
+  const claimRecovered = async () => {
+    if (!recovered) return;
+    authority = await ownership.claim();
+    if (authority === "owned") {
+      try {
+        await load();
+        recovered = false;
+      } catch {
+        authority = "held";
+        reason = "Unreadable recovered state";
+      }
+    }
+  };
   try {
     if (
       (await host.canonical(dataDir)) !== dataDir ||
@@ -1073,6 +1121,145 @@ export async function createNativeBackend(
     reason = "Unsafe or unreadable durable runtime; explicit recovery required";
   }
 
+  const invocationProof = async (
+    identity: NativeIdentity,
+    location: string,
+  ) => {
+    let proof: { messageID: string; createdAt: number } | undefined;
+    try {
+      proof = await host.readInvocation?.(identity, location);
+    } catch (error) {
+      // Native lookup failures may embed message content or service credentials.
+      const code =
+        error instanceof TypeError
+          ? "TypeError"
+          : error instanceof RangeError
+            ? "RangeError"
+            : "NativeError";
+      throw new Error(`Native invocation metadata is unavailable (${code})`);
+    }
+    if (
+      !proof ||
+      proof.messageID !== identity.messageID ||
+      !Number.isSafeInteger(proof.createdAt) ||
+      proof.createdAt < 0
+    )
+      throw new Error("Native invocation metadata is unavailable");
+    return {
+      messageID: text(identity.messageID),
+      callID: text(identity.id),
+      createdAt: proof.createdAt,
+    };
+  };
+  const reserveSessionDelivery = (delivery: SessionDelivery) => {
+    if (!delivery.invocation)
+      throw new Error("Native invocation metadata is unavailable");
+    const entries = [...(state.sessionDeliveries ?? [])];
+    if (entries.some((entry) => entry.id === delivery.id))
+      throw new Error("Delivery identity is already reserved");
+    let cutoff = state.deliveryCutoff;
+    if (entries.length >= STATE_BOUNDS.sessionDeliveries) {
+      const retire = entries
+        .filter((entry) => entry.status === "admitted" && entry.invocation)
+        .sort((a, b) => a.invocation!.createdAt - b.invocation!.createdAt)[0];
+      if (!retire)
+        throw new Error(
+          "Durable session delivery capacity exhausted; unresolved identities are pinned",
+        );
+      cutoff = Math.max(cutoff ?? 0, retire.invocation!.createdAt);
+      entries.splice(entries.indexOf(retire), 1);
+    }
+    if (cutoff !== undefined && delivery.invocation.createdAt <= cutoff)
+      throw new Error(
+        "Native invocation expired; inspect its original outcome without retrying",
+      );
+    const candidate: CoordinatorState = {
+      ...state,
+      version: 2,
+      sessionDeliveries: [...entries, delivery],
+      ...(cutoff === undefined ? {} : { deliveryCutoff: cutoff }),
+    };
+    assertStateBounds(candidate);
+    return candidate;
+  };
+  const reconcileSessionDeliveries = async (
+    sessionID: string,
+    coordinatorLocation: string,
+    identity?: NativeIdentity,
+  ) => {
+    for (const pending of state.sessionDeliveries ?? []) {
+      if (pending.sessionID !== sessionID || pending.status === "admitted")
+        continue;
+      if (pending.operation === "create" || pending.operation === "import") {
+        if (!identity)
+          throw new Error(
+            "Unresolved creation requires explicit native reconciliation approval",
+          );
+        await validateTarget(pending, sessionID);
+        const selected = await selectedWorker(sessionID);
+        await ask(
+          identity.sessionID,
+          "reconcile_session_creation",
+          JSON.stringify([pending, selected]),
+          identity,
+          identity.signal,
+        );
+        identity.signal?.throwIfAborted();
+        owned();
+        await validateTarget(pending, sessionID);
+        if (
+          fingerprint(await selectedWorker(sessionID)) !== fingerprint(selected)
+        )
+          throw new Error(
+            "Selected creation target changed during reconciliation approval",
+          );
+        pending.status = "admitted";
+        await persist();
+        continue;
+      }
+      if (
+        // Native transport failures cannot confirm admission or expose private error payloads.
+        (await host
+          .readSessionDelivery?.(pending, coordinatorLocation)
+          .catch(() => "unknown" as const)) !== "admitted"
+      )
+        throw new Error(
+          "Unresolved delivery; reconcile the existing identity before sending",
+        );
+      owned();
+      pending.status = "admitted";
+      await persist();
+    }
+    const bound = state.bindings.find((entry) => entry.workerID === sessionID);
+    for (const pending of state.intents.filter(
+      (entry) =>
+        entry.intent.workerID === sessionID &&
+        entry.intent.status !== "admitted",
+    )) {
+      // Failed native reads cannot confirm admission or release the retained identity.
+      const admitted =
+        bound &&
+        (await host
+          .readDelivery?.(bound, pending.intent, coordinatorLocation)
+          .catch(() => "unknown" as const));
+      owned();
+      identity?.signal?.throwIfAborted();
+      if (admitted !== "admitted")
+        throw new Error(
+          "Unresolved delivery; reconcile the existing identity before continuing",
+        );
+      pending.intent.status = "admitted";
+      await persist();
+    }
+  };
+  const rejectDeletedWorker = async (b: WorkerBinding) => {
+    if (
+      (await deletions()).some((record) => record.members.includes(b.workerID))
+    )
+      throw new Error(
+        "Worker has a retained deletion outcome; inspect rather than resend",
+      );
+  };
   const mutate = async (
     operation: ControlOperation,
     taskID: string,
@@ -1121,7 +1308,8 @@ export async function createNativeBackend(
         },
         revision: b.revision,
         epoch: b.epoch,
-        generation: kind === "manual" ? 0 : (state.observer?.generation ?? 0),
+        generation:
+          kind === "manual" ? 0 : (generationRecord()?.generation ?? 0),
         createdAt: Date.now(),
         kind,
       };
@@ -1147,20 +1335,6 @@ export async function createNativeBackend(
         throw error;
       }
     };
-    if (operation === "detach") {
-      exact(body, []);
-      for (const b of state.bindings)
-        if (b.status === "active") {
-          b.status = "held";
-          b.epoch++;
-        }
-      for (const i of state.intents)
-        if (i.intent.status === "reserved") i.intent.status = "ambiguous";
-      attached = false;
-      observer?.revoke();
-      await persist();
-      return true;
-    }
     if (operation === "create" || operation === "adopt") {
       const goal = parseGoal(operation === "create" ? body : body.goal);
       exact(operation === "create" ? body : object(body.goal), [
@@ -1218,24 +1392,32 @@ export async function createNativeBackend(
                   kind: "initial",
                   revision: 1,
                   epoch: 1,
-                  generation: state.observer?.generation ?? 0,
+                  generation: generationRecord()?.generation ?? 0,
                   createdAt: Date.now(),
                 },
               ],
         });
       };
       checkCreationCapacity();
-      await validateTarget(goal, workerID, workerID !== undefined);
+      await validateTarget(goal, workerID);
+      const selected = workerID ? await selectedWorker(workerID) : undefined;
       const approve = async () => {
         await ask(
           coordinatorID,
           operation,
-          JSON.stringify([dataDir, goal, workerID]),
+          JSON.stringify([dataDir, goal, workerID, selected]),
           identity,
           requestAbortSignal,
         );
         mutable();
-        await validateTarget(goal, workerID, workerID !== undefined);
+        await validateTarget(goal, workerID);
+        if (
+          workerID &&
+          fingerprint(await selectedWorker(workerID)) !== fingerprint(selected)
+        )
+          throw new Error(
+            "Selected hierarchical target changed during approval",
+          );
         mutable();
         checkCreationCapacity();
       };
@@ -1253,7 +1435,7 @@ export async function createNativeBackend(
       if (workerID)
         await adoptWorker(goal, workerID, {
           async read(id) {
-            await validateTarget(goal, id, true);
+            await validateTarget(goal, id);
             const w = await host.session.get({ sessionID: id });
             return {
               ...w,
@@ -1310,13 +1492,8 @@ export async function createNativeBackend(
       return true;
     }
     const b = binding(taskID);
-    if (
-      ["dispatch", "resume", "reserve"].includes(operation) &&
-      (await deletions()).some((record) => record.members.includes(b.workerID))
-    )
-      throw new Error(
-        "Worker has a retained deletion outcome; inspect rather than resend",
-      );
+    if (["dispatch", "resume", "reserve"].includes(operation))
+      await rejectDeletedWorker(b);
     if (operation === "dispatch") {
       exact(body, ["text", "scope"]);
       const assignment = text(body.text);
@@ -1333,20 +1510,11 @@ export async function createNativeBackend(
           fingerprint(binding(taskID)) !== approved
         )
           throw new Error("Manual target changed or requires takeover");
-        for (const pending of state.intents.filter(
-          (i) => i.intent.taskID === taskID && i.intent.status !== "admitted",
-        )) {
-          const admitted = await host
-            .readDelivery?.(b, pending.intent, initiating.location.directory)
-            .catch(() => "unknown" as const);
-          mutable();
-          if (admitted !== "admitted")
-            throw new Error(
-              "Unresolved delivery; reconcile the existing identity before sending",
-            );
-          pending.intent.status = "admitted";
-          await persist();
-        }
+        await reconcileSessionDeliveries(
+          b.workerID,
+          initiating.location.directory,
+          identity,
+        );
         await validateTarget(b, b.workerID);
         mutable();
       };
@@ -1371,24 +1539,33 @@ export async function createNativeBackend(
     )
       throw new Error("Task is not automatically owned");
     if (["hold", "resume", "takeover", "share"].includes(operation)) {
-      if (operation === "takeover") await topLevelWorker(b.workerID);
+      const selected =
+        operation === "takeover" ? await selectedWorker(b.workerID) : undefined;
       if (operation === "share") sharingCandidate(b, body);
       if (operation === "resume") {
-        if (identity)
+        if (
+          identity &&
+          (!state.supervision ||
+            state.supervision.coordinatorID !== identity.sessionID)
+        )
           throw new Error(
-            "Resume requires approved native TUI reconciliation, not conversational control",
+            "Resume requires an approved server supervision generation",
           );
         await resumeEligibility(b, body);
       }
       await ask(
         coordinatorID,
         operation,
-        JSON.stringify([dataDir, b.id, b.revision, b.epoch, body]),
+        JSON.stringify([dataDir, b.id, b.revision, b.epoch, body, selected]),
         identity,
         requestAbortSignal,
       );
       mutable();
-      if (operation === "takeover") await topLevelWorker(b.workerID);
+      if (
+        selected &&
+        fingerprint(await selectedWorker(b.workerID)) !== fingerprint(selected)
+      )
+        throw new Error("Selected hierarchical target changed during approval");
     }
     if (
       operation === "hold" ||
@@ -1453,7 +1630,7 @@ export async function createNativeBackend(
         intent,
         revision: b.revision,
         epoch: b.epoch,
-        generation: state.observer!.generation,
+        generation: generationRecord()!.generation,
         createdAt: now,
         validation: receipt.result,
       });
@@ -1471,7 +1648,8 @@ export async function createNativeBackend(
         i.revision !== b.revision ||
         i.epoch > b.epoch ||
         (i.intent.status === "reserved" &&
-          (i.epoch !== b.epoch || i.generation !== state.observer?.generation))
+          (i.epoch !== b.epoch ||
+            i.generation !== generationRecord()?.generation))
       )
         throw new Error("Unknown or obsolete intent");
       if (i.intent.status === "admitted" && body.status !== "admitted")
@@ -1528,7 +1706,7 @@ export async function createNativeBackend(
           workerID: b.workerID,
           revision: b.revision,
           epoch: b.epoch,
-          generation: state.observer!.generation,
+          generation: generationRecord()!.generation,
           support,
           evidence,
           validation: receipt.result,
@@ -1546,7 +1724,262 @@ export async function createNativeBackend(
     await persist();
     return true;
   };
-  return {
+  const createRuntime = (generation: number) => {
+    const currentGeneration = async () => {
+      owned();
+      if (!serverAttached || state.supervision?.generation !== generation)
+        throw new Error("Server supervision generation is unavailable");
+      await attachedCoordinator();
+      return state.supervision;
+    };
+    const sameBinding = (task: WorkerBinding) => {
+      const current = binding(task.id);
+      if (
+        current.workerID !== task.workerID ||
+        current.revision !== task.revision ||
+        current.epoch !== task.epoch
+      )
+        throw new Error("Server supervision binding changed");
+      return current;
+    };
+    const observe = async (task: WorkerBinding) => {
+      const captured = await serial(async () => {
+        const authority = await currentGeneration();
+        const current = sameBinding(task);
+        await validateTarget(current, current.workerID);
+        const observed = await readObserved(current);
+        if (!observed.snapshot || !host.observeNative)
+          throw new Error("Native supervision observation unavailable");
+        return {
+          binding: structuredClone(current),
+          snapshots: structuredClone(selectedSnapshots(current)),
+          snapshot: observed.snapshot,
+          coordinatorLocation: authority.coordinatorLocation,
+        };
+      });
+      const read = await host.observeNative!(
+        captured.binding,
+        captured.snapshots,
+        captured.snapshot,
+        captured.coordinatorLocation,
+        shutdown.signal,
+      );
+      await serial(async () => {
+        await currentGeneration();
+        const current = sameBinding(task);
+        const after = await readObserved(current);
+        if (
+          boundState(current) !== boundState(captured.binding) ||
+          !after.snapshot ||
+          fingerprint(after.snapshot) !== fingerprint(captured.snapshot)
+        )
+          throw new Error("Worker observation invalidated during native reads");
+      });
+      return read;
+    };
+    return new ServerSupervision(
+      createServerSupervisionPort({
+        generation,
+        current: () =>
+          serial(async () => {
+            await currentGeneration();
+            return structuredClone(snapshot());
+          }),
+        authorized: (task) =>
+          serial(async () => {
+            try {
+              await currentGeneration();
+              sameBinding(task);
+              return true;
+            } catch {
+              return false;
+            }
+          }),
+        observe,
+        suggest: async (input) => {
+          internalReasoning.add(input);
+          return backend.suggest(input);
+        },
+        validate: async (input) => {
+          internalReasoning.add(input);
+          return backend.validate(input);
+        },
+        control: (operation, task, body) =>
+          serial(async () => {
+            const authority = await currentGeneration();
+            sameBinding(task);
+            return mutate(operation, task.id, body, authority.coordinatorID);
+          }),
+        delivery: async (task, intent) => {
+          const authority = await serial(currentGeneration);
+          if (task.workerID !== intent.workerID) return "unknown";
+          return (
+            (await host.readDelivery?.(
+              task,
+              intent,
+              authority.coordinatorLocation,
+            )) ?? "unknown"
+          );
+        },
+        prompt: async (task, intent) => {
+          const read = await observe(task);
+          if (read.state !== "settled" || read.asks.length) return "ambiguous";
+          return serial(async () => {
+            const authority = await currentGeneration();
+            const current = sameBinding(task);
+            const stored = state.intents.find(
+              (entry) => entry.intent.id === intent.id,
+            );
+            const latest = await readObserved(current);
+            if (
+              current.status !== "active" ||
+              stored?.generation !== generation ||
+              stored.intent.status !== "reserved" ||
+              stored.validation?.status !== "accept" ||
+              !latest.snapshot ||
+              fingerprint(latest.snapshot) !== fingerprint(read.snapshot)
+            )
+              return "ambiguous";
+            const signal = AbortSignal.any([
+              shutdown.signal,
+              ...(host.projectSignal
+                ? [
+                    host.projectSignal(authority.coordinatorLocation),
+                    host.projectSignal(task.location),
+                  ]
+                : []),
+            ]);
+            try {
+              const result = await awaitNative(
+                host.nativeSend
+                  ? host.nativeSend(
+                      {
+                        sessionID: task.workerID,
+                        location: task.location,
+                        agent: task.agent,
+                        text: intent.text,
+                      },
+                      intent.id,
+                      authority.coordinatorLocation,
+                      signal,
+                    )
+                  : host.session.prompt(
+                      {
+                        sessionID: task.workerID,
+                        id: intent.id,
+                        text: intent.text,
+                      },
+                      { signal },
+                    ),
+                [signal],
+              );
+              return object(result).id === intent.id &&
+                object(result).sessionID === task.workerID
+                ? "admitted"
+                : "ambiguous";
+            } catch {
+              return "ambiguous";
+            }
+          });
+        },
+      }),
+    );
+  };
+  const backend: NativeBackend = {
+    async wakeSupervision(sessionID, ask = false) {
+      const lost = await serial(async () => {
+        if (!serverAttached || !state.supervision || !runtime) return;
+        try {
+          owned();
+          await attachedCoordinator();
+        } catch {
+          return state.supervision.coordinatorLocation;
+        }
+      });
+      if (lost) {
+        await backend.fenceProject(lost);
+        return;
+      }
+      await runtime?.wake(sessionID, ask);
+    },
+    async resumeTask(taskID, identity) {
+      const result = await serial(async () => {
+        owned();
+        await coordinator(identity.sessionID, identity);
+        const b = binding(taskID);
+        await rejectDeletedWorker(b);
+        await attachedCoordinator();
+        if (
+          !serverAttached ||
+          state.supervision?.coordinatorID !== identity.sessionID
+        )
+          throw new Error(
+            "Start an approved server supervision generation before resuming",
+          );
+        await reconcileSessionDeliveries(
+          b.workerID,
+          state.supervision.coordinatorLocation,
+          identity,
+        );
+        const observed = await readObserved(b);
+        if (!observed.snapshot)
+          throw new Error("Current worker observation unavailable");
+        const body = {
+          reconciliation: {
+            generation: state.supervision.generation,
+            workerID: b.workerID,
+            revision: b.revision,
+            epoch: b.epoch,
+            snapshotFingerprint: fingerprint(observed.snapshot),
+            observedAt: Date.now(),
+            state: "settled",
+            asks: [],
+          },
+        };
+        const accepted = await mutate(
+          "resume",
+          taskID,
+          body,
+          identity.sessionID,
+          identity,
+        );
+        await coordinator(identity.sessionID, identity);
+        return { accepted, snapshot: snapshot() };
+      });
+      const generation = result.snapshot.supervision?.generation;
+      const selectedRuntime = runtime;
+      const arming =
+        selectedRuntime && generation
+          ? await selectedRuntime.rearm(generation)
+          : { status: "held", reason: "Current server runtime is unavailable" };
+      if (arming.status !== "reconciled") {
+        if (
+          runtime === selectedRuntime &&
+          state.supervision?.generation === generation
+        )
+          await backend.fenceProject(state.supervision!.coordinatorLocation);
+        return { accepted: false, reason: arming.reason, snapshot: snapshot() };
+      }
+      const workerID = await serial(async () => {
+        owned();
+        const current = binding(taskID);
+        if (
+          !serverAttached ||
+          state.supervision?.generation !== generation ||
+          current.status !== "active"
+        )
+          return;
+        return current.workerID;
+      });
+      if (!workerID)
+        return {
+          accepted: false,
+          reason: "Task changed while arming supervision",
+          snapshot: snapshot(),
+        };
+      await backend.wakeSupervision(workerID);
+      return { ...result, snapshot: snapshot() };
+    },
     observe(input) {
       return serial(async () => {
         alive();
@@ -1557,6 +1990,8 @@ export async function createNativeBackend(
       });
     },
     async validate(input) {
+      if (!internalReasoning.has(input))
+        throw new Error("Reasoning requires the current server runtime");
       const identity = parseDecisionIdentity(input.identity);
       const unknown = (rationale: string): StrictValidationResult => ({
         receiptID: randomUUID(),
@@ -1575,11 +2010,11 @@ export async function createNativeBackend(
           const evidence = parseEvidence(input.evidence);
           const captured = await serial(async () => {
             owned();
-            const b = await authorizeReasoning("validate", input);
+            const b = await authorizeReasoning(input);
             if (
-              !attached ||
+              !supervisionAttached() ||
               b.status !== "active" ||
-              input.generation !== state.observer?.generation ||
+              input.generation !== generationRecord()?.generation ||
               identity.generation !== input.generation
             )
               return undefined;
@@ -1640,7 +2075,7 @@ export async function createNativeBackend(
             return {
               context: built.context,
               source: structuredClone(source),
-              coordinatorLocation: state.observer!.coordinatorLocation,
+              coordinatorLocation: generationRecord()!.coordinatorLocation,
               state: boundState(b),
               snapshot: observed.snapshot,
               cacheKey,
@@ -1693,8 +2128,8 @@ export async function createNativeBackend(
             const b = binding(identity.taskID);
             const observed = await readObserved(b);
             if (
-              !attached ||
-              state.observer?.generation !== input.generation ||
+              !supervisionAttached() ||
+              generationRecord()?.generation !== input.generation ||
               boundState(b) !== captured.state ||
               !observed.snapshot ||
               fingerprint(observed.snapshot) !==
@@ -1727,54 +2162,89 @@ export async function createNativeBackend(
         reasoningInFlight.delete(flightKey);
       }
     },
+    async startSupervision(identity) {
+      const result = await serial(async () => {
+        alive();
+        if (identity.signal?.aborted)
+          throw new Error("Native operation aborted");
+        await claimRecovered();
+        owned();
+        const current = await coordinator(identity.sessionID, identity);
+        const generation =
+          Math.max(
+            state.supervision?.generation ?? 0,
+            state.observer?.generation ?? 0,
+          ) + 1;
+        if (!Number.isSafeInteger(generation))
+          throw new Error("Observer generation exhausted");
+        const record = {
+          coordinatorID: current.id,
+          coordinatorLocation: current.location.directory,
+          coordinatorFingerprint: fingerprint([
+            current.id,
+            current.agent,
+            current.projectID,
+            current.location,
+          ]),
+          generation,
+        };
+        await ask(
+          identity.sessionID,
+          "start_supervision",
+          JSON.stringify([dataDir, record]),
+          identity,
+          identity.signal,
+        );
+        owned();
+        if (identity.signal?.aborted)
+          throw new Error("Native operation aborted");
+        runtime?.close();
+        serverAttached = false;
+        issued.clear();
+        receipts.clear();
+        receiptInputs.clear();
+        suggestedInputs.clear();
+        for (const binding of state.bindings) {
+          if (binding.status === "active") {
+            binding.status = "held";
+            binding.epoch++;
+          }
+        }
+        for (const entry of state.intents) {
+          if (entry.intent.status === "reserved")
+            entry.intent.status = "ambiguous";
+        }
+        state.version = 2;
+        state.sessionDeliveries ??= [];
+        delete state.observer;
+        state.supervision = record;
+        await persist();
+        serverAttached = true;
+        await attachedCoordinator();
+        return {
+          generation,
+          coordinatorID: current.id,
+          status: "held" as const,
+        };
+      });
+      for (const location of (await host.refreshObservers?.()) ?? [])
+        await backend.fenceProject(location);
+      if (
+        serverAttached &&
+        state.supervision?.generation === result.generation
+      ) {
+        const next = createRuntime(result.generation);
+        runtime = next;
+        await next.start(result.generation);
+      }
+      return result;
+    },
     bootstrap() {
       return {
         dataDir,
         authority: authority === "owned" ? "owned" : "held",
         ...(authority === "owned" ? {} : { reason }),
       };
-    },
-    read(proof) {
-      return serial(async () => {
-        owned();
-        if (!attached || !observer || !state.observer)
-          throw new Error("Observer authority is not eligible");
-        await attachedCoordinator();
-        await observer.authorize(proof, {
-          operation: "inspect",
-          taskID: state.observer.coordinatorID,
-          revision: 0,
-          epoch: 0,
-        });
-        owned();
-        await attachedCoordinator();
-        return snapshot();
-      });
-    },
-    readObservation(input, proof) {
-      return serial(async () => {
-        owned();
-        if (!attached || !observer || !state.observer)
-          throw new Error("Observer authority is not eligible");
-        await attachedCoordinator();
-        const b = binding(input.taskID);
-        const payload = await observer.authorize(proof, {
-          operation: "observe",
-          taskID: b.id,
-          revision: b.revision,
-          epoch: b.epoch,
-        });
-        if (
-          input.workerID !== b.workerID ||
-          fingerprint(payload.body) !== fingerprint({ workerID: b.workerID })
-        )
-          throw new Error("Mismatched observation target");
-        owned();
-        const result = await readObserved(b);
-        owned();
-        await attachedCoordinator();
-        return result;
-      });
     },
     async inspect(identity) {
       alive();
@@ -2007,103 +2477,10 @@ export async function createNativeBackend(
         };
       });
     },
-    attach(input, requestAbortSignal) {
-      return serial(async () => {
-        alive();
-        if (requestAbortSignal?.aborted)
-          throw new Error("Native operation aborted");
-        if (recovered) {
-          authority = await ownership.claim();
-          if (authority === "owned") {
-            try {
-              await load();
-              recovered = false;
-            } catch {
-              authority = "held";
-              reason = "Unreadable recovered state";
-            }
-          }
-        }
-        owned();
-        const { coordinatorID, verifier } = input;
-        await coordinator(coordinatorID);
-        const key = createPublicKey(verifier);
-        if (
-          key.asymmetricKeyType !== "ed25519" ||
-          verifier !== key.export({ type: "spki", format: "pem" }).toString()
-        )
-          throw new Error("Invalid public observer verifier");
-        const next = await observerFor(coordinatorID, requestAbortSignal);
-        const generation = await next.attach(verifier);
-        owned();
-        observer?.revoke();
-        observer = next;
-        attached = true;
-        return {
-          generation,
-          dataDir: state.observer!.dataDir,
-          coordinatorLocation: state.observer!.coordinatorLocation,
-        };
-      });
-    },
-    control(input, requestAbortSignal) {
-      return serial(async () => {
-        owned();
-        if (requestAbortSignal?.aborted)
-          throw new Error("Native operation aborted");
-        if (!attached || !observer || !state.observer)
-          throw new Error("Unapproved observer generation");
-        await attachedCoordinator();
-        if (!CONTROL_OPERATIONS.includes(input.operation))
-          throw new Error("Invalid operation");
-        const create =
-          input.operation === "create" ||
-          input.operation === "adopt" ||
-          input.operation === "detach";
-        const b = create ? undefined : binding(input.taskID);
-        const targetID =
-          input.operation === "detach"
-            ? state.observer.coordinatorID
-            : (b?.id ?? input.taskID);
-        if (input.taskID !== targetID)
-          throw new Error("Mismatched authoritative control target");
-        const payload = await observer.authorize(input.proof, {
-          operation: input.operation,
-          taskID: targetID,
-          revision: b?.revision ?? 0,
-          epoch: b?.epoch ?? 0,
-        });
-        owned();
-        if (requestAbortSignal?.aborted)
-          throw new Error("Native operation aborted");
-        const accepted = await mutate(
-          input.operation,
-          input.taskID,
-          payload.body,
-          state.observer.coordinatorID,
-          undefined,
-          requestAbortSignal,
-        );
-        if (input.operation === "detach")
-          return {
-            accepted,
-            reason:
-              "Detach committed; observer authority revoked. Do not retry.",
-          };
-        try {
-          await attachedCoordinator();
-        } catch {
-          return {
-            accepted,
-            reason:
-              "Operation committed; inventory withheld because coordinator authority changed. Do not retry; attach and reconcile explicitly.",
-          };
-        }
-        return { accepted, snapshot: snapshot() };
-      });
-    },
     async suggest(input) {
       alive();
+      if (!internalReasoning.has(input))
+        throw new Error("Reasoning requires the current server runtime");
       const flightKey = fingerprint(["suggest", input]);
       const pending = reasoningInFlight.get(flightKey);
       if (pending) return structuredClone(await pending) as SuggestResult;
@@ -2112,7 +2489,7 @@ export async function createNativeBackend(
       const work = (async (): Promise<SuggestResult> => {
         const evidence = parseEvidence(input.evidence);
         const captured = await serial(async () => {
-          const b = await authorizeReasoning("suggest", input);
+          const b = await authorizeReasoning(input);
           if (b.revision !== input.revision || b.epoch !== input.epoch)
             throw new Error("Stale task context");
           const observed = await readObserved(b);
@@ -2122,7 +2499,7 @@ export async function createNativeBackend(
             !(await evidenceIsCurrent(b, evidence, observed.snapshot))
           )
             throw new Error("Unavailable current native reasoning evidence");
-          const cacheKey = fingerprint(reasoningPayload("suggest", input).body);
+          const cacheKey = fingerprint(input);
           const cached = suggestedInputs.get(cacheKey);
           if (
             cached &&
@@ -2137,9 +2514,9 @@ export async function createNativeBackend(
           const snapshots = structuredClone(selectedSnapshots(b));
           return {
             binding: structuredClone(b),
-            coordinatorLocation: state.observer!.coordinatorLocation,
+            coordinatorLocation: generationRecord()!.coordinatorLocation,
             snapshots,
-            generation: state.observer?.generation,
+            generation: generationRecord()?.generation,
             state: JSON.stringify([b, snapshots]),
             snapshot: observed.snapshot,
             cacheKey,
@@ -2163,9 +2540,9 @@ export async function createNativeBackend(
           const b = binding(input.taskID);
           const observed = await readObserved(b);
           if (
-            captured.generation !== state.observer?.generation ||
+            captured.generation !== generationRecord()?.generation ||
             captured.state !== JSON.stringify([b, selectedSnapshots(b)]) ||
-            !attached ||
+            !supervisionAttached() ||
             !observed.snapshot ||
             fingerprint(observed.snapshot) !== fingerprint(captured.snapshot) ||
             !(await evidenceIsCurrent(b, evidence, observed.snapshot))
@@ -2249,11 +2626,398 @@ export async function createNativeBackend(
         }
         alive();
         recovered = true;
-        reason = "Recovery approved; separate attachment/rearm required";
+        reason =
+          "Recovery approved; start supervision and explicitly resume tasks";
         return snapshot();
       });
     },
-    nativeControl(operation, taskID, body, identity) {
+    async sessionOperation(request, identity) {
+      const input = structuredClone(request);
+      const execute = await serial(async () => {
+        owned();
+        exact(object(input), [
+          "operation",
+          "sessionID",
+          "location",
+          "agent",
+          "payload",
+        ]);
+        prepareNativeOperation(input);
+        if (!host.nativeOperation)
+          throw new Error("Native session operations unavailable");
+        if (input.sessionID === identity.sessionID)
+          throw new Error("Coordinator cannot be its own worker");
+        const signal = AbortSignal.any([
+          shutdown.signal,
+          ...(identity.signal ? [identity.signal] : []),
+        ]);
+        const caller = await coordinator(identity.sessionID, identity);
+        const creating =
+          input.operation === "create_native_session" ||
+          input.operation === "import_session";
+        const creationFingerprint = fingerprint(input);
+        const previousCreation = creating
+          ? state.sessionDeliveries?.find(
+              (entry) => entry.id === input.sessionID,
+            )
+          : undefined;
+        if (previousCreation) {
+          if (
+            previousCreation.fingerprint !== creationFingerprint ||
+            previousCreation.coordinatorID !== identity.sessionID
+          )
+            throw new Error(
+              "Native creation identity is already reserved for another invocation",
+            );
+          return async () => ({
+            status:
+              previousCreation.status === "admitted"
+                ? "completed"
+                : "uncertain",
+            sessionID: input.sessionID,
+            reason:
+              "Inspect the retained native creation identity; do not retry creation",
+          });
+        }
+        const creationProof = creating
+          ? await invocationProof(identity, caller.location.directory)
+          : undefined;
+        const allowArchived =
+          input.operation === "update_session" &&
+          input.payload.archived === false;
+        await validateTarget(
+          input,
+          creating ? undefined : input.sessionID,
+          allowArchived,
+        );
+        const validateNewAgent = async () => {
+          if (input.operation === "switch_session_agent")
+            await validateTarget({
+              location: input.location,
+              agent: text(input.payload.newAgent),
+            });
+        };
+        await validateNewAgent();
+        const selected = creating
+          ? {
+              id: input.sessionID,
+              location: input.location,
+              agent: input.agent,
+            }
+          : await selectedWorker(input.sessionID, allowArchived);
+        const subject = await host.nativeOperation(
+          input,
+          "subject",
+          caller.location.directory,
+          signal,
+        );
+        const bound = state.bindings.find(
+          (b) => b.workerID === input.sessionID,
+        );
+        const bindingFingerprint = bound ? fingerprint(bound) : undefined;
+        await ask(
+          identity.sessionID,
+          input.operation,
+          JSON.stringify([selected, input.payload, subject]),
+          identity,
+          signal,
+        );
+        signal.throwIfAborted();
+        owned();
+        await validateTarget(
+          input,
+          creating ? undefined : input.sessionID,
+          allowArchived,
+        );
+        if (
+          !creating &&
+          fingerprint(await selectedWorker(input.sessionID, allowArchived)) !==
+            fingerprint(selected)
+        )
+          throw new Error("Selected native target changed during approval");
+        const currentSubject = await host.nativeOperation(
+          input,
+          "subject",
+          caller.location.directory,
+          signal,
+        );
+        if (fingerprint(currentSubject) !== fingerprint(subject))
+          throw new Error("Selected native request changed during approval");
+        const currentBinding = state.bindings.find(
+          (b) => b.workerID === input.sessionID,
+        );
+        if (
+          (currentBinding ? fingerprint(currentBinding) : undefined) !==
+          bindingFingerprint
+        )
+          throw new Error("Task binding changed during approval");
+        await coordinator(identity.sessionID, identity);
+        await validateTarget(
+          input,
+          creating ? undefined : input.sessionID,
+          allowArchived,
+        );
+        await validateNewAgent();
+        owned();
+        if (currentBinding) {
+          if (creating)
+            throw new Error(
+              "Native creation target already has a task binding",
+            );
+          currentBinding.status = "manual";
+          currentBinding.epoch++;
+          await persist();
+        }
+        let creation: SessionDelivery | undefined;
+        if (creating) {
+          creation = {
+            id: input.sessionID,
+            sessionID: input.sessionID,
+            location: input.location,
+            agent: input.agent,
+            coordinatorID: identity.sessionID,
+            serviceID: ownership.owner,
+            operation:
+              input.operation === "import_session" ? "import" : "create",
+            fingerprint: creationFingerprint,
+            createdAt: Date.now(),
+            status: "reserved",
+            invocation: creationProof!,
+          };
+          state = reserveSessionDelivery(creation);
+          await persist();
+        }
+        return async () => {
+          owned();
+          signal.throwIfAborted();
+          try {
+            const result = await awaitNative(
+              host.nativeOperation!(
+                input,
+                "execute",
+                caller.location.directory,
+                signal,
+              ),
+              [signal],
+            );
+            if (creation) {
+              const session = object(result);
+              if (
+                session.id !== input.sessionID ||
+                session.agent !== input.agent ||
+                object(session.location).directory !== input.location
+              )
+                throw new Error(
+                  "Native creation acknowledgement changed identity",
+                );
+              await serial(async () => {
+                owned();
+                creation.status = "admitted";
+                await persist();
+              });
+            }
+            return {
+              status: "completed",
+              ...(creation ? { sessionID: input.sessionID } : {}),
+              ...(result === undefined ? {} : { result }),
+            };
+          } catch {
+            if (creation && !closed && authority === "owned")
+              await serial(async () => {
+                creation.status = "ambiguous";
+                await persist();
+              });
+            // Native effects may have committed; host errors can contain private payloads.
+            return {
+              status: "uncertain",
+              ...(creation ? { sessionID: input.sessionID } : {}),
+              reason:
+                "Native operation outcome is unconfirmed; inspect current native state before requesting another action",
+            };
+          }
+        };
+      });
+      return execute();
+    },
+    sendSession(request, identity) {
+      const input = structuredClone(request);
+      return serial<SessionSendResult>(async () => {
+        owned();
+        exact(object(input), [
+          "sessionID",
+          "location",
+          "agent",
+          "text",
+          "scope",
+          "kind",
+          "options",
+        ]);
+        const sessionID = text(input.sessionID);
+        const location = text(input.location);
+        const agent = text(input.agent);
+        const assignment = text(input.text);
+        if (assignment.length > 12_000) throw new Error("Oversized assignment");
+        if (sessionID === identity.sessionID)
+          throw new Error("Coordinator cannot be its own worker");
+        const caller = await coordinator(identity.sessionID, identity);
+        await validateTarget({ location, agent }, sessionID);
+        const selected = await selectedWorker(sessionID);
+        const bound = state.bindings.find((b) => b.workerID === sessionID);
+        const approvedBinding = bound ? fingerprint(bound) : undefined;
+        if (bound) {
+          const scope = list(input.scope, text);
+          if (
+            !scope.length ||
+            scope.some((entry) => !bound.scope.includes(entry))
+          )
+            throw new Error("Assignment scope exceeds the approved binding");
+        } else if (input.scope !== undefined) {
+          throw new Error("Unbound sessions have no task scope entries");
+        }
+        const kind = input.kind ?? "prompt";
+        const payloadFingerprint = fingerprint(input);
+        const sendID = `msg_${fingerprint([identity.sessionID, identity.messageID, identity.id, kind, sessionID, payloadFingerprint]).slice(0, 32)}`;
+        prepareNativeSend(input, sendID);
+        if (
+          (kind !== "prompt" || input.options !== undefined) &&
+          !host.nativeSend
+        )
+          throw new Error("Native send operation is unavailable");
+        const prior = state.sessionDeliveries?.find(
+          (entry) => entry.id === sendID,
+        );
+        if (prior) {
+          if (prior.fingerprint !== payloadFingerprint)
+            throw new Error(
+              "Delivery invocation changed; inspect its existing identity",
+            );
+          return prior.status === "admitted"
+            ? { sessionID, sendID: prior.id, status: "admitted" }
+            : {
+                sessionID,
+                sendID: prior.id,
+                status: "uncertain",
+                reason:
+                  "Native admission is unconfirmed; inspect this sendID without resending",
+              };
+        }
+        const invocation = await invocationProof(
+          identity,
+          caller.location.directory,
+        );
+        const eligible = async () => {
+          owned();
+          if (identity.signal?.aborted)
+            throw new Error("Native operation aborted");
+          await validateTarget({ location, agent }, sessionID);
+          if (
+            fingerprint(await selectedWorker(sessionID)) !==
+              fingerprint(selected) ||
+            (bound && fingerprint(bound) !== approvedBinding)
+          )
+            throw new Error("Selected session target changed during approval");
+          if (
+            (await deletions()).some((record) =>
+              record.members.includes(sessionID),
+            )
+          )
+            throw new Error("Session has a retained deletion outcome");
+          await reconcileSessionDeliveries(
+            sessionID,
+            caller.location.directory,
+            identity,
+          );
+          owned();
+        };
+        await eligible();
+        await ask(
+          identity.sessionID,
+          kind === "prompt" ? "send_session" : `${kind}_session`,
+          JSON.stringify([selected, input, sendID]),
+          identity,
+          identity.signal,
+        );
+        await eligible();
+        const delivery: SessionDelivery = {
+          id: sendID,
+          sessionID,
+          location,
+          agent,
+          ...(selected.parentID === null
+            ? {}
+            : { parentID: selected.parentID }),
+          coordinatorID: identity.sessionID,
+          serviceID: ownership.owner,
+          operation: kind,
+          fingerprint: payloadFingerprint,
+          createdAt: Date.now(),
+          status: "reserved",
+          invocation,
+        };
+        const candidate = reserveSessionDelivery(delivery);
+        if (bound) {
+          bound.status = "manual";
+          bound.epoch++;
+        }
+        state = candidate;
+        await persist();
+        try {
+          const result = await awaitNative(
+            host.nativeSend
+              ? host.nativeSend(
+                  input,
+                  sendID,
+                  caller.location.directory,
+                  AbortSignal.any([
+                    shutdown.signal,
+                    ...(identity.signal ? [identity.signal] : []),
+                  ]),
+                )
+              : host.session.prompt(
+                  {
+                    sessionID,
+                    id: sendID,
+                    text: assignment,
+                  },
+                  { signal: identity.signal ?? shutdown.signal },
+                ),
+            [shutdown.signal, ...(identity.signal ? [identity.signal] : [])],
+          );
+          if (
+            kind !== "command" &&
+            kind !== "skill" &&
+            kind !== "shell" &&
+            (object(result).id !== sendID ||
+              object(result).sessionID !== sessionID)
+          )
+            throw new Error(
+              "Native send acknowledgement does not match the reserved identity",
+            );
+          owned();
+          delivery.status = "admitted";
+          await persist();
+          return { sessionID, sendID, status: "admitted" };
+        } catch {
+          // Admission may have succeeded; return the retained ID without exposing host error payloads.
+          delivery.status = "ambiguous";
+          if (!closed && authority === "owned") await persist();
+          return {
+            sessionID,
+            sendID,
+            status: "uncertain",
+            reason:
+              authority === "owned"
+                ? "Native admission is unconfirmed; inspect this sendID without resending"
+                : reason,
+          };
+        }
+      });
+    },
+    async nativeControl(operation, taskID, body, identity) {
+      if (operation === "resume") {
+        exact(object(body), []);
+        return backend.resumeTask(taskID, identity);
+      }
       return serial(async () => {
         owned();
         await coordinator(identity.sessionID, identity);
@@ -2289,33 +3053,52 @@ export async function createNativeBackend(
       });
     },
     async fenceProject(location) {
-      if (state.observer?.coordinatorLocation === location) {
-        attached = false;
-        observer?.revoke();
+      const coordinatorLost =
+        generationRecord()?.coordinatorLocation === location;
+      if (state.supervision?.coordinatorLocation === location) {
+        serverAttached = false;
+        runtime?.close();
+      }
+      await serial(async () => {
+        if (authority !== "owned" || closed) return;
+        const affected = new Set(
+          state.bindings
+            .filter((task) => coordinatorLost || task.location === location)
+            .map((task) => task.id),
+        );
+        if (!coordinatorLost && !affected.size) return;
+        for (const task of state.bindings) {
+          if (affected.has(task.id) && task.status === "active") {
+            task.status = "held";
+            task.epoch++;
+          }
+        }
+        for (const entry of state.intents) {
+          if (
+            affected.has(entry.intent.taskID) &&
+            entry.intent.status === "reserved"
+          )
+            entry.intent.status = "ambiguous";
+        }
         issued.clear();
         receipts.clear();
         receiptInputs.clear();
         suggestedInputs.clear();
-      }
-      await serial(async () => {
-        if (
-          state.observer?.coordinatorLocation === location &&
-          authority === "owned"
-        )
-          await persist();
+        await persist();
       });
     },
     async dispose() {
       closed = true;
+      runtime?.close();
+      serverAttached = false;
       shutdown.abort();
-      attached = false;
-      observer?.revoke();
       await ownership.dispose(async () => {
         await tail;
         await host.closeStorage?.();
       });
     },
   };
+  return backend;
 }
 
 export interface WorkerObserverHost {
@@ -2329,6 +3112,39 @@ export interface WorkerObserver {
   idle(event: import("./state.ts").WorkerIdleEvent): Promise<void>;
   event(event: OpenCodeEvent): Promise<void>;
   dispose(): Promise<void>;
+}
+export async function processWorkerEvent(
+  observer: Pick<WorkerObserver, "event">,
+  backend: Pick<NativeBackend, "wakeSupervision">,
+  event: OpenCodeEvent,
+): Promise<void> {
+  await observer.event(event);
+  const ask =
+    event.type === "permission.asked" || event.type === "form.created";
+  if (
+    !ask &&
+    ![
+      "session.idle",
+      "session.execution.failed",
+      "session.execution.interrupted",
+      "session.moved",
+      "session.archived",
+      "session.deleted",
+      "session.agent.selected",
+      "session.model.selected",
+    ].includes(event.type)
+  )
+    return;
+  const data = "data" in event ? event.data : undefined;
+  const sessionID =
+    event.type === "form.created"
+      ? event.data.form.sessionID
+      : data && "sessionID" in data && typeof data.sessionID === "string"
+        ? data.sessionID
+        : "durable" in event
+          ? event.durable.aggregateID
+          : undefined;
+  if (sessionID) await backend.wakeSupervision(sessionID, ask);
 }
 const OBSERVATION_BOUNDS = {
   pendingEvents: 200,
@@ -2701,6 +3517,8 @@ export async function createWorkerObserver(
               "session.moved",
               "session.deleted",
               "session.archived",
+              "session.agent.selected",
+              "session.model.selected",
               "session.synthetic",
               "permission.asked",
               "form.created",
@@ -2896,17 +3714,18 @@ function unavailableCore(
       authority: "held",
       reason,
     }),
-    read: unavailable,
-    readObservation: unavailable,
     inspect: unavailable,
     deleteSession: unavailable,
-    attach: unavailable,
-    control: unavailable,
     suggest: unavailable,
     observe: unavailable,
     validate: unavailable,
     recover: unavailable,
     nativeControl: unavailable,
+    startSupervision: unavailable,
+    resumeTask: unavailable,
+    wakeSupervision: unavailable,
+    sendSession: unavailable,
+    sessionOperation: unavailable,
     inspectDeletions: unavailable,
     fenceProject: close,
     dispose: close,
@@ -3064,6 +3883,75 @@ async function createNativeCore(
       permission: { assert: (...args) => current().permission.assert(...args) },
       storage: sharedStorage,
       canonical,
+      async observeNative(
+        binding,
+        snapshots,
+        observed,
+        coordinatorLocation,
+        signal,
+      ) {
+        const adapter = projects.get(coordinatorLocation);
+        if (!adapter || adapter.abort.signal.aborted)
+          throw new Error("Coordinator project is unavailable");
+        return adapter.native.read((client, nativeSignal) =>
+          readNativeObservation(
+            client,
+            binding,
+            snapshots,
+            AbortSignal.any([signal, nativeSignal, adapter.abort.signal]),
+            observed,
+          ),
+        );
+      },
+      async nativeSend(input, sendID, coordinatorLocation, signal) {
+        const adapter = projects.get(coordinatorLocation);
+        if (!adapter || adapter.abort.signal.aborted)
+          throw new Error("Coordinator project is unavailable");
+        const execute = prepareNativeSend(input, sendID);
+        return adapter.native.read((client, nativeSignal) =>
+          execute(
+            client,
+            AbortSignal.any([signal, nativeSignal, adapter.abort.signal]),
+          ),
+        );
+      },
+      async nativeOperation(input, phase, coordinatorLocation, signal) {
+        const adapter = projects.get(coordinatorLocation);
+        if (!adapter || adapter.abort.signal.aborted)
+          throw new Error("Coordinator project is unavailable");
+        const prepared = prepareNativeOperation(input);
+        return adapter.native.read((client, nativeSignal) =>
+          prepared[phase](
+            client,
+            AbortSignal.any([signal, nativeSignal, adapter.abort.signal]),
+          ),
+        );
+      },
+      async readInvocation(identity, coordinatorLocation) {
+        const adapter = projects.get(coordinatorLocation);
+        if (!adapter || adapter.abort.signal.aborted)
+          throw new Error("Coordinator project is unavailable");
+        return adapter.native.read(async (client, nativeSignal) => {
+          const signal = AbortSignal.any([
+            nativeSignal,
+            adapter.abort.signal,
+            ...(identity.signal ? [identity.signal] : []),
+          ]);
+          const message = await client.session.message.get(
+            { sessionID: identity.sessionID, messageID: identity.messageID },
+            { signal },
+          );
+          if (
+            message.id !== identity.messageID ||
+            message.type !== "assistant" ||
+            message.agent !== identity.agent ||
+            !Number.isSafeInteger(message.time.created) ||
+            message.time.created < 0
+          )
+            throw new Error("Native invocation metadata is unavailable");
+          return { messageID: message.id, createdAt: message.time.created };
+        });
+      },
       async readDelivery(binding, intent, coordinatorLocation) {
         const adapter = projects.get(coordinatorLocation);
         if (!adapter || adapter.abort.signal.aborted) return "unknown";
@@ -3076,9 +3964,29 @@ async function createNativeCore(
           ),
         );
       },
+      async readSessionDelivery(delivery, coordinatorLocation) {
+        const adapter = projects.get(coordinatorLocation);
+        if (!adapter || adapter.abort.signal.aborted) return "unknown";
+        return adapter.native.read((client, signal) =>
+          readNativeSessionDelivery(
+            client,
+            delivery,
+            AbortSignal.any([signal, adapter.abort.signal]),
+          ),
+        );
+      },
       projectActive: (location) => {
         const adapter = projects.get(location);
         return !!adapter && !adapter.abort.signal.aborted;
+      },
+      async refreshObservers() {
+        const selected = [...projects.values()];
+        const results = await Promise.allSettled(
+          selected.map((project) => project.observe?.()),
+        );
+        return selected
+          .filter((_project, index) => results[index]?.status === "rejected")
+          .map((project) => project.location);
       },
       projectSignal: (location) => {
         const adapter = projects.get(location);
@@ -3260,6 +4168,15 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
             let observerClosing: Promise<void> | undefined;
             const stopObserver = () =>
               (observerClosing ??= workerObserver.dispose());
+            let degrading: Promise<void> | undefined;
+            const degradeObserver = () =>
+              (degrading ??= (async () => {
+                try {
+                  await stopObserver();
+                } finally {
+                  await backend.fenceProject(location);
+                }
+              })());
             cleanupSteps.push(stopObserver);
             try {
               if (adapter.abort.signal.aborted) {
@@ -3292,13 +4209,26 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
                       throw new Error(
                         "Native observation intake exceeds bound",
                       );
-                    const work = workerObserver.event(event);
+                    const work = processWorkerEvent(
+                      workerObserver,
+                      backend,
+                      event,
+                    );
                     pendingEvents.add(work);
                     void work.then(
                       () => pendingEvents.delete(work),
                       () => {
                         pendingEvents.delete(work);
-                        void stopObserver().catch(() => undefined);
+                        observerLog("warn", "observer.degraded", {
+                          phase: "event",
+                          classification: "unavailable",
+                        });
+                        void degradeObserver().catch(() =>
+                          observerLog("error", "observer.failed", {
+                            phase: "fence",
+                            classification: "unavailable",
+                          }),
+                        );
                       },
                     );
                   }
@@ -3308,10 +4238,9 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
                       phase: "stream",
                       classification: "unavailable",
                     });
-                  await stopObserver();
                 } finally {
                   try {
-                    await stopObserver();
+                    await degradeObserver();
                   } finally {
                     await Promise.allSettled([...pendingEvents]);
                   }
@@ -3468,62 +4397,11 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
           };
           return action ? traced(action, run) : run();
         };
-        const requestSignal = (signal: AbortSignal) =>
-          AbortSignal.any([adapter.abort.signal, signal]);
         const rpc = await ctx.rpc.register(BackseatRpc, {
           identity: async (input) =>
             serve(async () => native.identity(input), "identity"),
           bootstrap: async () =>
             serve(async () => backend.bootstrap(), "bootstrap"),
-          inspect: async (input) =>
-            serve(() => backend.read(input.proof), "inspect"),
-          attach: async (input, context) =>
-            serve(async () => {
-              const result = await backend.attach(
-                input,
-                requestSignal(context.signal),
-              );
-              const observations = await Promise.allSettled(
-                [...core.projects.values()].map((project) =>
-                  project.observe?.(),
-                ),
-              );
-              for (const observation of observations)
-                if (observation.status === "rejected")
-                  observerLog("warn", "observer.degraded");
-              return result;
-            }, "attach"),
-          control: async (input, context) =>
-            traced("control", async () => {
-              if (adapter.abort.signal.aborted)
-                throw new Error("Project adapter is unavailable");
-              const result = await backend.control(
-                input,
-                requestSignal(context.signal),
-              );
-              return adapter.abort.signal.aborted && result.accepted
-                ? {
-                    accepted: true,
-                    reason:
-                      "Operation committed; serving project unloaded. Do not retry; attach and reconcile explicitly.",
-                  }
-                : result;
-            }),
-          suggest: async (input) =>
-            serve(() => backend.suggest(input), "suggest"),
-          observe: async (input) =>
-            serve(() => backend.readObservation(input, input.proof), "observe"),
-          validate: async (input) =>
-            serve(() => backend.validate(input), "validate"),
-          recover: async (input, context) =>
-            serve(async () => {
-              await backend.recover(
-                input,
-                undefined,
-                requestSignal(context.signal),
-              );
-              return backend.bootstrap();
-            }, "recover"),
         });
         cleanupSteps.push(() => rpc.dispose());
         const registry = createCoordinationTools({

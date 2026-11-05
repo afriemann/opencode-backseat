@@ -1,7 +1,0 @@
-Coordinate / search
-Group: migration
-> api / held
-  shared snapshot contract v3
-  web / needs-input
-Create / Adopt / Open / Share / Hold / Resume / Takeover
-Native navigation / select / back

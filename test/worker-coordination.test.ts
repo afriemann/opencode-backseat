@@ -1,6 +1,12 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { BackseatRpc } from "../src/rpc.ts";
+import { buildContext } from "../src/context.ts";
 import { COORDINATOR_TOOL_IDS } from "../src/tools.ts";
+import {
+  prepareNativeOperation,
+  prepareNativeSend,
+  type SessionOperation,
+} from "../src/native-operations.ts";
 import { openSharedStorage, resolveDataDirectory } from "../src/storage.ts";
 import { coordinatorAgent } from "../src/coordinator-agent.ts";
 import * as subprocess from "node:child_process";
@@ -41,19 +47,15 @@ import {
 import {
   CoordinatorOwnership,
   acquireCoordinatorCore,
-  ObserverAuthority,
   createFilesystemOwnershipPort,
-  createObserverCapability,
-  forceNativeAsk,
   type LockInspection,
-  type ObserverRecord,
-  type SignedControl,
   type OwnershipPort,
 } from "../src/ownership.ts";
 import {
   promisePlugin,
   createNativeBackend,
   createWorkerObserver,
+  processWorkerEvent,
   type NativeBackendHost,
 } from "../src/server.ts";
 import type { OpenCodeClient, SessionMessageInfo } from "@opencode/client";
@@ -67,6 +69,1102 @@ import type {
 } from "@opencode/plugin/promise/tool";
 
 const nativePlugin = promisePlugin(() => {});
+const nativeIdentity = () => ({
+  sessionID: "coordinator",
+  agent: coordinatorAgent.id,
+  messageID: "message",
+  id: "fixture",
+});
+
+// spec: openspec/specs/worker-supervision/spec.md
+describe("Settled-work supervision", () => {
+  it("Evaluates a settled cross-project worker", async () => {
+    const f = await backendFixture(
+      [
+        {
+          ...goal,
+          workerID: "worker-api",
+          revision: 1,
+          epoch: 1,
+          status: "held",
+          followups: 0,
+          nonprogress: 0,
+        },
+        {
+          ...goal,
+          id: "historical-task",
+          workerID: "historical-worker",
+          revision: 1,
+          epoch: 1,
+          status: "manual",
+          followups: 0,
+          nonprogress: 0,
+        },
+      ],
+      0,
+      false,
+      false,
+    );
+    const identity = {
+      sessionID: "coordinator",
+      agent: coordinatorAgent.id,
+      messageID: "supervision",
+      id: "start",
+    };
+    f.host.observeNative = async (task, snapshots, observed) => {
+      const built = buildContext(
+        task,
+        {
+          taskID: task.id,
+          workerID: task.workerID,
+          turn: 1,
+          entries: [
+            {
+              id: "assistant-1:text:0",
+              kind: "worker",
+              text: "Task verification complete",
+            },
+          ],
+        },
+        snapshots,
+        40000,
+      );
+      if (built.status !== "ready") throw new Error(built.reason);
+      return {
+        turn: 1,
+        state: "settled",
+        asks: [],
+        context: built.context,
+        snapshot: observed,
+      };
+    };
+    f.host.generate = async (context, validation) => {
+      f.effects.push(validation ? "validate" : "suggest");
+      return validation
+        ? { status: "accept", rationale: "In-scope non-consent follow-up" }
+        : {
+            taskID: context.task.id,
+            workerID: context.task.workerID,
+            action: "continue",
+            nextStep: "Inspect the requested source",
+            scope: context.task.scope,
+            progress: true,
+          };
+    };
+    try {
+      const started = await f.backend.startSupervision(identity);
+      const task = (await f.backend.inspect()).bindings[0]!;
+      f.observation(task);
+      await f.backend.resumeTask(task.id, identity);
+      expect(f.effects.filter((effect) => effect === "prompt")).toHaveLength(1);
+      await expect(
+        f.backend.suggest({
+          taskID: task.id,
+          revision: task.revision,
+          epoch: (await f.backend.inspect()).bindings[0]!.epoch,
+          generation: started.generation,
+          evidence: {
+            taskID: task.id,
+            workerID: task.workerID,
+            turn: 1,
+            entries: [
+              {
+                id: "assistant-1:text:0",
+                kind: "worker",
+                text: "Task verification complete",
+              },
+            ],
+          },
+        }),
+      ).rejects.toThrow();
+      let published = false;
+      await processWorkerEvent(
+        {
+          event: async () => {
+            published = true;
+          },
+        },
+        {
+          wakeSupervision: async () => {
+            expect(published).toBe(true);
+          },
+        },
+        {
+          id: "event-idle",
+          created: Date.now(),
+          type: "session.idle",
+          data: { sessionID: task.workerID },
+        },
+      );
+      expect(f.effects.filter((effect) => effect === "prompt")).toHaveLength(1);
+      expect(f.effects.filter((effect) => effect === "suggest")).toHaveLength(
+        1,
+      );
+      expect(f.effects.filter((effect) => effect === "validate")).toHaveLength(
+        1,
+      );
+      const state = await f.backend.inspect();
+      expect(state.bindings[0]?.followups).toBe(1);
+      expect(state.intents[0]?.intent.status).toBe("admitted");
+      expect(state.intents[0]?.generation).toBe(started.generation);
+      await f.backend.fenceProject(task.location);
+      const fenced = (await f.backend.inspect()).bindings[0]!;
+      expect(fenced.status).toBe("held");
+      expect(fenced.epoch).toBeGreaterThan(state.bindings[0]!.epoch);
+      expect(fenced.followups).toBe(1);
+      await f.backend.wakeSupervision(task.workerID);
+      expect(f.effects.filter((effect) => effect === "prompt")).toHaveLength(1);
+      f.observation(fenced);
+      await f.backend.resumeTask(task.id, identity);
+      const get = f.host.session.get;
+      f.host.session.get = async (input) => {
+        const session = await get(input);
+        return input.sessionID === "coordinator"
+          ? { ...session, agent: goal.agent }
+          : session;
+      };
+      await f.backend.wakeSupervision("coordinator").catch(() => undefined);
+      expect((await f.backend.inspect()).bindings[0]?.status).toBe("held");
+      f.host.session.get = get;
+      await f.backend.wakeSupervision(task.workerID);
+      expect(f.effects.filter((effect) => effect === "prompt")).toHaveLength(2);
+      expect((await f.backend.inspect()).bindings[0]?.followups).toBe(2);
+      await f.backend.nativeControl("hold", task.id, {}, identity);
+      await f.backend.wakeSupervision(task.workerID);
+      expect(f.effects.filter((effect) => effect === "prompt")).toHaveLength(2);
+    } finally {
+      await f.backend.dispose();
+    }
+    const parallel = await backendFixture(
+      ["first", "second"].map((id) => ({
+        ...goal,
+        id,
+        workerID: `worker-${id}`,
+        revision: 1,
+        epoch: 1,
+        status: "held" as const,
+        followups: 0,
+        nonprogress: 0,
+      })),
+      0,
+      false,
+      false,
+    );
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const evaluating = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const nativeAdmissions: string[] = [];
+    parallel.host.observeNative = f.host.observeNative;
+    parallel.host.generate = async (context, validation) => {
+      if (validation)
+        return { status: "accept", rationale: "In-scope follow-up" };
+      if (context.task.id === "first") {
+        entered();
+        await gate;
+      }
+      return {
+        taskID: context.task.id,
+        workerID: context.task.workerID,
+        action: "continue",
+        nextStep: "Inspect the requested source",
+        scope: context.task.scope,
+        progress: true,
+      };
+    };
+    parallel.host.nativeSend = async (input, sendID) => {
+      const reserved = parseCoordinatorState(parallel.root()).intents.find(
+        (entry) => entry.intent.id === sendID,
+      );
+      expect(reserved?.intent.status).toBe("reserved");
+      expect(reserved?.intent.workerID).toBe(input.sessionID);
+      nativeAdmissions.push(sendID);
+      return { id: sendID, sessionID: input.sessionID };
+    };
+    try {
+      await parallel.backend.startSupervision(identity);
+      for (const binding of (await parallel.backend.inspect()).bindings)
+        parallel.observation(binding);
+      const first = parallel.backend.resumeTask("first", identity);
+      await evaluating;
+      const second = parallel.backend.resumeTask("second", identity);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      release();
+      expect((await first).accepted).toBe(true);
+      expect((await second).accepted).toBe(true);
+      expect(nativeAdmissions).toHaveLength(2);
+      const persisted = await parallel.backend.inspect();
+      expect(persisted.bindings.map((binding) => binding.followups)).toEqual([
+        1, 1,
+      ]);
+      expect(persisted.intents.map((entry) => entry.intent.id).sort()).toEqual(
+        nativeAdmissions.sort(),
+      );
+      expect(
+        persisted.intents.every((entry) => entry.intent.status === "admitted"),
+      ).toBe(true);
+    } finally {
+      release();
+      await parallel.backend.dispose();
+    }
+  });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Explicit native request replies", () => {
+  const identity = {
+    sessionID: "coordinator",
+    agent: coordinatorAgent.id,
+    messageID: "manual-request",
+    id: "reply",
+  };
+  const cases = [
+    {
+      operation: "reply_permission" as const,
+      payload: {
+        requestID: "permission-1",
+        decision: "once",
+        message: "Approved once",
+      },
+    },
+    {
+      operation: "reply_form" as const,
+      payload: {
+        formID: "form-1",
+        answer: { choice: ["selected"], proceed: true, count: 2 },
+      },
+    },
+    {
+      operation: "request_permission" as const,
+      payload: { action: "shell", resources: ["make test"] },
+    },
+    {
+      operation: "remove_saved_permission" as const,
+      payload: { id: "saved-1" },
+    },
+  ];
+  it("Replies to the selected native request", async () => {
+    for (const entry of cases) {
+      const { backend, host, asks } = await backendFixture([], 0, false, false);
+      const calls: unknown[] = [];
+      host.nativeOperation = async (input, phase) => {
+        if (phase === "subject")
+          return {
+            id: "selected-request",
+            state: "pending",
+            resources: ["make test"],
+          };
+        calls.push(input);
+        return { accepted: true };
+      };
+      const input = {
+        ...entry,
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+      };
+      expect(await backend.sessionOperation(input, identity)).toEqual({
+        status: "completed",
+        result: { accepted: true },
+      });
+      expect(calls).toEqual([input]);
+      expect(asks).toEqual([`backseat.${entry.operation}`]);
+      expect((await backend.inspect(identity)).bindings).toEqual([]);
+      await backend.dispose();
+    }
+    const nativeCalls: unknown[] = [];
+    const request = {
+      id: "permission-1",
+      sessionID: "native-worker",
+      action: "shell",
+      resources: ["make test"],
+    };
+    const form = {
+      id: "form-1",
+      sessionID: "native-worker",
+      title: "Select",
+      fields: [{ id: "choice", type: "string", title: "Choice" }],
+      state: { status: "pending" },
+    };
+    const native = {
+      session: {
+        form: {
+          get: async () => form,
+          reply: async (input: unknown) => {
+            nativeCalls.push(input);
+          },
+        },
+      },
+      permission: {
+        get: async () => request,
+        reply: async (input: unknown) => {
+          nativeCalls.push(input);
+        },
+      },
+    } as unknown as OpenCodeClient;
+    for (const entry of cases.slice(0, 2)) {
+      const input = {
+        ...entry,
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+      };
+      const prepared = prepareNativeOperation(input);
+      expect(
+        await prepared.subject(native, new AbortController().signal),
+      ).toEqual(entry.operation === "reply_permission" ? request : form);
+      await prepared.execute(native, new AbortController().signal);
+      expect(nativeCalls.at(-1)).toEqual({
+        sessionID: input.sessionID,
+        ...entry.payload,
+      });
+    }
+    const saved = {
+      id: "saved-1",
+      projectID: "selected-project",
+      action: "shell",
+      resource: "make test",
+      time: { created: 1, updated: 1 },
+    };
+    let rows = [saved, { ...saved, projectID: "another-project" }];
+    let selected = {
+      id: "native-worker",
+      projectID: saved.projectID,
+      agent: goal.agent,
+      location: { directory: goal.location },
+      revert: { messageID: "staged-message" },
+    };
+    const scopedCalls: unknown[] = [];
+    const scopedClient = {
+      session: {
+        get: async () => selected,
+        revert: {
+          commit: async (input: unknown) => {
+            scopedCalls.push(["commit", input]);
+          },
+        },
+      },
+      permission: {
+        create: async (input: unknown) => {
+          scopedCalls.push(["create", input]);
+        },
+        saved: {
+          list: async (input: unknown) => {
+            scopedCalls.push(["list", input]);
+            return rows;
+          },
+          remove: async (input: unknown) => {
+            scopedCalls.push(["remove", input]);
+          },
+        },
+      },
+    } as unknown as OpenCodeClient;
+    const target = {
+      sessionID: "native-worker",
+      location: goal.location,
+      agent: goal.agent,
+    };
+    const signal = new AbortController().signal;
+    const removal = prepareNativeOperation({
+      ...target,
+      operation: "remove_saved_permission",
+      payload: { id: saved.id },
+    });
+    expect(await removal.subject(scopedClient, signal)).toEqual(saved);
+    expect(scopedCalls.at(-1)).toEqual([
+      "list",
+      { projectID: saved.projectID },
+    ]);
+    await removal.execute(scopedClient, signal);
+    expect(scopedCalls.at(-1)).toEqual(["remove", { id: saved.id }]);
+    for (const invalid of [
+      [{ ...saved, projectID: "another-project" }],
+      [saved, saved],
+    ]) {
+      rows = invalid;
+      await expect(removal.subject(scopedClient, signal)).rejects.toThrow(
+        "unavailable",
+      );
+    }
+    const permissionPayload = {
+      action: "shell",
+      resources: ["make test"],
+      save: ["make test"],
+    };
+    await prepareNativeOperation({
+      ...target,
+      operation: "request_permission",
+      payload: permissionPayload,
+    }).execute(scopedClient, signal);
+    expect(scopedCalls.at(-1)).toEqual([
+      "create",
+      { sessionID: target.sessionID, ...permissionPayload },
+    ]);
+    const commit = prepareNativeOperation({
+      ...target,
+      operation: "commit_session_revert",
+      payload: {},
+    });
+    expect(await commit.subject(scopedClient, signal)).toEqual(selected.revert);
+    await commit.execute(scopedClient, signal);
+    expect(scopedCalls.at(-1)).toEqual([
+      "commit",
+      { sessionID: target.sessionID },
+    ]);
+    for (const changed of [
+      { ...selected, id: "another-worker" },
+      { ...selected, location: { directory: "/different/project" } },
+    ]) {
+      selected = changed;
+      await expect(commit.subject(scopedClient, signal)).rejects.toThrow(
+        "changed",
+      );
+    }
+    const bound = {
+      ...goal,
+      workerID: "native-worker",
+      revision: 1,
+      epoch: 2,
+      status: "active" as const,
+      followups: 2,
+      nonprogress: 1,
+    };
+    const fixture = await backendFixture([bound], 0, false, false);
+    fixture.host.nativeOperation = async () => null;
+    const epoch = (await fixture.backend.inspect(identity)).bindings[0]!.epoch;
+    await fixture.backend.sessionOperation(
+      {
+        ...cases[0]!,
+        sessionID: bound.workerID,
+        location: goal.location,
+        agent: goal.agent,
+      },
+      identity,
+    );
+    expect((await fixture.backend.inspect(identity)).bindings[0]).toMatchObject(
+      { status: "manual", epoch: epoch + 1, followups: 2, nonprogress: 1 },
+    );
+    await fixture.backend.dispose();
+  });
+  it("Rejects a changed or unapproved reply", async () => {
+    for (const failure of [
+      "denied",
+      "request-changed",
+      "target-changed",
+      "invalid-answer",
+    ] as const) {
+      const { backend, host, approve, move } = await backendFixture(
+        [],
+        0,
+        false,
+        false,
+      );
+      let subject = "original",
+        executions = 0;
+      host.nativeOperation = async (_input, phase) => {
+        if (phase === "subject")
+          return { id: "request-1", state: "pending", text: subject };
+        executions++;
+      };
+      approve(async () => {
+        if (failure === "denied") throw new Error("Native approval denied");
+        if (failure === "request-changed") subject = "changed";
+        if (failure === "target-changed") move();
+      });
+      const input = {
+        operation: "reply_form" as const,
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+        payload: {
+          formID: "form-1",
+          answer:
+            failure === "invalid-answer"
+              ? { invalid: { nested: true } }
+              : { proceed: true },
+        },
+      };
+      await expect(backend.sessionOperation(input, identity)).rejects.toThrow();
+      expect(executions).toBe(0);
+      await backend.dispose();
+    }
+  });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Full native session controls", () => {
+  const identity = {
+    sessionID: "coordinator",
+    agent: coordinatorAgent.id,
+    messageID: "native-control",
+    id: "control",
+  };
+  const operations = [
+    [
+      "fork_session",
+      { before: "message-before" },
+      "fork",
+      { before: "message-before" },
+    ],
+    [
+      "switch_session_agent",
+      { newAgent: "reviewer" },
+      "switchAgent",
+      { agent: "reviewer" },
+    ],
+    [
+      "switch_session_model",
+      { model: { id: "model", providerID: "provider", variant: "medium" } },
+      "switchModel",
+      { model: { id: "model", providerID: "provider", variant: "medium" } },
+    ],
+    [
+      "update_session",
+      {
+        title: "Selected title",
+        metadata: { selected: true },
+        permissions: [
+          { action: "shell", resource: "make test", effect: "ask" },
+        ],
+        archived: false,
+      },
+      "update",
+      {
+        title: "Selected title",
+        metadata: { selected: true },
+        permissions: [
+          { action: "shell", resource: "make test", effect: "ask" },
+        ],
+        archived: false,
+      },
+    ],
+    [
+      "move_session",
+      { workdir: "/projects/destination", delivery: "queue" },
+      "move",
+      { directory: "/projects/destination", delivery: "queue" },
+    ],
+    ["interrupt_session", { resume: false }, "interrupt", { resume: false }],
+    ["background_session", {}, "background", {}],
+    ["wait_session", {}, "wait", {}],
+    [
+      "generate_session",
+      { prompt: "Summarize selected context" },
+      "generate",
+      { prompt: "Summarize selected context" },
+    ],
+    [
+      "stage_session_revert",
+      { messageID: "boundary", files: true },
+      "stage",
+      { messageID: "boundary", files: true },
+    ],
+    ["clear_session_revert", {}, "clear", {}],
+    ["commit_session_revert", {}, "commit", {}],
+    [
+      "set_session_environment",
+      { variables: { SELECTED: "", MODE: "test" } },
+      "environment",
+      { variables: { SELECTED: "", MODE: "test" } },
+    ],
+    [
+      "put_session_instruction",
+      { key: "selected", value: { enabled: true } },
+      "put",
+      { key: "selected", value: { enabled: true } },
+    ],
+    [
+      "remove_session_instruction",
+      { key: "selected" },
+      "remove",
+      { key: "selected" },
+    ],
+    ["mark_session_viewed", { idle: 42 }, "view", { idle: 42 }],
+  ] as const;
+  it("Executes approved native session operations", async () => {
+    const f = await backendFixture([], 0, false, false);
+    const agents = f.host.agent.list;
+    f.host.agent.list = async (...args) => {
+      const catalog = await agents(...args);
+      return {
+        ...catalog,
+        data: [
+          ...catalog.data,
+          {
+            ...catalog.data.find((agent) => agent.id === goal.agent)!,
+            id: "reviewer",
+          },
+        ],
+      };
+    };
+    const calls: unknown[] = [];
+    f.host.nativeOperation = async (input, phase) => {
+      if (phase === "subject") return null;
+      calls.push(input);
+      return { native: true };
+    };
+    for (const [operation, payload] of operations) {
+      const input = {
+        operation,
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+        payload,
+      };
+      expect(await f.backend.sessionOperation(input, identity)).toEqual({
+        status: "completed",
+        result: { native: true },
+      });
+      expect(calls.at(-1)).toEqual(input);
+      expect(f.asks.at(-1)).toBe(`backseat.${operation}`);
+    }
+    expect((await f.backend.inspect(identity)).bindings).toEqual([]);
+    const get = f.host.session.get;
+    f.host.session.get = async (input) => {
+      const session = await get(input);
+      return input.sessionID === "native-worker"
+        ? { ...session, time: { ...session.time, archived: 10 } }
+        : session;
+    };
+    expect(
+      await f.backend.sessionOperation(
+        {
+          operation: "update_session",
+          sessionID: "native-worker",
+          location: goal.location,
+          agent: goal.agent,
+          payload: { archived: false },
+        },
+        identity,
+      ),
+    ).toEqual({ status: "completed", result: { native: true } });
+    await f.backend.dispose();
+    const callsAtNative: unknown[] = [];
+    const nativeCall = (name: string) => async (payload: unknown) => {
+      callsAtNative.push([name, payload]);
+    };
+    const native = {
+      session: {
+        ...Object.fromEntries(
+          [
+            "fork",
+            "switchAgent",
+            "switchModel",
+            "update",
+            "move",
+            "interrupt",
+            "background",
+            "generate",
+            "environment",
+            "view",
+          ].map((name) => [name, nativeCall(name)]),
+        ),
+        revert: Object.fromEntries(
+          ["stage", "clear", "commit"].map((name) => [name, nativeCall(name)]),
+        ),
+      },
+      experimental: {
+        session: {
+          wait: nativeCall("wait"),
+          instructions: {
+            entry: { put: nativeCall("put"), remove: nativeCall("remove") },
+          },
+        },
+      },
+    } as unknown as OpenCodeClient;
+    for (const [operation, payload, method, expected] of operations) {
+      await prepareNativeOperation({
+        operation,
+        payload,
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+      }).execute(native, new AbortController().signal);
+      expect(callsAtNative.at(-1)).toEqual([
+        method,
+        { sessionID: "native-worker", ...expected },
+      ]);
+    }
+    for (const operation of [
+      "cancel_session_input",
+      "update_session_input",
+      "cancel_session_form",
+    ] as const) {
+      const payload =
+        operation === "cancel_session_form"
+          ? { formID: "selected-form" }
+          : {
+              inboxID: "selected-input",
+              ...(operation === "update_session_input"
+                ? { delivery: "queue" }
+                : {}),
+            };
+      const prepared = prepareNativeOperation({
+        operation,
+        payload,
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+      } as SessionOperation);
+      const selectedInput = {
+        id: "selected-input",
+        sessionID: "native-worker",
+        delivery: "steer",
+      };
+      const selectedForm = {
+        id: "selected-form",
+        sessionID: "native-worker",
+        state: { status: "pending" },
+      };
+      const selectedClient = {
+        session: {
+          inbox: {
+            list: async () => [selectedInput],
+            cancel: nativeCall("cancel-input"),
+            update: nativeCall("update-input"),
+          },
+          form: {
+            get: async () => selectedForm,
+            cancel: nativeCall("cancel-form"),
+          },
+        },
+      } as unknown as OpenCodeClient;
+      expect(
+        await prepared.subject(selectedClient, new AbortController().signal),
+      ).toEqual(
+        operation === "cancel_session_form" ? selectedForm : selectedInput,
+      );
+      await prepared.execute(selectedClient, new AbortController().signal);
+      expect(callsAtNative.at(-1)).toEqual([
+        operation === "cancel_session_form"
+          ? "cancel-form"
+          : operation === "cancel_session_input"
+            ? "cancel-input"
+            : "update-input",
+        { sessionID: "native-worker", ...payload },
+      ]);
+      if (operation === "cancel_session_form")
+        selectedForm.state.status = "replied";
+      else selectedInput.sessionID = "other-session";
+      await expect(
+        prepared.subject(selectedClient, new AbortController().signal),
+      ).rejects.toThrow();
+    }
+    const formFields = [
+      {
+        key: "decision",
+        type: "string",
+        required: true,
+        options: [{ value: "yes", label: "Yes" }],
+      },
+    ];
+    const createForm = prepareNativeOperation({
+      operation: "create_session_form",
+      sessionID: "native-worker",
+      location: goal.location,
+      agent: goal.agent,
+      payload: {
+        formID: "form_selected",
+        title: "Select an answer",
+        fields: formFields,
+      },
+    } as SessionOperation);
+    await createForm.execute(
+      {
+        session: { form: { create: nativeCall("create-form") } },
+      } as unknown as OpenCodeClient,
+      new AbortController().signal,
+    );
+    expect(callsAtNative.at(-1)).toEqual([
+      "create-form",
+      {
+        sessionID: "native-worker",
+        id: "form_selected",
+        title: "Select an answer",
+        fields: formFields,
+      },
+    ]);
+    expect(() =>
+      prepareNativeOperation({
+        operation: "create_session_form",
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+        payload: {
+          formID: "form_selected",
+          title: "Select an answer",
+          fields: [{ key: "bad", type: "unknown" }],
+        },
+      } as SessionOperation),
+    ).toThrow();
+    const creation = await backendFixture([], 0, false, false);
+    let creates = 0;
+    creation.host.nativeOperation = async (input, phase) => {
+      if (phase === "subject") return null;
+      creates++;
+      const reserved = parseCoordinatorState(
+        creation.root(),
+      ).sessionDeliveries?.at(-1);
+      expect(reserved?.sessionID).toBe(input.sessionID);
+      expect(reserved?.status).toBe("reserved");
+      return {
+        id: input.sessionID,
+        agent: input.agent,
+        location: { directory: input.location },
+      };
+    };
+    const createInput = {
+      operation: "create_native_session",
+      sessionID: "ses_selected",
+      location: goal.location,
+      agent: goal.agent,
+      payload: { title: "Selected session" },
+    } as SessionOperation;
+    expect(
+      await creation.backend.sessionOperation(createInput, identity),
+    ).toMatchObject({ status: "completed", sessionID: "ses_selected" });
+    expect(
+      await creation.backend.sessionOperation(createInput, identity),
+    ).toMatchObject({ status: "completed", sessionID: "ses_selected" });
+    expect(creates).toBe(1);
+    expect((await creation.backend.inspect(identity)).bindings).toEqual([]);
+    await creation.backend.dispose();
+    for (const operation of [
+      "create_native_session",
+      "import_session",
+    ] as const) {
+      for (const resolution of ["approved", "denied", "changed"] as const) {
+        const uncertain = await backendFixture([], 0, false, false);
+        let nativeCreates = 0;
+        uncertain.host.nativeOperation = async (_input, phase) => {
+          if (phase === "subject") return null;
+          nativeCreates++;
+          throw new Error("Acknowledgement lost");
+        };
+        const input = {
+          ...createInput,
+          operation,
+          payload:
+            operation === "import_session"
+              ? {
+                  transfer: {
+                    info: {
+                      id: "ses_selected",
+                      projectID: "project",
+                      agent: goal.agent,
+                      location: { directory: goal.location },
+                      cost: 0,
+                      tokens: {
+                        input: 0,
+                        output: 0,
+                        reasoning: 0,
+                        cache: { read: 0, write: 0 },
+                      },
+                      time: { created: 1, updated: 1 },
+                    },
+                    messages: [],
+                  },
+                }
+              : createInput.payload,
+        };
+        try {
+          expect(
+            await uncertain.backend.sessionOperation(input, identity),
+          ).toMatchObject({ status: "uncertain", sessionID: "ses_selected" });
+          expect(
+            await uncertain.backend.sessionOperation(input, identity),
+          ).toMatchObject({ status: "uncertain", sessionID: "ses_selected" });
+          expect(nativeCreates).toBe(1);
+          const altered = structuredClone(input);
+          if ("transfer" in altered.payload && altered.payload.transfer)
+            (
+              altered.payload
+                .transfer as import("@opencode/client").SessionTransferData
+            ).info.cost = 1;
+          else altered.payload = { title: "Different requested session" };
+          await expect(
+            uncertain.backend.sessionOperation(altered, identity),
+          ).rejects.toThrow("reserved");
+          await expect(
+            uncertain.backend.sessionOperation(input, {
+              ...identity,
+              sessionID: "another-coordinator",
+            }),
+          ).rejects.toThrow();
+          expect(nativeCreates).toBe(1);
+          const request = {
+            sessionID: "ses_selected",
+            location: goal.location,
+            agent: goal.agent,
+            text: "Use the inspected native session",
+          };
+          if (resolution !== "approved") {
+            uncertain.approve(async () => {
+              if (resolution === "denied") throw new Error("Resolution denied");
+              uncertain.move();
+            });
+            await expect(
+              uncertain.backend.sendSession(request, {
+                ...identity,
+                id: "after-creation",
+              }),
+            ).rejects.toThrow();
+            expect(
+              parseCoordinatorState(uncertain.root()).sessionDeliveries![0]!
+                .status,
+            ).toBe("ambiguous");
+            expect(nativeCreates).toBe(1);
+            continue;
+          }
+          expect(
+            (
+              await uncertain.backend.sendSession(request, {
+                ...identity,
+                id: "after-creation",
+              })
+            ).status,
+          ).toBe("admitted");
+          expect(uncertain.asks).toContain(
+            "backseat.reconcile_session_creation",
+          );
+          expect(
+            parseCoordinatorState(uncertain.root()).sessionDeliveries![0]!
+              .status,
+          ).toBe("admitted");
+          expect(nativeCreates).toBe(1);
+        } finally {
+          await uncertain.backend.dispose();
+        }
+      }
+    }
+    await prepareNativeOperation(createInput).execute(
+      {
+        session: { create: nativeCall("create-session") },
+      } as unknown as OpenCodeClient,
+      new AbortController().signal,
+    );
+    expect(callsAtNative.at(-1)).toEqual([
+      "create-session",
+      {
+        id: "ses_selected",
+        agent: goal.agent,
+        location: { directory: goal.location },
+        title: "Selected session",
+      },
+    ]);
+    const transfer = {
+      info: {
+        id: "ses_imported",
+        projectID: "project",
+        agent: goal.agent,
+        location: { directory: "/projects/source" },
+        cost: 0,
+        tokens: {
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+        time: { created: 1, updated: 1 },
+      },
+      messages: [],
+    };
+    const importInput = {
+      operation: "import_session",
+      sessionID: "ses_imported",
+      location: goal.location,
+      agent: goal.agent,
+      payload: { transfer },
+    } as SessionOperation;
+    await prepareNativeOperation(importInput).execute(
+      {
+        experimental: { session: { import: nativeCall("import-session") } },
+      } as unknown as OpenCodeClient,
+      new AbortController().signal,
+    );
+    expect(callsAtNative.at(-1)).toEqual([
+      "import-session",
+      { ...transfer, location: { directory: goal.location } },
+    ]);
+    expect(() =>
+      prepareNativeOperation({
+        ...importInput,
+        sessionID: "different-session",
+      }),
+    ).toThrow("identity");
+  });
+  it("Rejects denied stale or unsupported controls", async () => {
+    for (const failure of [
+      "denied",
+      "stale",
+      "unsupported",
+      "cancelled",
+      "invalid-payload",
+      "coordinator-agent",
+    ] as const) {
+      const f = await backendFixture([], 0, false, false);
+      let executes = 0;
+      f.host.nativeOperation = async (_input, phase) => {
+        if (phase === "execute") executes++;
+        return null;
+      };
+      const abort = new AbortController();
+      f.approve(async () => {
+        if (failure === "denied") throw new Error("Native approval denied");
+        if (failure === "stale") f.move();
+        if (failure === "cancelled") abort.abort();
+      });
+      const input = {
+        operation:
+          failure === "unsupported"
+            ? "unknown_native_control"
+            : failure === "coordinator-agent"
+              ? "switch_session_agent"
+              : "interrupt_session",
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+        payload:
+          failure === "invalid-payload"
+            ? { resume: "not-boolean" }
+            : failure === "coordinator-agent"
+              ? { newAgent: coordinatorAgent.id }
+              : { resume: false },
+      };
+      await expect(
+        f.backend.sessionOperation(
+          input as Parameters<typeof f.backend.sessionOperation>[0],
+          { ...identity, signal: abort.signal },
+        ),
+      ).rejects.toThrow();
+      expect(executes).toBe(0);
+      await f.backend.dispose();
+    }
+    const f = await backendFixture([], 0, false, false);
+    f.host.nativeOperation = async (_input, phase) => {
+      if (phase === "execute")
+        throw new Error("Private native payload must not escape");
+      return null;
+    };
+    const result = await f.backend.sessionOperation(
+      {
+        operation: "interrupt_session",
+        sessionID: "native-worker",
+        location: goal.location,
+        agent: goal.agent,
+        payload: {},
+      },
+      identity,
+    );
+    expect(result).toMatchObject({ status: "uncertain" });
+    expect(JSON.stringify(result)).not.toContain("Private native payload");
+    await f.backend.dispose();
+  });
+});
 
 type NativeAgent = NonNullable<ReturnType<AgentEditor["get"]>>;
 type NativeExecutionEvent = Pick<
@@ -80,6 +1178,255 @@ const observerScope = {
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Shared durable coordination store", () => {
+  it("Reloads task-free delivery state without resetting tasks", async () => {
+    const { host } = creationHost();
+    const binding = {
+      ...(await createWorker(goal, host)),
+      followups: 2,
+      nonprogress: 1,
+    };
+    const populated = {
+      version: 1,
+      bindings: [binding],
+      snapshots: [],
+      intents: [],
+      completions: [],
+    };
+    const previous = parseCoordinatorState(populated);
+    const delivery = {
+      id: "msg_unbound",
+      sessionID: "unbound-worker",
+      location: "/projects/other",
+      agent: "engineer",
+      coordinatorID: "coordinator",
+      serviceID: "native-incarnation",
+      operation: "prompt",
+      fingerprint: fingerprint({ text: "Approved assignment" }),
+      createdAt: 1,
+      status: "ambiguous",
+    };
+    const encoded = JSON.stringify({
+      ...populated,
+      version: 2,
+      sessionDeliveries: [delivery],
+    });
+    const loaded = parseCoordinatorState(JSON.parse(encoded));
+    expect(loaded.bindings).toEqual(previous.bindings);
+    expect(loaded.intents).toEqual(previous.intents);
+    expect(loaded).toMatchObject({
+      version: 2,
+      sessionDeliveries: [delivery],
+    });
+    expect(parseCoordinatorState(JSON.parse(JSON.stringify(loaded)))).toEqual(
+      loaded,
+    );
+    expect(JSON.stringify(populated)).toBe(JSON.stringify(previous));
+    const proven = {
+      ...loaded,
+      deliveryCutoff: 10,
+      sessionDeliveries: [
+        {
+          ...loaded.sessionDeliveries![0]!,
+          invocation: {
+            messageID: "assistant-parent",
+            callID: "native-tool-call",
+            createdAt: 20,
+          },
+        },
+      ],
+    };
+    expect(parseCoordinatorState(JSON.parse(JSON.stringify(proven)))).toEqual(
+      proven,
+    );
+  });
+
+  it("Retires confirmed deliveries without replaying expired invocations", async () => {
+    const records = Array.from(
+      { length: STATE_BOUNDS.sessionDeliveries },
+      (_, i) => ({
+        id: `msg_retained_${i}`,
+        sessionID: "historical-worker",
+        location: goal.location,
+        agent: goal.agent,
+        coordinatorID: "coordinator",
+        serviceID: "incarnation",
+        operation: "prompt" as const,
+        fingerprint: fingerprint(i),
+        createdAt: i,
+        status: "admitted" as const,
+        invocation: {
+          messageID: `parent_${i}`,
+          callID: `call_${i}`,
+          createdAt: i + 1,
+        },
+      }),
+    );
+    const base = {
+      ...parseCoordinatorState(undefined),
+      version: 2 as const,
+      sessionDeliveries: records,
+    };
+    const request = {
+      sessionID: "worker",
+      location: goal.location,
+      agent: goal.agent,
+      text: "New assignment",
+    };
+    const f = await backendFixture([], 0, false, false, [], base);
+    try {
+      expect(
+        (await f.backend.sendSession(request, nativeIdentity())).status,
+      ).toBe("admitted");
+      const state = parseCoordinatorState(f.root());
+      expect(state.sessionDeliveries).toHaveLength(800);
+      expect(state.deliveryCutoff).toBe(1);
+      expect(
+        state.sessionDeliveries!.some((r) => r.id === records[0]!.id),
+      ).toBe(false);
+      const reload = parseCoordinatorState(JSON.parse(JSON.stringify(state)));
+      expect(reload.deliveryCutoff).toBe(1);
+      f.host.readInvocation = async (identity) => ({
+        messageID: identity.messageID,
+        createdAt: 1,
+      });
+      for (const id of ["retired-call", "same-time-other-call"]) {
+        await expect(
+          f.backend.sendSession(
+            { ...request, text: id },
+            { ...nativeIdentity(), id },
+          ),
+        ).rejects.toThrow("expired");
+      }
+      expect(f.effects.filter((e) => e === "prompt")).toHaveLength(1);
+      const restored = await backendFixture([], 0, false, false, [], reload);
+      restored.host.readInvocation = async (identity) => ({
+        messageID: identity.messageID,
+        createdAt: 1,
+      });
+      try {
+        await expect(
+          restored.backend.sendSession(request, {
+            ...nativeIdentity(),
+            id: "expired-after-reload",
+          }),
+        ).rejects.toThrow("expired");
+        expect(restored.effects).not.toContain("prompt");
+      } finally {
+        await restored.backend.dispose();
+      }
+    } finally {
+      await f.backend.dispose();
+    }
+    for (const mode of [
+      "ambiguous",
+      "legacy",
+      "missing-proof",
+      "wrong-message",
+      "negative-time",
+      "unsupported-proof",
+    ] as const) {
+      const pinned = records.map(({ invocation, ...record }) => ({
+        ...record,
+        ...(mode === "legacy" ? {} : { invocation }),
+        ...(mode === "ambiguous" ? { status: "ambiguous" as const } : {}),
+      }));
+      const held = await backendFixture([], 0, false, false, [], {
+        ...base,
+        sessionDeliveries: pinned,
+      });
+      if (mode === "missing-proof")
+        held.host.readInvocation = async () => {
+          throw new Error("Unavailable message");
+        };
+      if (mode === "wrong-message" || mode === "negative-time")
+        held.host.readInvocation = async (identity) => ({
+          messageID:
+            mode === "wrong-message" ? "different-message" : identity.messageID,
+          createdAt: mode === "negative-time" ? -1 : 1000,
+        });
+      if (mode === "unsupported-proof") delete held.host.readInvocation;
+      try {
+        await expect(
+          held.backend.sendSession(request, nativeIdentity()),
+        ).rejects.toThrow();
+        expect(held.effects).not.toContain("prompt");
+        expect(
+          parseCoordinatorState(held.root()).sessionDeliveries,
+        ).toHaveLength(800);
+      } finally {
+        await held.backend.dispose();
+      }
+    }
+  });
+
+  it("Rejects incompatible delivery records without reset", () => {
+    const delivery = {
+      id: "msg_unbound",
+      sessionID: "unbound-worker",
+      location: "/projects/other",
+      agent: "engineer",
+      coordinatorID: "coordinator",
+      serviceID: "native-incarnation",
+      operation: "prompt",
+      fingerprint: fingerprint({ text: "Approved assignment" }),
+      createdAt: 1,
+      status: "ambiguous",
+    };
+    const base = parseCoordinatorState(undefined);
+    const extended = { ...base, version: 2, sessionDeliveries: [delivery] };
+    for (const invalid of [
+      { ...extended, version: 1 },
+      { ...base, version: 2 },
+      { ...extended, version: 3 },
+      { ...extended, deliveryCutoff: -1 },
+      {
+        ...extended,
+        sessionDeliveries: [
+          {
+            ...delivery,
+            invocation: { messageID: "parent", callID: "call", createdAt: -1 },
+          },
+        ],
+      },
+      {
+        ...extended,
+        sessionDeliveries: [
+          {
+            ...delivery,
+            invocation: { messageID: "parent", callID: "", createdAt: 1 },
+          },
+        ],
+      },
+      { ...extended, sessionDeliveries: [delivery, delivery] },
+      {
+        ...extended,
+        sessionDeliveries: Array.from(
+          { length: STATE_BOUNDS.sessionDeliveries + 1 },
+          (_, index) => ({
+            ...delivery,
+            id: `msg_${index}`,
+          }),
+        ),
+      },
+      ...[
+        { status: "delivered" },
+        { fingerprint: "not-a-fingerprint" },
+        { createdAt: -1 },
+        { id: "x".repeat(201) },
+        { sessionID: "" },
+        { operation: "arbitrary" },
+        { text: "Do not persist prompt content" },
+      ].map((change) => ({
+        ...extended,
+        sessionDeliveries: [{ ...delivery, ...change }],
+      })),
+    ]) {
+      const encoded = JSON.stringify(invalid);
+      expect(() => parseCoordinatorState(invalid)).toThrow();
+      expect(JSON.stringify(invalid)).toBe(encoded);
+    }
+  });
+
   it("Preserves populated stores across manual assignments", async () => {
     const { host } = creationHost();
     const binding = {
@@ -541,21 +1888,6 @@ async function registeredCoordinator(
   let nativeRpc:
     | {
         bootstrap(): Promise<import("../src/rpc.ts").CoordinatorBootstrap>;
-        attach(
-          input: { coordinatorID: string; verifier: string },
-          context: { signal: AbortSignal },
-        ): Promise<{
-          generation: number;
-          dataDir: string;
-          coordinatorLocation: string;
-        }>;
-        inspect(input: {
-          proof: SignedControl;
-        }): Promise<import("../src/rpc.ts").CoordinatorSnapshot>;
-        recover(
-          input: { coordinatorID: string },
-          context: { signal: AbortSignal },
-        ): Promise<import("../src/rpc.ts").CoordinatorBootstrap>;
       }
     | undefined;
   const registration = { dispose: async () => {} };
@@ -733,7 +2065,11 @@ async function registeredCoordinator(
     defaults,
     disposedHooks,
     dispatched,
-    async invoke(tool: string, input: unknown = {}) {
+    async invoke(
+      tool: string,
+      input: unknown = {},
+      signal = new AbortController().signal,
+    ) {
       const event = {
         tool,
         sessionID: home,
@@ -747,7 +2083,7 @@ async function registeredCoordinator(
       if (!selected) throw new Error("Unregistered tool");
       return selected.execute(input, {
         ...event,
-        signal: new AbortController().signal,
+        signal,
         progress: async () => {},
       });
     },
@@ -813,6 +2149,7 @@ describe("Bundled conversational coordinator", () => {
         "edit",
         "backseat_inspect",
         "backseat_control",
+        "backseat_unregistered",
         "skill",
         "permission.reply",
         "form.reply",
@@ -826,19 +2163,8 @@ describe("Bundled conversational coordinator", () => {
         }),
       ).rejects.toThrow("Coordinator tool");
       expect(f.dispatched).toEqual([]);
-      for (const tool of [
-        "execute",
-        "backseat_list_sessions",
-        "backseat_dispatch_task",
-        "question",
-      ])
-        await f.execute(tool);
-      expect(f.dispatched).toEqual([
-        "execute",
-        "backseat_list_sessions",
-        "backseat_dispatch_task",
-        "question",
-      ]);
+      for (const tool of COORDINATOR_TOOL_IDS) await f.execute(tool);
+      expect(f.dispatched).toEqual([...COORDINATOR_TOOL_IDS]);
       await f.execute("read", {
         agent: "engineer" as NativeExecutionEvent["agent"],
       });
@@ -1046,15 +2372,10 @@ describe("Bundled conversational coordinator", () => {
               (rule.action === "backseat.*" && action.startsWith("backseat.")),
           )
           .at(-1)?.effect;
-      for (const tool of [
-        "execute",
-        "backseat_list_sessions",
-        "backseat_delete_session",
-        "question",
-      ])
+      for (const tool of COORDINATOR_TOOL_IDS)
         expect(effect(tool)).toBe("allow");
       for (const action of [
-        "backseat.attach",
+        "backseat.start_supervision",
         "backseat.create",
         "backseat.dispatch",
         "backseat.adopt",
@@ -1272,15 +2593,66 @@ describe("Bundled conversational coordinator", () => {
       try {
         const before = fixture.asks.length;
         await expect(
-          fixture.backend.attach({
-            coordinatorID: "coordinator",
-            verifier: createObserverCapability().verifier,
-          }),
+          fixture.backend.startSupervision(nativeIdentity()),
         ).rejects.toThrow("Backseat Coordinator");
         expect(fixture.asks).toHaveLength(before);
       } finally {
         await fixture.backend.dispose();
       }
+    }
+  });
+  it("Preserves cross-project control under inherited policy", async () => {
+    const f = await backendFixture([], 0, false, false);
+    try {
+      const locations: unknown[] = [];
+      const catalog = f.host.agent.list;
+      f.host.agent.list = async (input) => {
+        locations.push(input?.location?.directory);
+        const result = await catalog(input);
+        return {
+          ...result,
+          data: result.data.map((agent) =>
+            agent.id === coordinatorAgent.id
+              ? {
+                  ...agent,
+                  permissions: [...agent.permissions, ...inheritedPolicy],
+                }
+              : agent,
+          ),
+        };
+      };
+      f.host.nativeSend = async (input, sendID, coordinatorLocation) => {
+        expect(input.location).toBe(goal.location);
+        expect(coordinatorLocation).toBe("/projects/home");
+        return f.host.session.prompt({
+          sessionID: input.sessionID,
+          id: sendID,
+          text: input.text,
+        });
+      };
+      const result = await f.backend.sendSession(
+        {
+          sessionID: "selected-worker",
+          location: goal.location,
+          agent: goal.agent,
+          text: "Run the approved endpoint checks",
+        },
+        nativeIdentity(),
+      );
+      expect(result.status).toBe("admitted");
+      expect(f.asks).toEqual(["backseat.send_session"]);
+      expect(f.effects).toEqual(["prompt"]);
+      expect(locations).toContain("/projects/home");
+      expect(
+        parseCoordinatorState(f.root()).sessionDeliveries![0],
+      ).toMatchObject({
+        sessionID: "selected-worker",
+        location: goal.location,
+        coordinatorID: "coordinator",
+      });
+      expect((await f.backend.inspect()).bindings).toEqual([]);
+    } finally {
+      await f.backend.dispose();
     }
   });
   it("Rejects coordinator worker assignments", async () => {
@@ -1340,9 +2712,10 @@ async function backendFixture(
   unresolved = false,
   attach = true,
   completions: import("../src/state.ts").CompletionRecord[] = [],
+  initial?: import("../src/state.ts").CoordinatorState,
 ) {
   const home = "/projects/home";
-  let root: unknown = {
+  let root: unknown = initial ?? {
     version: 1,
     bindings,
     snapshots: Array.from({ length: snapshotCount }, (_, n) => ({
@@ -1393,6 +2766,10 @@ async function backendFixture(
     { id: "idle-1", type: "idle", time: { created: 1 }, outcome: "succeeded" },
   ];
   const host: NativeBackendHost = {
+    readInvocation: async (identity) => ({
+      messageID: identity.messageID,
+      createdAt: 1000,
+    }),
     session: {
       async get({ sessionID }) {
         return {
@@ -1470,6 +2847,33 @@ async function backendFixture(
       effects.push("generate");
       return {};
     },
+    observeNative: async (binding, snapshots, snapshot) => {
+      const built = buildContext(
+        binding,
+        {
+          taskID: binding.id,
+          workerID: binding.workerID,
+          turn: 1,
+          entries: [
+            {
+              id: "fixture-observation",
+              kind: "worker",
+              text: "No task evidence supplied by this fixture",
+            },
+          ],
+        },
+        snapshots,
+        40000,
+      );
+      if (built.status !== "ready") throw new Error(built.reason);
+      return {
+        turn: 1,
+        state: binding.status === "active" ? "running" : "settled",
+        asks: [],
+        snapshot,
+        context: built.context,
+      };
+    },
   };
   const backend = await createNativeBackend(
     host,
@@ -1484,36 +2888,20 @@ async function backendFixture(
     }),
     home,
   );
-  const capability = createObserverCapability();
   const { generation } = attach
-    ? await backend.attach({
-        coordinatorID: "coordinator",
-        verifier: capability.verifier,
-      })
+    ? await backend.startSupervision(nativeIdentity())
     : { generation: 0 };
-  let sequence = 0;
   const control = async (
     operation: "create" | "adopt" | "hold" | "resume" | "share",
     taskID: string,
     body: unknown,
   ) => {
-    const b = (await backend.inspect()).bindings.find((b) => b.id === taskID);
-    return backend.control({
+    return backend.nativeControl(
       operation,
       taskID,
-      proof: capability.sign(
-        generation,
-        ++sequence,
-        {
-          operation,
-          taskID,
-          revision: b?.revision ?? 0,
-          epoch: b?.epoch ?? 0,
-          body,
-        },
-        observerScope,
-      ),
-    });
+      operation === "resume" ? {} : body,
+      nativeIdentity(),
+    );
   };
   const observation = (b: WorkerBinding) => {
     const snapshot = {
@@ -1592,28 +2980,10 @@ describe("Authorised shared-state inspection", () => {
         dataDir: "/projects/home",
         authority: "owned",
       });
-      const capability = createObserverCapability();
-      const attached = await f.backend.attach({
-        coordinatorID: "coordinator",
-        verifier: capability.verifier,
-      });
-      expect(attached).toMatchObject(observerScope);
       f.failWrite();
-      await expect(
-        f.backend.read(
-          capability.sign(
-            attached.generation,
-            1,
-            {
-              operation: "inspect",
-              taskID: "coordinator",
-              revision: 0,
-              epoch: 0,
-            },
-            attached,
-          ),
-        ),
-      ).rejects.toThrow("Storage failed");
+      await expect(f.control("hold", goal.id, {})).rejects.toThrow(
+        "Storage failed",
+      );
       const metadata = f.backend.bootstrap();
       expect(metadata.authority).toBe("held");
       expect(Object.keys(metadata).sort()).toEqual([
@@ -1626,7 +2996,7 @@ describe("Authorised shared-state inspection", () => {
     }
   });
   it("Rejects unauthorised shared-state reads", async () => {
-    for (const change of ["location", "role"] as const) {
+    for (const change of ["role", "catalog"] as const) {
       const f = await backendFixture([
         {
           ...goal,
@@ -1640,286 +3010,26 @@ describe("Authorised shared-state inspection", () => {
       ]);
       try {
         const get = f.host.session.get;
-        let changed = false;
         f.host.session.get = async (input) => ({
           ...(await get(input)),
-          ...(changed && input.sessionID === "coordinator"
-            ? change === "location"
-              ? { location: { directory: "/projects/relocated" } }
-              : { agent: "engineer" }
+          ...(change === "role" && input.sessionID === "coordinator"
+            ? { agent: "engineer" }
             : {}),
         });
-        let entered!: () => void, release!: () => void;
-        const ready = new Promise<void>((done) => {
-          entered = done;
+        if (change === "catalog")
+          f.host.agent.list = async () => ({
+            location: { directory: "/projects/home" },
+            data: [],
+          });
+        await expect(f.backend.inspect(nativeIdentity())).rejects.toThrow();
+        expect(f.backend.bootstrap()).toEqual({
+          dataDir: "/projects/home",
+          authority: "owned",
         });
-        const wait = new Promise<void>((done) => {
-          release = done;
-        });
-        const { get: read, set } = f.host.storage;
-        let writes = 0;
-        f.host.storage = {
-          get: read,
-          set: async (key, value) => {
-            if (++writes === 2) {
-              entered();
-              await wait;
-            }
-            await set(key, value);
-          },
-        };
-        const pending = f.control("hold", goal.id, {});
-        await ready;
-        changed = true;
-        release();
-        const result = await pending;
-        expect(result.accepted).toBe(true);
-        expect(result.snapshot).toBeUndefined();
-        expect(result.reason).toMatch(/committed.*do not retry/i);
-        expect((await f.backend.inspect()).bindings[0]!.epoch).toBe(2);
+        expect(f.effects).not.toContain("prompt");
       } finally {
         await f.backend.dispose();
       }
-    }
-    const disclosures: string[] = [];
-    for (const window of [
-      "proof-publication",
-      "observation-read",
-      "final-catalog",
-    ] as const) {
-      const paused = await backendFixture([
-        {
-          ...goal,
-          workerID: "worker",
-          revision: 1,
-          epoch: 1,
-          status: "held",
-          followups: 2,
-          nonprogress: 0,
-        },
-      ]);
-      try {
-        const getSession = paused.host.session.get;
-        let directory = observerScope.coordinatorLocation;
-        paused.host.session.get = async (input) => ({
-          ...(await getSession(input)),
-          ...(input.sessionID === "coordinator"
-            ? { location: { directory } }
-            : {}),
-        });
-        const listAgents = paused.host.agent.list;
-        paused.host.agent.list = async (input) => ({
-          ...(await listAgents(input)),
-          location: { directory: input?.location?.directory ?? directory },
-        });
-        const entry = (await paused.backend.inspect()).bindings[0]!;
-        paused.observation(entry);
-        const capability = createObserverCapability();
-        const { generation } = await paused.backend.attach({
-          coordinatorID: "coordinator",
-          verifier: capability.verifier,
-        });
-        let entered!: () => void, release!: () => void;
-        const ready = new Promise<void>((done) => {
-          entered = done;
-        });
-        const wait = new Promise<void>((done) => {
-          release = done;
-        });
-        const catalog = paused.host.agent.list;
-        let catalogs = 0;
-        paused.host.agent.list = async (input) => {
-          const result = await catalog(input);
-          if (window === "final-catalog" && ++catalogs === 2) {
-            entered();
-            await wait;
-          }
-          return result;
-        };
-        const { get, set } = paused.host.storage;
-        paused.host.storage = {
-          get: async (key) => {
-            if (window === "observation-read" && key.endsWith(":snapshot")) {
-              entered();
-              await wait;
-            }
-            return get(key);
-          },
-          set: async (key, value) => {
-            if (window === "proof-publication") {
-              entered();
-              await wait;
-            }
-            return set(key, value);
-          },
-        };
-        const operation =
-          window === "proof-publication" ? "inspect" : "observe";
-        const proof = capability.sign(
-          generation,
-          1,
-          {
-            operation,
-            taskID: operation === "inspect" ? "coordinator" : entry.id,
-            revision: operation === "inspect" ? 0 : entry.revision,
-            epoch: operation === "inspect" ? 0 : entry.epoch,
-            ...(operation === "observe"
-              ? { body: { workerID: entry.workerID } }
-              : {}),
-          },
-          observerScope,
-        );
-        const pending =
-          operation === "inspect"
-            ? paused.backend.read(proof)
-            : paused.backend.readObservation(
-                { taskID: entry.id, workerID: entry.workerID },
-                proof,
-              );
-        await ready;
-        directory = "/projects/relocated-before-disclosure";
-        release();
-        disclosures.push(
-          await pending.then(
-            () => `${window}:disclosed`,
-            (error) =>
-              `${window}:${/Observer authority|Coordinator identity changed/.test(String(error)) ? "held" : String(error)}`,
-          ),
-        );
-      } finally {
-        await paused.backend.dispose();
-      }
-    }
-    expect(disclosures).toEqual([
-      "proof-publication:held",
-      "observation-read:held",
-      "final-catalog:held",
-    ]);
-    const f = await backendFixture([
-      {
-        ...goal,
-        workerID: "worker",
-        revision: 1,
-        epoch: 1,
-        status: "held",
-        followups: 2,
-        nonprogress: 0,
-      },
-    ]);
-    const capability = createObserverCapability();
-    try {
-      const { generation } = await f.backend.attach({
-        coordinatorID: "coordinator",
-        verifier: capability.verifier,
-      });
-      const read = capability.sign(
-        generation,
-        1,
-        { operation: "inspect", taskID: "coordinator", revision: 0, epoch: 0 },
-        observerScope,
-      );
-      for (const change of [
-        { dataDir: "/different-store" },
-        { coordinatorLocation: "/different-conversation" },
-      ]) {
-        await expect(f.backend.read({ ...read, ...change })).rejects.toThrow(
-          "Observer authority",
-        );
-        await expect(
-          f.backend.read(
-            capability.sign(
-              generation,
-              1,
-              {
-                operation: "inspect",
-                taskID: "coordinator",
-                revision: 0,
-                epoch: 0,
-              },
-              { ...observerScope, ...change },
-            ),
-          ),
-        ).rejects.toThrow("Observer authority");
-      }
-      await expect(
-        f.backend.read({
-          ...read,
-          signature: createObserverCapability().sign(
-            generation,
-            1,
-            {
-              operation: "inspect",
-              taskID: "coordinator",
-              revision: 0,
-              epoch: 0,
-            },
-            observerScope,
-          ).signature,
-        }),
-      ).rejects.toThrow("Observer authority");
-      expect((await f.backend.read(read)).bindings[0]?.followups).toBe(2);
-      await expect(f.backend.read(read)).rejects.toThrow("Observer authority");
-      const task = (await f.backend.inspect()).bindings[0]!;
-      f.observation(task);
-      const observation = capability.sign(
-        generation,
-        2,
-        {
-          operation: "observe",
-          taskID: task.id,
-          revision: task.revision,
-          epoch: task.epoch,
-          body: { workerID: task.workerID },
-        },
-        observerScope,
-      );
-      await expect(
-        f.backend.readObservation(
-          { taskID: task.id, workerID: "different-worker" },
-          observation,
-        ),
-      ).rejects.toThrow("Mismatched observation");
-      const current = capability.sign(
-        generation,
-        3,
-        {
-          operation: "observe",
-          taskID: task.id,
-          revision: task.revision,
-          epoch: task.epoch,
-          body: { workerID: task.workerID },
-        },
-        observerScope,
-      );
-      expect(
-        (
-          await f.backend.readObservation(
-            { taskID: task.id, workerID: task.workerID },
-            current,
-          )
-        ).snapshot?.sessionID,
-      ).toBe(task.workerID);
-      await f.backend.attach({
-        coordinatorID: "coordinator",
-        verifier: createObserverCapability().verifier,
-      });
-      await expect(
-        f.backend.read(
-          capability.sign(
-            generation,
-            4,
-            {
-              operation: "inspect",
-              taskID: "coordinator",
-              revision: 0,
-              epoch: 0,
-            },
-            observerScope,
-          ),
-        ),
-      ).rejects.toThrow("Observer authority");
-    } finally {
-      await f.backend.dispose();
     }
   });
 });
@@ -2007,7 +3117,7 @@ describe("Approved task binding", () => {
             ),
           ).rejects.toThrow();
           expect((await f.backend.inspect()).bindings).toEqual(before);
-          expect((await f.backend.inspect()).observer?.sequence).toBe(1);
+          expect((await f.backend.inspect()).supervision?.generation).toBe(1);
           expect(f.effects).toEqual([]);
           expect(f.asks).toHaveLength(failure === "capacity" ? 1 : 2);
         } finally {
@@ -2262,25 +3372,27 @@ describe("Filesystem coordinator authority", () => {
           const nativePlugin=promisePlugin(()=>{});
           import * as ownership from ${JSON.stringify(new URL("../src/ownership.ts", import.meta.url).href)};
           const directory=${JSON.stringify(directory)};
-          let finish, failing=false, unhandled=0, releases=0;
+          let finish, failing=false, unhandled=0, releases=0, fences=0;
           const ended=new Promise(resolve=>{finish=resolve;});
           const values=new Map();
           const registration={dispose:async()=>{}};
-          const core={projects:new Map(),backend:{bootstrap:()=>({dataDir:directory,authority:"owned"}),fenceProject:async()=>{}},storage:{get:async key=>values.get(key),set:async(key,value)=>{if(failing)throw new Error("Injected observer invalidation failure");values.set(key,value);}},dispose:async()=>{}};
+          const core={projects:new Map(),backend:{bootstrap:()=>({dataDir:directory,authority:"owned"}),fenceProject:async()=>{fences++;}},storage:{get:async key=>values.get(key),set:async(key,value)=>{if(failing)throw new Error("Injected observer invalidation failure");values.set(key,value);}},dispose:async()=>{}};
           const acquisition=spyOn(ownership,"acquireCoordinatorCore").mockResolvedValue({core,release:async()=>{releases++;}});
           process.on("unhandledRejection",()=>{unhandled++;});
           const close=await nativePlugin.setup({app:{version:"2.2.5"},options:{dataDir:directory},location:{directory},session:{hook:async()=>registration},event:{async *subscribe(){await ended;}},permission:{hook:async()=>registration},agent:{transform:async()=>registration},rpc:{register:async()=>registration},tool:{transform:async()=>registration,hook:async()=>registration}});
           failing=true;finish();
           await new Promise(resolve=>setImmediate(resolve));
           await new Promise(resolve=>setImmediate(resolve));
+          const fenced=fences>0;
           let held=false;try{await close();}catch{held=true;}
           acquisition.mockRestore();
-          process.stdout.write(JSON.stringify({unhandled,releases,held}));
+          process.stdout.write(JSON.stringify({unhandled,releases,held,fenced}));
         `);
         expect(JSON.parse(output)).toEqual({
           unhandled: 0,
           releases: 0,
           held: true,
+          fenced: true,
         });
       } finally {
         await rm(directory, { recursive: true, force: true });
@@ -2350,28 +3462,20 @@ describe("Filesystem coordinator authority", () => {
         },
       );
       try {
+        await project.invoke("backseat_start_supervision");
         finish();
-        const capability = createObserverCapability();
-        const attached = await project.rpc.attach(
-          {
-            coordinatorID: project.coordinatorID,
-            verifier: capability.verifier,
-          },
-          { signal: new AbortController().signal },
-        );
-        await project.rpc.inspect({
-          proof: capability.sign(
-            attached.generation,
-            1,
-            {
-              operation: "inspect",
-              taskID: project.coordinatorID,
-              revision: 0,
-              epoch: 0,
-            },
-            attached,
-          ),
-        });
+        let fenced = false;
+        for (let sequence = 1; sequence <= 100 && !fenced; sequence++) {
+          const stored = JSON.parse(
+            await readFile(`${directory}/state.json`, "utf8"),
+          ).values as Record<string, { usable?: boolean }>;
+          fenced = Object.values(stored).some(
+            (value) => value.usable === false,
+          );
+          if (!fenced)
+            await new Promise<void>((resolve) => setTimeout(resolve, 2));
+        }
+        expect(fenced).toBe(true);
         const values = JSON.parse(
           await readFile(`${directory}/state.json`, "utf8"),
         ).values as Record<string, { usable?: boolean }>;
@@ -2422,19 +3526,9 @@ describe("Filesystem coordinator authority", () => {
         sessions,
       );
       try {
-        const signal = new AbortController().signal;
-        await first.rpc.recover(
-          { coordinatorID: first.coordinatorID },
-          { signal },
-        );
-        const attaching = first.rpc
-          .attach(
-            {
-              coordinatorID: first.coordinatorID,
-              verifier: createObserverCapability().verifier,
-            },
-            { signal },
-          )
+        await first.invoke("backseat_recover_runtime");
+        const attaching = first
+          .invoke("backseat_start_supervision")
           .catch(() => undefined);
         await entered;
         const closing =
@@ -2444,7 +3538,7 @@ describe("Filesystem coordinator authority", () => {
         if (startup === "unload")
           expect(first.disposedHooks).toContain("experimental.idle");
         else {
-          expect(attached?.generation).toBeDefined();
+          expect(attached?.output).toBeDefined();
           const values = JSON.parse(
             await readFile(`${directory}/state.json`, "utf8"),
           ).values as Record<string, { usable?: boolean }>;
@@ -2552,19 +3646,10 @@ describe("Filesystem coordinator authority", () => {
           },
         },
       );
-      const capability = createObserverCapability();
-      const attachment = project.rpc
-        .attach(
-          {
-            coordinatorID: project.coordinatorID,
-            verifier: capability.verifier,
-          },
-          { signal: new AbortController().signal },
-        )
-        .then(
-          () => "approved",
-          () => "cancelled",
-        );
+      const attachment = project.invoke("backseat_start_supervision").then(
+        () => "approved",
+        () => "cancelled",
+      );
       await ready;
       try {
         await project.close();
@@ -2608,19 +3693,10 @@ describe("Filesystem coordinator authority", () => {
       }
       let firstClosed = false;
       try {
-        const capability = createObserverCapability();
-        const signal = new AbortController().signal;
-        const initial = await first.rpc.attach(
-          { coordinatorID: first.coordinatorID, verifier: capability.verifier },
-          { signal },
-        );
-        const replacement = await second.rpc.attach(
-          {
-            coordinatorID: second.coordinatorID,
-            verifier: capability.verifier,
-          },
-          { signal },
-        );
+        const initial = (await first.invoke("backseat_start_supervision"))
+          .output as { generation: number };
+        const replacement = (await second.invoke("backseat_start_supervision"))
+          .output as { generation: number };
         expect(replacement.generation).toBe(initial.generation + 1);
         expect(await second.rpc.bootstrap()).toEqual({
           dataDir: shared,
@@ -2637,45 +3713,26 @@ describe("Filesystem coordinator authority", () => {
           entered();
           await wait;
         };
-        const departedRead = first.rpc
-          .inspect({
-            proof: capability.sign(
-              replacement.generation,
-              1,
-              {
-                operation: "inspect",
-                taskID: second.coordinatorID,
-                revision: 0,
-                epoch: 0,
-              },
-              replacement,
-            ),
-          })
-          .then(
-            () => "disclosed",
-            () => "withheld",
-          );
+        const departedRead = first.invoke("backseat_list_tasks").then(
+          () => "disclosed",
+          () => "withheld",
+        );
         await ready;
         const unloading = first.close();
         firstClosed = true;
         release();
         expect(await departedRead).toBe("withheld");
         await unloading;
-        const snapshot = await second.rpc.inspect({
-          proof: capability.sign(
-            replacement.generation,
-            2,
-            {
-              operation: "inspect",
-              taskID: second.coordinatorID,
-              revision: 0,
-              epoch: 0,
-            },
-            replacement,
-          ),
-        });
-        expect(snapshot.observer?.coordinatorID).toBe(second.coordinatorID);
-        expect(snapshot.observer?.sequence).toBe(2);
+        expect(
+          (await second.invoke("backseat_list_tasks")).output,
+        ).toBeDefined();
+        const stored = JSON.parse(
+          await readFile(`${shared}/state.json`, "utf8"),
+        ).values as Record<string, { supervision?: { coordinatorID: string } }>;
+        expect(
+          Object.values(stored).find((value) => value.supervision)?.supervision
+            ?.coordinatorID,
+        ).toBe(second.coordinatorID);
       } finally {
         if (!firstClosed) await first.close();
         await second.close();
@@ -2819,11 +3876,8 @@ describe("Filesystem coordinator authority", () => {
             },
           },
         );
-        await project.rpc
-          .recover(
-            { coordinatorID: project.coordinatorID },
-            { signal: request.signal },
-          )
+        await project
+          .invoke("backseat_recover_runtime", {}, request.signal)
           .catch(() => undefined);
         released.push(
           JSON.parse(await readFile(`${directory}/ownership.lock`, "utf8"))
@@ -2853,17 +3907,14 @@ describe("Filesystem coordinator authority", () => {
         },
       );
       try {
-        const signal = new AbortController().signal;
         expect((await project.rpc.bootstrap()).authority).toBe("held");
         expect(
-          await project.rpc.recover(
-            { coordinatorID: project.coordinatorID },
-            { signal },
-          ),
-        ).toEqual({
+          (await project.invoke("backseat_recover_runtime")).output,
+        ).toMatchObject({
           dataDir: directory,
           authority: "held",
-          reason: "Recovery approved; separate attachment/rearm required",
+          reason:
+            "Recovery approved; start supervision and explicitly resume tasks",
         });
         expect(approvals).toBe(1);
         expect(
@@ -2871,31 +3922,16 @@ describe("Filesystem coordinator authority", () => {
             () => undefined,
           ),
         ).toBeUndefined();
-        const capability = createObserverCapability();
-        const attached = await project.rpc.attach(
-          {
-            coordinatorID: project.coordinatorID,
-            verifier: capability.verifier,
-          },
-          { signal },
-        );
-        expect(approvals).toBe(2);
-        const snapshot = await project.rpc.inspect({
-          proof: capability.sign(
-            attached.generation,
-            1,
-            {
-              operation: "inspect",
-              taskID: project.coordinatorID,
-              revision: 0,
-              epoch: 0,
-            },
-            attached,
-          ),
+        const started = await project.invoke("backseat_start_supervision");
+        expect(started.output).toEqual({
+          generation: 1,
+          coordinatorID: project.coordinatorID,
+          status: "held",
         });
-        expect(snapshot.bindings).toEqual([]);
+        expect(approvals).toBe(2);
+        expect((await project.rpc.bootstrap()).authority).toBe("owned");
         expect(await readFile(`${directory}/state.json`, "utf8")).toContain(
-          "observer",
+          "supervision",
         );
       } finally {
         await project.close();
@@ -3372,6 +4408,19 @@ describe("Conversational manual assignment", () => {
             await expect(
               reopened.deleteSession("delete-root", identity),
             ).rejects.toThrow("retained deletion");
+            await expect(
+              reopened.sendSession(
+                {
+                  sessionID: "delete-root",
+                  location: goal.location,
+                  agent: goal.agent,
+                  text: "Do not repeat deleted work",
+                  scope: goal.scope,
+                },
+                identity,
+              ),
+            ).rejects.toThrow("retained deletion");
+            expect(f.effects).not.toContain("prompt");
             for (const operation of ["dispatch", "resume"] as const)
               await expect(
                 reopened.nativeControl(
@@ -3432,59 +4481,52 @@ describe("Conversational manual assignment", () => {
       }
     }
   });
-  it("Rejects child adoption and takeover before and after approval", async () => {
+  it("Adopts a selected child without widening ownership", async () => {
     for (const operation of ["adopt", "takeover"] as const) {
-      for (const phase of ["before", "during"] as const) {
-        const selected: WorkerBinding = {
-          ...goal,
-          workerID: "worker-api",
-          revision: 1,
-          epoch: 1,
-          status: "held",
-          followups: 0,
-          nonprogress: 0,
-        };
-        const f = await backendFixture(
-          operation === "adopt" ? [] : [selected],
-          0,
-          false,
-          false,
+      const selected: WorkerBinding = {
+        ...goal,
+        workerID: "worker-api",
+        revision: 1,
+        epoch: 1,
+        status: "held",
+        followups: 0,
+        nonprogress: 0,
+      };
+      const f = await backendFixture(
+        operation === "adopt" ? [] : [selected],
+        0,
+        false,
+        false,
+      );
+      const get = f.host.session.get;
+      f.host.session.get = async (input) => ({
+        ...(await get(input)),
+        ...(input.sessionID === selected.workerID
+          ? { parentID: "native-parent" }
+          : {}),
+      });
+      try {
+        await f.backend.nativeControl(
+          operation,
+          selected.id,
+          operation === "adopt" ? { goal, workerID: selected.workerID } : {},
+          {
+            sessionID: "coordinator",
+            agent: coordinatorAgent.id,
+            messageID: "message",
+            id: "ownership-call",
+          },
         );
-        let parentID: string | undefined =
-          phase === "before" ? "native-parent" : undefined;
-        const get = f.host.session.get;
-        f.host.session.get = async (input) => ({
-          ...(await get(input)),
-          ...(input.sessionID === selected.workerID && parentID
-            ? { parentID }
-            : {}),
+        expect(f.effects).toEqual([]);
+        const current = (await f.backend.inspect()).bindings;
+        expect(current).toHaveLength(1);
+        expect(current[0]).toMatchObject({
+          workerID: selected.workerID,
+          status: operation === "adopt" ? "held" : "manual",
         });
-        f.approve(async () => {
-          parentID = "native-parent";
-        });
-        try {
-          await expect(
-            f.backend.nativeControl(
-              operation,
-              selected.id,
-              operation === "adopt"
-                ? { goal, workerID: selected.workerID }
-                : {},
-              {
-                sessionID: "coordinator",
-                agent: coordinatorAgent.id,
-                messageID: "message",
-                id: "ownership-call",
-              },
-            ),
-          ).rejects.toThrow("top-level");
-          expect(f.effects).toEqual([]);
-          const current = (await f.backend.inspect()).bindings;
-          expect(current).toEqual(operation === "adopt" ? [] : [selected]);
-          expect(f.asks).toHaveLength(phase === "before" ? 0 : 1);
-        } finally {
-          await f.backend.dispose();
-        }
+        expect(f.asks).toEqual([`backseat.${operation}`]);
+      } finally {
+        await f.backend.dispose();
       }
     }
     const root = await backendFixture([binding], 0, false, false);
@@ -3502,6 +4544,42 @@ describe("Conversational manual assignment", () => {
       expect(root.effects).toEqual([]);
     } finally {
       await root.backend.dispose();
+    }
+  });
+  it("Rejects changed hierarchical targets", async () => {
+    for (const operation of ["adopt", "takeover"] as const) {
+      const f = await backendFixture(
+        operation === "adopt" ? [] : [binding],
+        0,
+        false,
+        false,
+      );
+      let parentID = "selected-parent";
+      const get = f.host.session.get;
+      f.host.session.get = async (input) => ({
+        ...(await get(input)),
+        ...(input.sessionID === binding.workerID ? { parentID } : {}),
+      });
+      f.approve(async () => {
+        parentID = "changed-parent";
+      });
+      try {
+        await expect(
+          f.backend.nativeControl(
+            operation,
+            binding.id,
+            operation === "adopt" ? { goal, workerID: binding.workerID } : {},
+            identity,
+          ),
+        ).rejects.toThrow("changed");
+        expect(f.asks).toHaveLength(1);
+        expect((await f.backend.inspect()).bindings).toEqual(
+          operation === "adopt" ? [] : [binding],
+        );
+        expect(f.effects).toEqual([]);
+      } finally {
+        await f.backend.dispose();
+      }
     }
   });
   const identity = {
@@ -3637,10 +4715,7 @@ describe("Conversational manual assignment", () => {
         ]);
       }
       expect(state.observer).toBeUndefined();
-      await f.backend.attach({
-        coordinatorID: "coordinator",
-        verifier: createObserverCapability().verifier,
-      });
+      await f.backend.startSupervision(nativeIdentity());
       const get = f.host.session.get;
       f.host.session.get = (input) =>
         get({
@@ -3665,9 +4740,256 @@ describe("Conversational manual assignment", () => {
       approval.mockRestore();
       await f.backend.dispose();
     }
+    const unbound = await backendFixture([], 0, false, false);
+    try {
+      const sends: string[] = [];
+      unbound.host.session.prompt = async (input) => {
+        const state = parseCoordinatorState(unbound.root());
+        expect(state.sessionDeliveries?.at(-1)).toMatchObject({
+          id: input.id,
+          sessionID: input.sessionID,
+          status: "reserved",
+        });
+        sends.push(input.text!);
+        return { id: input.id, sessionID: input.sessionID } as Awaited<
+          ReturnType<NativeBackendHost["session"]["prompt"]>
+        >;
+      };
+      for (const [index, assignment] of [
+        "Inspect current work",
+        "Report findings",
+      ].entries()) {
+        const result = await unbound.backend.sendSession(
+          {
+            sessionID: "worker-api",
+            location: goal.location,
+            agent: goal.agent,
+            text: assignment,
+          },
+          { ...identity, id: `unbound-${index}` },
+        );
+        expect(result).toMatchObject({
+          sessionID: "worker-api",
+          status: "admitted",
+        });
+        expect(result.sendID).toStartWith("msg_");
+      }
+      expect(sends).toEqual(["Inspect current work", "Report findings"]);
+      const state = parseCoordinatorState(unbound.root());
+      expect(state.bindings).toEqual([]);
+      expect(state.intents).toEqual([]);
+      expect(state.sessionDeliveries?.map((entry) => entry.status)).toEqual([
+        "admitted",
+        "admitted",
+      ]);
+      expect(unbound.asks).toEqual([
+        "backseat.send_session",
+        "backseat.send_session",
+      ]);
+      const nested = [
+        {
+          sessionID: "worker-one",
+          location: goal.location,
+          agent: goal.agent,
+          text: "Inspect",
+        },
+        {
+          sessionID: "worker-two",
+          location: goal.location,
+          agent: goal.agent,
+          text: "Inspect",
+        },
+        {
+          sessionID: "worker-two",
+          location: goal.location,
+          agent: goal.agent,
+          text: "Report",
+        },
+      ];
+      const nestedIDs = [];
+      for (const request of nested)
+        nestedIDs.push(
+          (await unbound.backend.sendSession(request, identity)).sendID,
+        );
+      expect(new Set(nestedIDs).size).toBe(3);
+      expect(
+        (await unbound.backend.sendSession(nested[2]!, identity)).sendID,
+      ).toBe(nestedIDs[2]!);
+      expect(sends).toHaveLength(5);
+      unbound.host.nativeSend = async (input, sendID) => {
+        const reserved = parseCoordinatorState(
+          unbound.root(),
+        ).sessionDeliveries?.at(-1);
+        expect(reserved?.id).toBe(sendID);
+        expect(reserved?.status).toBe("reserved");
+        expect(reserved?.operation).toBe(input.kind);
+        return { id: sendID, sessionID: input.sessionID };
+      };
+      for (const kind of [
+        "synthetic",
+        "shell",
+        "compact",
+        "command",
+        "skill",
+      ] as const) {
+        const sent = await unbound.backend.sendSession(
+          {
+            sessionID: "worker-api",
+            location: goal.location,
+            agent: goal.agent,
+            text: "Selected input",
+            kind,
+            options:
+              kind === "command"
+                ? { name: "review" }
+                : kind === "skill"
+                  ? { skillID: "selected" }
+                  : {},
+          },
+          { ...identity, id: kind },
+        );
+        expect(sent.status).toBe("admitted");
+        expect(unbound.asks.at(-1)).toBe(`backseat.${kind}_session`);
+      }
+      const nativeCalls: unknown[] = [];
+      const call = (name: string) => async (payload: unknown) => {
+        nativeCalls.push([name, payload]);
+      };
+      const client = {
+        session: {
+          prompt: call("prompt"),
+          synthetic: call("synthetic"),
+          shell: call("shell"),
+          compact: call("compact"),
+          command: call("command"),
+        },
+        experimental: { session: { skill: call("skill") } },
+      } as unknown as OpenCodeClient;
+      const file = {
+        uri: "file:///projects/api/README.md",
+        source: { type: "uri", uri: "file:///projects/api/README.md" },
+        name: "README",
+        mention: { start: 0, end: 6, text: "README" },
+      };
+      for (const [kind, options, expected] of [
+        [
+          "prompt",
+          {
+            files: [file],
+            agents: [{ name: "reviewer" }],
+            skills: [{ id: "review" }],
+            metadata: { selected: true },
+            delivery: "queue",
+            resume: false,
+          },
+          {
+            id: "msg_selected",
+            text: "Selected input",
+            files: [file],
+            agents: [{ name: "reviewer" }],
+            skills: [{ id: "review" }],
+            metadata: { selected: true },
+            delivery: "queue",
+            resume: false,
+          },
+        ],
+        [
+          "synthetic",
+          { description: "Selected context", resume: false },
+          {
+            id: "msg_selected",
+            text: "Selected input",
+            description: "Selected context",
+            resume: false,
+          },
+        ],
+        ["shell", {}, { id: "msg_selected", command: "Selected input" }],
+        [
+          "compact",
+          { delivery: "queue" },
+          { id: "msg_selected", delivery: "queue" },
+        ],
+        [
+          "command",
+          { name: "review", files: [file] },
+          { name: "review", text: "Selected input", files: [file] },
+        ],
+        [
+          "skill",
+          { skillID: "review", resume: false },
+          { id: "review", resume: false },
+        ],
+      ] as const) {
+        await prepareNativeSend(
+          { sessionID: "worker-api", text: "Selected input", kind, options },
+          "msg_selected",
+        )(client, new AbortController().signal);
+        expect(nativeCalls.at(-1)).toEqual([
+          kind,
+          { sessionID: "worker-api", ...expected },
+        ]);
+      }
+    } finally {
+      await unbound.backend.dispose();
+    }
   });
 
   it("Rejects changed or unapproved manual targets", async () => {
+    for (const mode of [
+      "outside",
+      "missing",
+      "empty",
+      "unbound",
+      "valid",
+    ] as const) {
+      const f = await backendFixture(
+        mode === "unbound" ? [] : [binding],
+        0,
+        false,
+        false,
+      );
+      const before = parseCoordinatorState(f.root());
+      try {
+        const request = {
+          sessionID: binding.workerID,
+          location: binding.location,
+          agent: binding.agent,
+          text: "Use the approved scope",
+          ...(mode === "missing"
+            ? {}
+            : {
+                scope:
+                  mode === "outside"
+                    ? ["outside-approved-scope"]
+                    : mode === "empty"
+                      ? []
+                      : binding.scope,
+              }),
+        };
+        if (mode === "valid") {
+          expect((await f.backend.sendSession(request, identity)).status).toBe(
+            "admitted",
+          );
+          const after = parseCoordinatorState(f.root());
+          expect(after.bindings[0]).toMatchObject({
+            status: "manual",
+            epoch: before.bindings[0]!.epoch + 1,
+          });
+          expect(after.sessionDeliveries).toHaveLength(1);
+          expect(f.asks).toEqual(["backseat.send_session"]);
+          expect(f.effects).toEqual(["prompt"]);
+        } else {
+          await expect(
+            f.backend.sendSession(request, identity),
+          ).rejects.toThrow();
+          expect(f.asks).toEqual([]);
+          expect(f.effects).toEqual([]);
+          expect(parseCoordinatorState(f.root())).toEqual(before);
+        }
+      } finally {
+        await f.backend.dispose();
+      }
+    }
     for (const mode of [
       "denied",
       "moved",
@@ -3718,9 +5040,70 @@ describe("Conversational manual assignment", () => {
         await f.backend.dispose();
       }
     }
+    for (const mode of ["denied", "moved", "identity", "cancelled"] as const) {
+      const f = await backendFixture([], 0, false, false);
+      const request = new AbortController();
+      f.approve(async () => {
+        if (mode === "cancelled") request.abort();
+        if (mode === "denied") throw new Error("Native dispatch denied");
+        if (mode === "moved") f.move();
+        if (mode === "identity") {
+          const get = f.host.session.get;
+          f.host.session.get = async (input) => ({
+            ...(await get(input)),
+            agent:
+              input.sessionID === identity.sessionID ? "engineer" : goal.agent,
+          });
+        }
+      });
+      try {
+        await expect(
+          f.backend.sendSession(
+            {
+              sessionID: "worker-api",
+              location: goal.location,
+              agent: goal.agent,
+              text: "Approved assignment",
+            },
+            { ...identity, signal: request.signal },
+          ),
+        ).rejects.toThrow();
+        expect(f.effects).toEqual([]);
+        expect(
+          parseCoordinatorState(f.root()).sessionDeliveries,
+        ).toBeUndefined();
+      } finally {
+        await f.backend.dispose();
+      }
+    }
   });
 
   it("Retains an uncertain manual send without resending", async () => {
+    for (const mismatch of ["id", "sessionID"] as const) {
+      const f = await backendFixture([], 0, false, false);
+      let sends = 0;
+      f.host.session.prompt = async (input) => {
+        sends++;
+        return {
+          id: mismatch === "id" ? "wrong" : input.id,
+          sessionID: mismatch === "sessionID" ? "wrong" : input.sessionID,
+        } as Awaited<ReturnType<NativeBackendHost["session"]["prompt"]>>;
+      };
+      const input = {
+        sessionID: "worker-api",
+        location: goal.location,
+        agent: goal.agent,
+        text: "Selected assignment",
+      };
+      const first = await f.backend.sendSession(input, identity);
+      expect(first.status).toBe("uncertain");
+      expect(await f.backend.sendSession(input, identity)).toEqual(first);
+      expect(sends).toBe(1);
+      expect(
+        parseCoordinatorState(f.root()).sessionDeliveries![0]!.status,
+      ).toBe("ambiguous");
+      await f.backend.dispose();
+    }
     for (const failure of [
       "transport",
       "publication",
@@ -3822,6 +5205,100 @@ describe("Conversational manual assignment", () => {
         await f.backend.dispose();
       }
     }
+    const f = await backendFixture([], 0, false, false);
+    let sends = 0;
+    f.host.session.prompt = async () => {
+      sends++;
+      throw new Error("Admission acknowledgement lost");
+    };
+    const input = {
+      sessionID: "worker-api",
+      location: goal.location,
+      agent: goal.agent,
+      text: "Approved assignment",
+    };
+    try {
+      const first = await f.backend.sendSession(input, identity);
+      expect(first.status).toBe("uncertain");
+      expect(await f.backend.sendSession(input, identity)).toEqual(first);
+      f.host.readSessionDelivery = async () => {
+        throw new Error("Private native transport payload");
+      };
+      await expect(
+        f.backend.sendSession(input, { ...identity, id: "another-call" }),
+      ).rejects.toThrow("Unresolved");
+      expect(sends).toBe(1);
+      const persisted = parseCoordinatorState(f.root());
+      expect(persisted.bindings).toEqual([]);
+      expect(persisted.sessionDeliveries).toMatchObject([
+        {
+          id: first.sendID,
+          status: "ambiguous",
+        },
+      ]);
+      await f.backend.dispose();
+      const restored = await createNativeBackend(
+        f.host,
+        new CoordinatorOwnership("/projects/home", "restored", {
+          inspect: async () => ({ safe: true }),
+          acquire: async () => true,
+          release: async () => {},
+          approveRecovery: async () => {},
+          recover: async () => {},
+        }),
+        "/projects/home",
+      );
+      try {
+        await expect(
+          restored.sendSession(input, { ...identity, id: "another-call" }),
+        ).rejects.toThrow("Unresolved");
+        expect(sends).toBe(1);
+        await restored.nativeControl(
+          "adopt",
+          binding.id,
+          { goal, workerID: binding.workerID },
+          identity,
+        );
+        await expect(
+          restored.nativeControl(
+            "dispatch",
+            binding.id,
+            { text: input.text, scope: binding.scope },
+            identity,
+          ),
+        ).rejects.toThrow("Unresolved");
+        expect(sends).toBe(1);
+        f.host.readSessionDelivery = async (delivery) => {
+          expect(delivery.id).toBe(first.sendID);
+          return "admitted";
+        };
+        f.host.session.prompt = async (send) => {
+          sends++;
+          return { id: send.id, sessionID: send.sessionID } as Awaited<
+            ReturnType<NativeBackendHost["session"]["prompt"]>
+          >;
+        };
+        expect(
+          (
+            await restored.sendSession(
+              { ...input, scope: binding.scope },
+              { ...identity, id: "another-call" },
+            )
+          ).status,
+        ).toBe("admitted");
+        expect(sends).toBe(2);
+        expect(
+          parseCoordinatorState(f.root()).sessionDeliveries?.[0],
+        ).toMatchObject({
+          id: first.sendID,
+          status: "admitted",
+        });
+      } finally {
+        await restored.dispose();
+      }
+    } finally {
+      await f.backend.dispose();
+    }
   });
 });
 
@@ -3869,6 +5346,111 @@ describe("Explicit control transitions", () => {
   });
 
   it("Resume requires fresh eligible state", async () => {
+    for (const problem of [
+      "valid",
+      "pending",
+      "changed",
+      "denied",
+      "unresolved",
+      "reconciled",
+      "exhausted",
+      "unstarted",
+      "rearm",
+    ] as const) {
+      const f = await backendFixture(
+        [
+          {
+            ...binding,
+            status: "held",
+            ...(problem === "exhausted" ? { followups: 3 } : {}),
+          },
+        ],
+        0,
+        problem === "unresolved" || problem === "reconciled",
+        false,
+      );
+      const identity = {
+        sessionID: "coordinator",
+        agent: coordinatorAgent.id,
+        messageID: "resume-message",
+        id: "resume-call",
+      };
+      let nativeReads = 0;
+      if (problem === "reconciled")
+        f.host.readDelivery = async (_task, intent) => {
+          expect(intent.id).toBe("initial");
+          return "admitted";
+        };
+      f.host.observeNative = async (task, _snapshots, observed) => {
+        nativeReads++;
+        if (problem === "rearm" && task.status === "active")
+          throw new Error("Native worker became unavailable during rearm");
+        return {
+          turn: 1,
+          state: task.status === "active" ? "running" : "settled",
+          asks: problem === "pending" ? ["human"] : [],
+          snapshot: observed,
+          context: {
+            framing: "Untrusted task evidence",
+            task,
+            turn: 1,
+            evidence: [],
+            shared: [],
+          },
+        };
+      };
+      try {
+        if (problem !== "unstarted") await f.backend.startSupervision(identity);
+        const current = (await f.backend.inspect()).bindings[0]!;
+        f.observation(current);
+        if (problem === "denied")
+          f.approve(async () => {
+            throw new Error("Denied");
+          });
+        if (problem === "changed")
+          f.approve(async () => {
+            f.messages.push({ ...f.messages[0]!, id: "new-input" });
+          });
+        if (problem === "valid" || problem === "reconciled") {
+          const result = await f.backend.resumeTask(current.id, identity);
+          expect(result.accepted).toBe(true);
+          expect(result.snapshot?.bindings[0]?.status).toBe("active");
+          expect(result.snapshot?.bindings[0]?.followups).toBe(
+            current.followups,
+          );
+          expect(nativeReads).toBeGreaterThanOrEqual(2);
+          expect(f.asks).toEqual([
+            "backseat.start_supervision",
+            "backseat.resume",
+          ]);
+          expect(f.effects).not.toContain("prompt");
+          if (problem === "reconciled")
+            expect(
+              parseCoordinatorState(f.root()).intents[0]?.intent,
+            ).toMatchObject({
+              id: "initial",
+              status: "admitted",
+            });
+        } else if (problem === "rearm") {
+          const result = await f.backend.resumeTask(current.id, identity);
+          expect(result.accepted).toBe(false);
+          expect(result.reason).toBe("Unreadable rearm inventory");
+          expect(result.snapshot?.bindings[0]?.status).toBe("held");
+          expect(result.snapshot?.bindings[0]?.followups).toBe(
+            current.followups,
+          );
+          expect(f.effects).not.toContain("prompt");
+        } else {
+          await expect(
+            f.backend.resumeTask(current.id, identity),
+          ).rejects.toThrow();
+          expect((await f.backend.inspect()).bindings[0]).toEqual(current);
+          expect(f.effects).not.toContain("prompt");
+        }
+      } finally {
+        await f.backend.dispose();
+      }
+    }
     const held = { ...binding, status: "held" as const };
     const eligible = {
       workerID: held.workerID,
@@ -3891,10 +5473,8 @@ describe("Explicit control transitions", () => {
       expect(held.status).toBe("held");
     }
     for (const problem of [
-      "bare",
       "exhausted",
       "unresolved",
-      "pending",
       "snapshot-changed",
       "denied",
       "failed",
@@ -3954,8 +5534,6 @@ describe("Explicit control transitions", () => {
             ...f.messages[1]!,
             outcome: "interrupted",
           } as SessionMessageInfo;
-        if (problem === "pending")
-          body.reconciliation.asks.push("human" as never);
         if (problem === "snapshot-changed")
           f.approve(async () => {
             f.messages.push({ ...f.messages[0]!, id: "idle-2" });
@@ -4009,9 +5587,7 @@ describe("Explicit control transitions", () => {
           expect(f.asks).toHaveLength(asks);
           expect(f.effects).not.toContain("prompt");
         } else {
-          await expect(
-            f.control("resume", current.id, problem === "bare" ? {} : body),
-          ).rejects.toThrow();
+          await expect(f.control("resume", current.id, body)).rejects.toThrow();
           expect((await f.backend.inspect()).bindings[0]).toEqual(current);
           expect(f.asks).toHaveLength(
             ["snapshot-changed", "denied", "pre-idle-after-ask"].includes(
@@ -4069,7 +5645,7 @@ describe("Explicit control transitions", () => {
       const result = await projected
         .control("resume", current.id, {
           reconciliation: {
-            generation: (await projected.backend.inspect()).observer!
+            generation: (await projected.backend.inspect()).supervision!
               .generation,
             workerID: current.workerID,
             revision: current.revision,
@@ -4194,522 +5770,143 @@ async function mockAuthority(scenario: "competing" | "recovery") {
 }
 
 function assertNativeRpcBoundary() {
-  const capability = createObserverCapability();
-  const proof = capability.sign(
-    1,
-    1,
-    {
-      operation: "hold",
-      taskID: "api-task",
-      revision: 1,
-      epoch: 1,
-      body: {},
-    },
-    observerScope,
-  );
-  const valid = { operation: "hold" as const, taskID: "api-task", proof };
-  const parse = BackseatRpc.methods.control.input["~standard"].validate;
-  expect(parse(valid)).toEqual({ value: valid });
+  const parse = BackseatRpc.methods.identity.input["~standard"].validate;
+  const input = { nonce: "a".repeat(64), origin: "fixture" };
+  expect(parse(input)).toEqual({ value: input });
   for (const invalid of [
-    { ...valid, confirmed: true },
-    { ...valid, operation: "override" },
-    { ...valid, taskID: "" },
-    { ...valid, proof: undefined },
-    { ...valid, proof: { ...proof, generation: 0 } },
-    { ...valid, proof: { ...proof, sequence: 1.5 } },
-    { ...valid, proof: { ...proof, payload: [] } },
-    { ...valid, proof: { ...proof, signature: "" } },
-    { ...valid, proof: { ...proof, confirmed: true } },
+    { ...input, nonce: "short" },
+    { ...input, origin: "x".repeat(201) },
+    { ...input, confirmed: true },
   ])
     expect(parse(invalid)).toHaveProperty("issues");
-  const attach = {
-    coordinatorID: "coordinator",
-    verifier: capability.verifier,
-  };
-  expect(
-    BackseatRpc.methods.attach.input["~standard"].validate(attach),
-  ).toEqual({
-    value: attach,
-  });
-  expect(
-    BackseatRpc.methods.attach.input["~standard"].validate({
-      ...attach,
-      confirmed: true,
-    }),
-  ).toHaveProperty("issues");
-  const snapshot = {
-    version: 1 as const,
-    dataDir: "/projects/coordinator",
-    authority: "owned" as const,
-    bindings: [],
-    snapshots: [],
-    intents: [],
-    completions: [],
-  };
-  expect(
-    BackseatRpc.methods.control.output["~standard"].validate({
-      accepted: true,
-      snapshot,
-    }),
-  ).toEqual({ value: { accepted: true, snapshot } });
-  const reason = "Control committed; inventory withheld; do not retry";
-  expect(
-    BackseatRpc.methods.control.output["~standard"].validate({
-      accepted: true,
-      reason,
-    }),
-  ).toEqual({ value: { accepted: true, reason } });
-  for (const reply of [
-    { accepted: false, reason },
-    { accepted: true },
-    { accepted: true, reason, extra: true },
-  ]) {
-    expect(
-      BackseatRpc.methods.control.output["~standard"].validate(reply),
-    ).toHaveProperty("issues");
-  }
-  expect(
-    BackseatRpc.methods.control.output["~standard"].validate({
-      accepted: "yes",
-      snapshot,
-    }),
-  ).toHaveProperty("issues");
 }
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Approved observer generation", () => {
-  function observerPort() {
-    let record: ObserverRecord | undefined;
-    const approvals: ObserverRecord[] = [];
-    return {
-      approvals,
-      port: {
-        async load() {
-          return record && structuredClone(record);
-        },
-        async save(value: ObserverRecord) {
-          record = structuredClone(value);
-        },
-        async approve(value: ObserverRecord) {
-          approvals.push(structuredClone(value));
-        },
-      },
-    };
-  }
-
   it("Native approval binds observer generation", async () => {
-    for (const field of ["projectID", "workspaceID"] as const) {
-      const current = await backendFixture();
+    const f = await backendFixture([], 0, false, false);
+    try {
+      const first = await f.backend.startSupervision(nativeIdentity());
+      expect(first).toEqual({
+        generation: 1,
+        coordinatorID: "coordinator",
+        status: "held",
+      });
+      expect(f.asks).toEqual(["backseat.start_supervision"]);
+      expect(
+        (
+          await f.backend.startSupervision({
+            ...nativeIdentity(),
+            id: "replacement",
+          })
+        ).generation,
+      ).toBe(2);
+      expect(f.effects).not.toContain("prompt");
+    } finally {
+      await f.backend.dispose();
+    }
+    for (const change of [
+      "denied",
+      "projectID",
+      "workspaceID",
+      "cancelled",
+    ] as const) {
+      const f = await backendFixture([], 0, false, false);
       try {
+        const abort = new AbortController();
+        const get = f.host.session.get;
         let changed = false;
-        const get = current.host.session.get;
-        current.host.session.get = async (input) => {
+        f.host.session.get = async (input) => {
           const session = await get(input);
-          return input.sessionID === "coordinator"
-            ? {
-                ...session,
-                ...(field === "projectID"
-                  ? { projectID: changed ? "after" : "before" }
-                  : {}),
-                location: {
-                  ...session.location,
-                  ...(field === "workspaceID"
-                    ? { workspaceID: changed ? "after" : "before" }
-                    : {}),
-                },
-              }
-            : session;
+          if (!changed || input.sessionID !== "coordinator") return session;
+          return {
+            ...session,
+            ...(change === "projectID" ? { projectID: "changed" } : {}),
+            location: {
+              ...session.location,
+              ...(change === "workspaceID" ? { workspaceID: "changed" } : {}),
+            },
+          };
         };
-        current.approve(async () => {
+        f.approve(async () => {
+          if (change === "denied") throw new Error("Denied");
+          if (change === "cancelled") abort.abort();
           changed = true;
         });
         await expect(
-          current.backend.attach({
-            coordinatorID: "coordinator",
-            verifier: createObserverCapability().verifier,
+          f.backend.startSupervision({
+            ...nativeIdentity(),
+            signal: abort.signal,
           }),
-        ).rejects.toThrow("changed during native approval");
+        ).rejects.toThrow();
+        expect(f.effects).not.toContain("prompt");
+        expect((await f.backend.inspect()).supervision).toBeUndefined();
       } finally {
-        await current.backend.dispose();
+        await f.backend.dispose();
       }
     }
-    const unloading = await backendFixture();
-    try {
-      const abort = new AbortController();
-      unloading.host.projectSignal = () => abort.signal;
-      const list = unloading.host.agent.list;
-      let approved = false;
-      unloading.approve(async () => {
-        approved = true;
-      });
-      unloading.host.agent.list = async (input) => {
-        const result = await list(input);
-        if (approved && input?.location?.directory === goal.location)
-          abort.abort();
-        return result;
-      };
-      await expect(unloading.control("create", goal.id, goal)).rejects.toThrow(
-        "Native operation aborted",
-      );
-      expect(
-        unloading.effects.filter((effect) =>
-          ["create", "prompt"].includes(effect),
-        ),
-      ).toEqual([]);
-    } finally {
-      await unloading.backend.dispose();
-    }
-    const relocated = await backendFixture();
-    try {
-      const get = relocated.host.session.get;
-      let location = "/projects/conversation";
-      relocated.host.session.get = async (input) => ({
-        ...(await get(input)),
-        location: { directory: location },
-      });
-      const list = relocated.host.agent.list;
-      relocated.host.agent.list = async (input) => ({
-        ...(await list(input)),
-        location: { directory: input?.location?.directory ?? location },
-      });
-      const capability = createObserverCapability();
-      await relocated.backend.attach({
-        coordinatorID: "coordinator",
-        verifier: capability.verifier,
-      });
-      relocated.approve(async () => {
-        location = "/projects/moved-during-approval";
-      });
-      await expect(
-        relocated.backend.attach({
-          coordinatorID: "coordinator",
-          verifier: createObserverCapability().verifier,
-        }),
-      ).rejects.toThrow("changed during native approval");
-      expect((await relocated.backend.inspect()).observer?.verifier).toBe(
-        capability.verifier,
-      );
-      await expect(
-        relocated.backend.read(
-          capability.sign(
-            2,
-            1,
-            {
-              operation: "inspect",
-              taskID: "coordinator",
-              revision: 0,
-              epoch: 0,
-            },
-            {
-              dataDir: "/projects/home",
-              coordinatorLocation: "/projects/conversation",
-            },
-          ),
-        ),
-      ).rejects.toThrow("coordinator location changed");
-    } finally {
-      await relocated.backend.dispose();
-    }
-    const root = resolve(".opencode/backseat");
-    await mkdir(root, { recursive: true, mode: 0o700 });
-    const home = await mkdtemp(`${root}/setup-test-`);
-    const values = new Map<string, unknown>();
-    const registrations: string[] = [];
-    const registration = { dispose: async () => {} };
-    const setupContext = {
-      app: { version: "2.2.5" },
-      options: { dataDir: `${home}/data` },
-      location: { directory: home },
-      session: {
-        async hook() {
-          return registration;
-        },
-      },
-      storage: {
-        async get(key: string) {
-          return values.get(key);
-        },
-        async set(key: string, value: unknown) {
-          values.set(key, structuredClone(value));
-        },
-      },
-      event: {
-        async *subscribe({ signal }: { signal: AbortSignal }) {
-          await new Promise<void>((resolve) => {
-            if (signal.aborted) resolve();
-            else
-              signal.addEventListener("abort", () => resolve(), { once: true });
-          });
-        },
-      },
-      permission: {
-        async hook(kind: string, callback: typeof forceNativeAsk) {
-          registrations.push(kind);
-          for (const effect of ["allow", "deny"] as const) {
-            const event = {
-              action: "backseat.create",
-              effect: effect as "allow" | "ask" | "deny",
-            };
-            callback(event);
-            expect(event.effect).toBe(effect === "allow" ? "ask" : "deny");
-          }
-          return registration;
-        },
-      },
-      rpc: {
-        async register() {
-          return registration;
-        },
-      },
-      tool: {
-        hook: async () => registration,
-        async transform() {
-          return registration;
-        },
-      },
-      agent: { transform: async () => registration },
-    } as unknown as Plugin.Context;
-    try {
-      const cleanup = await nativePlugin.setup(setupContext);
-      expect(registrations).toEqual(["evaluate"]);
-      if (typeof cleanup === "function") await cleanup();
-    } finally {
-      await rm(home, { recursive: true, force: true });
-    }
-    const incumbent = await backendFixture([
-      {
-        ...goal,
-        workerID: "worker",
-        revision: 1,
-        epoch: 1,
-        status: "held",
-        followups: 0,
-        nonprogress: 0,
-      },
-    ]);
+    const incumbent = await backendFixture();
     try {
       const before = incumbent.root();
       incumbent.approve(async () => {
         throw new Error("Denied replacement");
       });
       await expect(
-        incumbent.backend.attach({
-          coordinatorID: "coordinator",
-          verifier: createObserverCapability().verifier,
-        }),
+        incumbent.backend.startSupervision(nativeIdentity()),
       ).rejects.toThrow("Denied replacement");
       expect(incumbent.root()).toEqual(before);
       incumbent.approve(async () => {});
-      expect((await incumbent.control("hold", goal.id, {})).accepted).toBe(
-        true,
-      );
-      const persisted = await incumbent.backend.inspect();
-      const set = incumbent.host.storage.set;
-      let writes = 0;
-      incumbent.host.storage = {
-        ...incumbent.host.storage,
-        async set(key, value) {
-          if (++writes === 2) throw new Error("Candidate write failed");
-          await set(key, value);
-        },
-      };
-      await expect(incumbent.control("hold", goal.id, {})).rejects.toThrow(
-        "Candidate write failed",
-      );
-      const held = await incumbent.backend.inspect();
-      expect(held.authority).toBe("held");
-      expect(held.bindings).toEqual(persisted.bindings);
-      expect(held.observer?.sequence).toBe(
-        (persisted.observer?.sequence ?? 0) + 1,
+      await incumbent.backend.startSupervision(nativeIdentity());
+      expect((await incumbent.backend.inspect()).supervision?.generation).toBe(
+        2,
       );
     } finally {
       await incumbent.backend.dispose();
     }
-    const { port, approvals } = observerPort();
-    const capability = createObserverCapability();
-    const authority = new ObserverAuthority(
-      "coordinator-home",
-      port,
-      observerScope,
-    );
-    const generation = await authority.attach(capability.verifier);
-    expect(approvals).toEqual([
-      {
-        ...observerScope,
-        coordinatorID: "coordinator-home",
-        generation,
-        verifier: capability.verifier,
-        sequence: 0,
-      },
-    ]);
-    const payload = {
-      operation: "hold",
-      taskID: goal.id,
-      revision: 1,
-      epoch: 1,
-      body: { reason: "Manual hold" },
-    };
-    expect(
-      await authority.authorize(
-        capability.sign(generation, 1, payload, observerScope),
-        payload,
-      ),
-    ).toEqual(payload);
-    const saved = await port.load();
-    expect(saved?.verifier).toBe(capability.verifier);
-    const approve = port.approve;
-    port.approve = async () => {
-      throw new Error("Denied candidate");
-    };
-    await expect(
-      authority.attach(createObserverCapability().verifier),
-    ).rejects.toThrow("Denied candidate");
-    expect(await port.load()).toEqual(saved);
-    await expect(
-      authority.authorize(
-        capability.sign(generation, 2, payload, observerScope),
-        payload,
-      ),
-    ).resolves.toEqual(payload);
-    port.approve = approve;
-    expect(JSON.stringify(saved)).not.toContain("PRIVATE KEY");
-    expect(Object.keys(capability).sort()).toEqual(["sign", "verifier"]);
+  });
+  it("Rejects unapproved observer mutations", async () => {
     const f = await backendFixture(
       [
         {
           ...goal,
-          group: "team",
           workerID: "worker",
           revision: 1,
           epoch: 1,
           status: "held",
-          followups: 0,
-          nonprogress: 0,
+          followups: 2,
+          nonprogress: 1,
         },
       ],
-      STATE_BOUNDS.snapshots,
+      0,
+      false,
+      false,
     );
     try {
-      const before = await f.backend.inspect();
-      const asks = f.asks.length;
+      const before = f.root();
       await expect(
-        f.control("share", goal.id, {
-          snapshot: {
-            id: "excess",
-            version: 1,
-            content: "approved",
-            group: "team",
-            recipients: [goal.id],
-          },
-          shared: [{ id: "excess", version: 1 }],
+        f.backend.resumeTask(goal.id, nativeIdentity()),
+      ).rejects.toThrow();
+      await expect(
+        f.backend.startSupervision({
+          ...nativeIdentity(),
+          sessionID: "worker",
         }),
       ).rejects.toThrow();
-      expect((await f.backend.inspect()).bindings).toEqual(before.bindings);
-      expect((await f.backend.inspect()).snapshots).toEqual(before.snapshots);
-      expect(f.asks).toHaveLength(asks);
+      for (const operation of ["reserve", "finish", "record"] as const)
+        await expect(
+          f.backend.nativeControl(operation, goal.id, {}, nativeIdentity()),
+        ).rejects.toThrow();
+      expect(f.root()).toEqual(before);
+      expect(f.effects).not.toContain("prompt");
+      await f.backend.startSupervision(nativeIdentity());
+      expect((await f.backend.inspect()).bindings[0]).toMatchObject({
+        status: "held",
+        followups: 2,
+        nonprogress: 1,
+      });
+      assertNativeRpcBoundary();
     } finally {
       await f.backend.dispose();
-    }
-  });
-
-  it("Rejects unapproved observer mutations", async () => {
-    assertNativeRpcBoundary();
-    const { port } = observerPort();
-    const capability = createObserverCapability();
-    const authority = new ObserverAuthority(
-      "coordinator-home",
-      port,
-      observerScope,
-    );
-    const expected = {
-      operation: "hold",
-      taskID: goal.id,
-      revision: 1,
-      epoch: 1,
-    };
-    await expect(
-      authority.authorize(
-        capability.sign(1, 1, expected, observerScope),
-        expected,
-      ),
-    ).rejects.toThrow("Observer authority is not eligible");
-    const generation = await authority.attach(capability.verifier);
-    const proof = capability.sign(generation, 1, expected, observerScope);
-    for (const invalid of [
-      createObserverCapability().sign(generation, 1, expected, observerScope),
-      {
-        ...proof,
-        payload: JSON.stringify({ ...expected, taskID: "unapproved-task" }),
-      },
-      capability.sign(generation, 1, { ...expected, epoch: 2 }, observerScope),
-    ]) {
-      await expect(authority.authorize(invalid, expected)).rejects.toThrow(
-        "Observer authority is not eligible",
-      );
-    }
-    await authority.authorize(proof, expected);
-    await expect(authority.authorize(proof, expected)).rejects.toThrow(
-      "Observer authority is not eligible",
-    );
-    authority.revoke();
-    await expect(
-      authority.authorize(
-        capability.sign(generation, 2, expected, observerScope),
-        expected,
-      ),
-    ).rejects.toThrow("Observer authority is not eligible");
-    const denied = new ObserverAuthority(
-      "coordinator-home",
-      {
-        ...port,
-        async approve() {
-          throw new Error("Denied");
-        },
-      },
-      observerScope,
-    );
-    await expect(denied.attach(capability.verifier)).rejects.toThrow("Denied");
-    await expect(
-      denied.authorize(
-        capability.sign(generation + 1, 1, expected, observerScope),
-        expected,
-      ),
-    ).rejects.toThrow("Observer authority is not eligible");
-    for (const abort of ["shutdown", "request"] as const) {
-      const f = await backendFixture();
-      let approve!: () => void, entered!: () => void;
-      const started = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      f.approve(() => {
-        entered();
-        return new Promise<void>((resolve) => {
-          approve = resolve;
-        });
-      });
-      const request = new AbortController();
-      const pending = f.backend
-        .attach(
-          {
-            coordinatorID: "coordinator",
-            verifier: createObserverCapability().verifier,
-          },
-          request.signal,
-        )
-        .then(
-          () => "attached",
-          () => "aborted",
-        );
-      await started;
-      if (abort === "request") request.abort();
-      else await f.backend.dispose();
-      expect(await pending).toBe("aborted");
-      const before = f.root();
-      approve();
-      await Promise.resolve();
-      expect(f.root()).toEqual(before);
-      if (abort === "request") await f.backend.dispose();
-      expect(f.effects).toEqual(["release"]);
     }
   });
 });

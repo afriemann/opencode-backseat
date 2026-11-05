@@ -120,6 +120,30 @@ function fixture() {
         controls.push(input);
         return { accepted: true };
       },
+      async sendSession(...input: unknown[]) {
+        controls.push(["send_session", ...input]);
+        return {
+          sessionID: "worker",
+          sendID: "msg_native",
+          status: "admitted",
+        };
+      },
+      async sessionOperation(...input: unknown[]) {
+        controls.push(["session_operation", ...input]);
+        return { status: "completed" };
+      },
+      async resumeTask(...input: unknown[]) {
+        controls.push(["resume_task", ...input]);
+        return { accepted: true };
+      },
+      async startSupervision(...input: unknown[]) {
+        controls.push(["start_supervision", ...input]);
+        return {
+          generation: 1,
+          coordinatorID: "coordinator",
+          status: "held" as const,
+        };
+      },
       async recover(...input: unknown[]) {
         controls.push(["recover", ...input]);
         return { authority: "held" };
@@ -177,6 +201,133 @@ function fixture() {
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Fine-grained Code Mode queries", () => {
+  it("Pages selected session content incrementally", async () => {
+    const f = fixture();
+    const target = {
+      sessionID: "running",
+      location: "/projects/one",
+      agent: "engineer",
+    };
+    const projection = [
+      {
+        id: "idle-1",
+        type: "idle",
+        outcome: "succeeded",
+        time: { created: 1 },
+      },
+    ];
+    Object.assign(f.client, {
+      message: {
+        list: async () => ({
+          data: projection,
+          cursor: { next: "native-next" },
+        }),
+      },
+      experimental: {
+        session: {
+          instructions: { entry: { list: async () => [] } },
+          stats: async () => ({}),
+          export: async () => ({ info: f.rows[0], messages: projection }),
+          log: async function* () {
+            yield { type: "log.synced", aggregateID: "running", seq: 0 };
+          },
+        },
+      },
+    });
+    Object.assign(f.client.session, {
+      context: async () => [],
+      diff: async () => [],
+      message: { get: async () => projection[0] },
+      form: {
+        list: async () => [],
+        get: async () => ({ id: "form", sessionID: "running" }),
+      },
+      inbox: {
+        list: async () => [
+          {
+            id: "send-anchor",
+            sessionID: "running",
+            type: "user",
+            time: { created: 1 },
+            payload: { text: "Requested work" },
+            delivery: "queue",
+          },
+        ],
+      },
+    });
+    Object.assign(f.client.permission, {
+      list: async () => [],
+      get: async () => ({ id: "request", sessionID: "running" }),
+      saved: { list: async () => [] },
+    });
+    for (const [name, query] of [
+      ["read_session_messages", { order: "asc" }],
+      ["read_session_message", { messageID: "idle-1" }],
+      ["read_session_context", {}],
+      ["read_session_diff", {}],
+      ["read_session_inbox", {}],
+      ["list_session_permissions", {}],
+      ["get_session_permission", { requestID: "request" }],
+      ["list_saved_permissions", {}],
+      ["list_session_forms", {}],
+      ["get_session_form", { formID: "form" }],
+      ["list_session_instructions", {}],
+      ["read_session_stats", { toolsLevel: "summary" }],
+      ["export_session", {}],
+    ] as const) {
+      expect((await f.call(name, { ...target, ...query })).available).toBe(
+        true,
+      );
+    }
+    const first = await f.call("read_session_messages", target);
+    expect(typeof first.cursor).toBe("string");
+    for (const caller of [
+      {
+        ...f.context,
+        sessionID: "another-coordinator" as ToolContext["sessionID"],
+      },
+      { ...f.context, agent: "another-agent" as ToolContext["agent"] },
+    ])
+      await expect(
+        f.call(
+          "read_session_messages",
+          { ...target, cursor: first.cursor },
+          caller,
+        ),
+      ).rejects.toThrow();
+    expect(
+      await f.call("follow_session", { ...target, sendID: "send-anchor" }),
+    ).toMatchObject({
+      available: true,
+      sendID: "send-anchor",
+      anchor: "pending",
+    });
+    f.registry.dispose();
+  });
+  it("Rejects invalid or unavailable content continuation", async () => {
+    const f = fixture();
+    let reads = 0;
+    f.port.native.read = async () => {
+      reads++;
+      throw new Error("Unexpected native read");
+    };
+    for (const query of [
+      { extra: true },
+      { order: "invalid" },
+      { toolsLevel: "invalid" },
+      { limit: 1.5 },
+      { location: "relative/project" },
+    ])
+      await expect(
+        f.call("read_session_messages", {
+          sessionID: "running",
+          location: "/projects/one",
+          ...query,
+        }),
+      ).rejects.toThrow();
+    expect(reads).toBe(0);
+    f.registry.dispose();
+  });
   it("Returns native session timestamps", async () => {
     const f = fixture();
     f.rows.splice(2);
@@ -549,6 +700,78 @@ describe("Fine-grained Code Mode queries", () => {
       "dispatch",
       "task",
       { text: "Requested work", scope: ["source"] },
+      expect.objectContaining({ sessionID: "coordinator" }),
+    ]);
+    const send = {
+      sessionID: "worker",
+      location: "/projects/one",
+      agent: "engineer",
+      text: "Requested work",
+    };
+    expect(await f.call("send_session", send)).toMatchObject({
+      sendID: "msg_native",
+      status: "admitted",
+    });
+    expect(f.controls.at(-1)).toMatchObject([
+      "send_session",
+      send,
+      expect.objectContaining({ sessionID: "coordinator" }),
+    ]);
+    for (const [kind, options] of [
+      ["synthetic", { resume: false }],
+      ["shell", {}],
+      ["compact", { delivery: "queue" }],
+      ["command", { name: "review" }],
+      ["skill", { skillID: "coding" }],
+    ] as const) {
+      const { text, ...target } = send;
+      expect(
+        (
+          await f.call(`${kind}_session`, {
+            ...target,
+            ...(kind === "compact" || kind === "skill" ? {} : { text }),
+            options,
+          })
+        ).status,
+      ).toBe("admitted");
+      expect(f.controls.at(-1)).toMatchObject([
+        "send_session",
+        {
+          ...target,
+          text: kind === "compact" || kind === "skill" ? kind : text,
+          kind,
+          options,
+        },
+        expect.objectContaining({ sessionID: "coordinator" }),
+      ]);
+    }
+    for (const [operation, payload] of [
+      ["reply_permission", { requestID: "permission", decision: "reject" }],
+      ["reply_form", { formID: "form", answer: { selected: "" } }],
+      ["request_permission", { action: "shell", resources: ["make test"] }],
+      ["remove_saved_permission", { id: "saved" }],
+      ["interrupt_session", { resume: false }],
+    ] as const) {
+      const target = {
+        sessionID: send.sessionID,
+        location: send.location,
+        agent: send.agent,
+      };
+      expect(await f.call(operation, { ...target, ...payload })).toEqual({
+        status: "completed",
+      });
+      expect(f.controls.at(-1)).toMatchObject([
+        "session_operation",
+        { operation, ...target, payload },
+        expect.objectContaining({ sessionID: "coordinator" }),
+      ]);
+    }
+    expect(await f.call("resume_task", { taskID: "task" })).toEqual({
+      accepted: true,
+    });
+    expect(f.controls.at(-1)).toMatchObject([
+      "resume_task",
+      "task",
       expect.objectContaining({ sessionID: "coordinator" }),
     ]);
     for (const [name, input, expected] of [

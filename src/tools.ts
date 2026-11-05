@@ -7,6 +7,19 @@ import {
 } from "./native-connection.ts";
 import type { NativeBackend } from "./server.ts";
 import {
+  CONTENT_READERS,
+  CONTENT_READER_NAMES,
+  createNativeContent,
+  parseContentQuery,
+} from "./native-content.ts";
+import {
+  NATIVE_OPERATIONS,
+  NATIVE_OPERATION_NAMES,
+  NATIVE_SEND_DESCRIPTIONS,
+  NATIVE_SEND_OPTIONS,
+  type NativeSendKind,
+} from "./native-operations.ts";
+import {
   NativeDiscovery,
   readNativeInventory,
   refreshNativeSessions,
@@ -14,7 +27,7 @@ import {
 } from "./native-sessions.ts";
 import { exact, integer, list, object, text, fingerprint } from "./state.ts";
 
-export const COORDINATION_TOOLS = [
+const CORE_COORDINATION_TOOLS = [
   "list_sessions",
   "list_projects",
   "list_agents",
@@ -24,10 +37,19 @@ export const COORDINATION_TOOLS = [
   "adopt_session",
   "take_over_task",
   "dispatch_task",
+  "send_session",
   "hold_task",
+  "start_supervision",
+  "resume_task",
   "share_context",
   "recover_runtime",
   "delete_session",
+] as const;
+export const COORDINATION_TOOLS = [
+  ...CORE_COORDINATION_TOOLS,
+  ...NATIVE_OPERATION_NAMES,
+  ...CONTENT_READER_NAMES,
+  ...Object.keys(NATIVE_SEND_DESCRIPTIONS).map((kind) => `${kind}_session`),
 ] as const;
 export const COORDINATOR_TOOL_IDS = new Set([
   "execute",
@@ -44,6 +66,10 @@ export interface CoordinationToolPort {
     | "nativeControl"
     | "recover"
     | "deleteSession"
+    | "sendSession"
+    | "sessionOperation"
+    | "startSupervision"
+    | "resumeTask"
   >;
   canonical(location: string): Promise<string>;
   authorize(context: ToolContext): Promise<void>;
@@ -151,7 +177,7 @@ const rowSchema = {
   additionalProperties: false,
 };
 const outputSchemas: Record<
-  (typeof COORDINATION_TOOLS)[number],
+  (typeof CORE_COORDINATION_TOOLS)[number],
   Record<string, unknown>
 > = {
   list_sessions: {
@@ -249,7 +275,10 @@ const outputSchemas: Record<
   adopt_session: { type: "object", additionalProperties: true },
   take_over_task: { type: "object", additionalProperties: true },
   dispatch_task: { type: "object", additionalProperties: true },
+  send_session: { type: "object", additionalProperties: true },
   hold_task: { type: "object", additionalProperties: true },
+  start_supervision: { type: "object", additionalProperties: true },
+  resume_task: { type: "object", additionalProperties: true },
   share_context: { type: "object", additionalProperties: true },
   recover_runtime: { type: "object", additionalProperties: true },
   delete_session: {
@@ -305,6 +334,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   let sequence = 0,
     disposed = false;
   const now = port.now ?? Date.now;
+  const content = createNativeContent(now);
   const alive = (context: ToolContext) => {
     if (disposed || port.signal.aborted)
       throw new Error("Project adapter is unavailable");
@@ -581,8 +611,92 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       ),
     };
   };
-  const specs: Record<
-    (typeof COORDINATION_TOOLS)[number],
+  type ToolSpec = {
+    description: string;
+    input: ReturnType<typeof inputSchema>;
+    run(
+      v: Record<string, unknown>,
+      context: ToolContext,
+      diagnostics: DiagnosticContext,
+    ): Promise<unknown>;
+  };
+  const nativeSpecs = Object.fromEntries(
+    NATIVE_OPERATION_NAMES.map((operation) => {
+      const definition = NATIVE_OPERATIONS[operation];
+      return [
+        operation,
+        {
+          description: `${definition.description} ${operation === "create_native_session" || operation === "import_session" ? "Select an available canonical project location and eligible agent from the catalogs, and retain the new session identity." : "Select exact sessionID, location and current agent from list_sessions."} No task binding is required. Manual control fences pending automatic decisions.`,
+          input: inputSchema(
+            {
+              sessionID: stringSchema,
+              location: stringSchema,
+              agent: stringSchema,
+              ...definition.input.properties,
+            },
+            ["sessionID", "location", "agent", ...definition.input.required],
+          ),
+          async run(v: Record<string, unknown>, context: ToolContext) {
+            const { sessionID, location, agent, ...payload } = v;
+            return port.backend.sessionOperation(
+              {
+                operation,
+                sessionID: text(sessionID),
+                location: text(location),
+                agent: text(agent),
+                payload,
+              },
+              context,
+            );
+          },
+        },
+      ];
+    }),
+  );
+  const contentSpecs = Object.fromEntries(
+    CONTENT_READER_NAMES.map((name) => {
+      const definition = CONTENT_READERS[name];
+      return [
+        name,
+        {
+          description: definition.description,
+          input: definition.input,
+          async run(value: Record<string, unknown>, context: ToolContext) {
+            const { sendID, ...remaining } = value;
+            const query = parseContentQuery(
+              definition.kind === "tracking" ? remaining : value,
+            );
+            await canonical(query.location);
+            const incarnation = port.native.identity({
+              nonce: "0".repeat(64),
+              origin: "backseat-content",
+            }).mac;
+            return native(context, (client, signal) => {
+              const caller = JSON.stringify([context.sessionID, context.agent]);
+              if (definition.kind === "tracking")
+                return content.follow(
+                  { ...query, sendID: text(sendID) },
+                  caller,
+                  incarnation,
+                  client,
+                  signal,
+                );
+              return content.read(
+                definition.kind,
+                query,
+                caller,
+                incarnation,
+                client,
+                signal,
+              );
+            });
+          },
+        },
+      ];
+    }),
+  );
+  const coreSpecs: Record<
+    (typeof CORE_COORDINATION_TOOLS)[number],
     {
       description: string;
       input: ReturnType<typeof inputSchema>;
@@ -773,14 +887,14 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     adopt_session: {
       description:
-        "Bind a selected top-level native session to a user-approved task without sending a worker prompt, interrupting execution or changing its agent. task.location and task.agent must match the selected session. Requires native approval; rejects child sessions and competing ownership. Inspect the resulting binding with get_task.",
+        "Bind a selected native session, including a child, to a user-approved task without sending a prompt, interrupting execution or changing its agent. task.location and task.agent must match the selected session. Requires native approval; rejects changed targets and competing ownership. Does not bind its parent or siblings. Inspect the resulting binding with get_task.",
       input: inputSchema(
         {
           task: taskSchema,
           sessionID: {
             ...stringSchema,
             description:
-              "Exact native session ID from list_sessions with topLevel true; not a task ID.",
+              "Exact selected native session ID from list_sessions, including child sessions; not a task ID.",
           },
         },
         ["task", "sessionID"],
@@ -798,7 +912,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     take_over_task: {
       description:
-        "Take manual control of a bound top-level worker and fence automatic follow-ups without sending a prompt. Read get_task first; requires operation-specific native approval. For an unbound session use adopt_session instead.",
+        "Take manual control of a bound worker, including a child, and fence automatic follow-ups without sending a prompt. Read get_task first; requires operation-specific native approval. Does not take control of its parent or siblings. For an unbound session use adopt_session instead.",
       input: inputSchema(
         {
           taskID: {
@@ -850,6 +964,60 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           { text: text(v.text), scope: list(v.scope, text) },
           context,
         );
+      },
+    },
+    send_session: {
+      description:
+        "Send user-requested text to a selected native session without creating or adopting a task. options accepts native file, agent and skill attachments, metadata, delivery and resume. Select its exact sessionID, location and agent from list_sessions. Native approval binds the target and complete input. For an already bound task, supply scope copied from its approved scope; the operation takes manual control and fences automation. Returns sessionID, sendID and admitted or uncertain status. Never retry an uncertain send; inspect its existing sendID.",
+      input: inputSchema(
+        {
+          sessionID: stringSchema,
+          location: stringSchema,
+          agent: stringSchema,
+          text: { ...stringSchema, maxLength: 12_000 },
+          scope: stringsSchema,
+          options: NATIVE_SEND_OPTIONS.prompt,
+        },
+        ["sessionID", "location", "agent", "text"],
+      ),
+      async run(v, context) {
+        exact(v, [
+          "sessionID",
+          "location",
+          "agent",
+          "text",
+          "scope",
+          "options",
+        ]);
+        return port.backend.sendSession(
+          {
+            sessionID: text(v.sessionID),
+            location: text(v.location),
+            agent: text(v.agent),
+            text: text(v.text),
+            ...(v.options === undefined ? {} : { options: object(v.options) }),
+            ...(v.scope === undefined ? {} : { scope: list(v.scope, text) }),
+          },
+          context,
+        );
+      },
+    },
+    start_supervision: {
+      description:
+        "Start a server-owned supervision generation for this coordinator under operation-bound native approval. Fences previous automatic decisions and preserves consumed limits and delivery identities. Returns generation, coordinatorID and held status; starting inventories authority but never implicitly resumes tasks. No terminal attachment or proof is required.",
+      input: inputSchema({}, []),
+      async run(v, context) {
+        exact(v, []);
+        return port.backend.startSupervision(context);
+      },
+    },
+    resume_task: {
+      description:
+        "Resume one selected task under operation-bound native approval in the current server supervision generation. Requires start_supervision, fresh globally settled native worker state, no pending human requests, reconciled delivery identities and remaining finite limits. Preserves counters and rechecks native evidence after approval; no terminal attachment is required.",
+      input: inputSchema({ taskID: stringSchema }, ["taskID"]),
+      async run(v, context) {
+        exact(v, ["taskID"]);
+        return port.backend.resumeTask(text(v.taskID), context);
       },
     },
     hold_task: {
@@ -976,12 +1144,80 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       },
     },
   };
+  const specs: Record<string, ToolSpec> = {
+    ...coreSpecs,
+    ...nativeSpecs,
+    ...Object.fromEntries(
+      Object.entries(NATIVE_SEND_DESCRIPTIONS).map(([kind, description]) => [
+        `${kind}_session`,
+        {
+          description: `${description} Select exact sessionID, location and current agent from list_sessions. No task binding is required. Bound sessions require their approved scope and take manual control. Returns sendID and admitted or uncertain; inspect an uncertain identity, never resend it.`,
+          input: inputSchema(
+            {
+              sessionID: stringSchema,
+              location: stringSchema,
+              agent: stringSchema,
+              text: stringSchema,
+              scope: stringsSchema,
+              options: NATIVE_SEND_OPTIONS[kind as NativeSendKind],
+            },
+            [
+              "sessionID",
+              "location",
+              "agent",
+              ...(kind === "compact" || kind === "skill" ? [] : ["text"]),
+              ...(kind === "command" || kind === "skill" ? ["options"] : []),
+            ],
+          ),
+          async run(v: Record<string, unknown>, context: ToolContext) {
+            exact(v, [
+              "sessionID",
+              "location",
+              "agent",
+              "text",
+              "scope",
+              "options",
+            ]);
+            return port.backend.sendSession(
+              {
+                sessionID: text(v.sessionID),
+                location: text(v.location),
+                agent: text(v.agent),
+                text:
+                  v.text === undefined &&
+                  (kind === "compact" || kind === "skill")
+                    ? kind
+                    : text(v.text),
+                kind: kind as NativeSendKind,
+                ...(v.scope === undefined
+                  ? {}
+                  : { scope: list(v.scope, text) }),
+                ...(v.options === undefined
+                  ? {}
+                  : { options: object(v.options) }),
+              },
+              context,
+            );
+          },
+        },
+      ]),
+    ),
+    ...contentSpecs,
+  };
+  const toolSpec = (name: string): ToolSpec => {
+    const spec = specs[name];
+    if (!spec) throw new Error("Missing native tool definition");
+    return spec;
+  };
   return {
     tools: COORDINATION_TOOLS.map((name): Info => ({
       name,
-      description: specs[name].description,
-      input: specs[name].input,
-      output: outputSchemas[name],
+      description: toolSpec(name).description,
+      input: toolSpec(name).input,
+      output:
+        name in outputSchemas
+          ? outputSchemas[name as keyof typeof outputSchemas]
+          : { type: "object", additionalProperties: true },
       options: { namespace: "backseat", codemode: true },
       async execute(input: unknown, context) {
         const diagnostics = diagnosticContext(port.diagnostics, "tool", name);
@@ -990,7 +1226,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           alive(context);
           await port.authorize(context);
           alive(context);
-          const output = await specs[name].run(
+          const output = await toolSpec(name).run(
             object(input),
             {
               ...context,
@@ -1016,6 +1252,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     dispose() {
       disposed = true;
       pages.clear();
+      content.dispose();
     },
   };
 }

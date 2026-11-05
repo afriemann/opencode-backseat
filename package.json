@@ -8,7 +8,6 @@
   },
   "exports": {
     ".": "./src/server.ts",
-    "./tui": "./src/tui.ts",
     "./rpc": "./src/rpc.ts"
   },
   "peerDependencies": {
@@ -20,11 +19,7 @@
   },
   "devDependencies": {
     "@opencode/plugin": "2.2.5",
-    "@opencode/theme": "2.2.5",
-    "@opentui/core": "0.8.0",
-    "@opentui/solid": "0.8.0",
     "effect": "4.0.6",
-    "solid-js": "1.9.17",
     "@types/bun": "1.4.4",
     "typescript": "6.0.3",
     "prettier": "3.9.10",

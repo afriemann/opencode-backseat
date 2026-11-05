@@ -37,8 +37,7 @@ export interface SupervisionPort extends DispatchPort, EvaluatorPort {
   binding(taskID: string): Promise<WorkerBinding>;
   inventory(): Promise<readonly WorkerBinding[]>;
   observe(binding: WorkerBinding): Promise<WorkerObservation>;
-  // Native-TUI capability verification against the server's approved observer
-  // generation and binding. This is NOT an RPC caller's confirmed flag.
+  // Verify the approved generation and exact binding, not a caller's assertion.
   authorized(generation: string, binding: WorkerBinding): Promise<boolean>;
   // Full native reads plus semantic scope/non-consent admission validation.
   validateStep(
