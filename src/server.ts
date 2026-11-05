@@ -10,6 +10,7 @@ import {
 import {
   createNativeConnection,
   DIAGNOSTIC_EVENTS,
+  projectRequestDiagnostics,
   DIAGNOSTIC_PHASES,
   DIAGNOSTIC_FAILURES,
   DiagnosticToken,
@@ -2787,6 +2788,7 @@ export const hostDiagnostics = Effect.gen(function* () {
       if (!Object.hasOwn(levels, level) || !DIAGNOSTIC_EVENTS.includes(event))
         return;
       const record: Record<string, unknown> = { service: "backseat", event };
+      Object.assign(record, projectRequestDiagnostics(fields));
       for (const [key, values] of [
         ["phase", DIAGNOSTIC_PHASES],
         ["classification", DIAGNOSTIC_FAILURES],
