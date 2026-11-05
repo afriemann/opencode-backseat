@@ -108,6 +108,8 @@ describe("Native session inventory", () => {
     expect(inventory.sessions[0]).toEqual({
       id: "one",
       title: "one",
+      createdAt: 1,
+      updatedAt: 1,
       projectID: "one",
       parentID: null,
       topLevel: true,

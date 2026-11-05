@@ -231,6 +231,8 @@ export interface NativeInventory {
   sessions: {
     id: string;
     title: string;
+    createdAt: number;
+    updatedAt: number;
     projectID: string;
     parentID: string | null;
     topLevel: boolean;
@@ -316,6 +318,8 @@ function sessionMetadata(
   return {
     id: worker.id,
     title: worker.title ?? worker.id,
+    createdAt: worker.time.created,
+    updatedAt: worker.time.updated,
     projectID: worker.projectID,
     parentID: worker.parentID ?? null,
     topLevel: worker.parentID === undefined,
