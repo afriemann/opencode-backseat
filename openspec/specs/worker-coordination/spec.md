@@ -353,3 +353,19 @@ Backseat SHALL preserve coordination results, original errors, permission checks
 - **WHEN** diagnostic token generation, record processing or host logging fails during an operation
 - **THEN** its result or original error remains unchanged and required cancellation and cleanup still occur
 - **AND** logging causes no retries, recursive logging or fallback sink writes
+
+### Requirement: Native session inventory timestamps
+
+The coordinator SHALL include numeric `createdAt` and `updatedAt` fields in each `list_sessions` row, copied from native `time.created` and `time.updated` as Unix milliseconds. `updatedAt` represents general session-update recency, not exclusively conversation activity.
+
+#### Scenario: Returns native session timestamps
+
+- **GIVEN** native sessions with distinct creation and update timestamps
+- **WHEN** the coordinator lists sessions or follows a buffered continuation
+- **THEN** each row exposes those timestamps unchanged, using refreshed detail metadata when available.
+
+#### Scenario: Preserves timestamps when status refresh is unavailable
+
+- **GIVEN** native list metadata with creation and update timestamps
+- **WHEN** a session detail read fails and the caller includes unknown status
+- **THEN** the row retains the available list timestamps with unknown status and partial inventory.
