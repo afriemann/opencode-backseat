@@ -180,7 +180,7 @@ export async function openAnchoredDirectory(
         ? !actual.isDirectory()
         : !actual.isFile() || actual.nlink !== 1) ||
       (actual.uid !== uid && actual.uid !== 0) ||
-      (actual.mode & 0o022) !== 0 ||
+      ((actual.mode & 0o002) !== 0 && (actual.mode & 0o1000) === 0) ||
       ((privateDirectory || !directoryEntry) &&
         (actual.uid !== uid ||
           (actual.mode & 0o777) !== (directoryEntry ? 0o700 : 0o600)))

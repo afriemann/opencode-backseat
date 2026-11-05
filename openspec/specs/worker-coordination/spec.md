@@ -154,11 +154,20 @@ The plugin SHALL keep coordination state in one selected user data store indepen
 - **AND** first use initializes an empty store without reading, migrating or deleting existing project-home state; subsequent use preserves populated data.
 - **AND** default selection does not discover, read, migrate, delete or fall back to the old branded store; explicit `dataDir` selection and the persisted format remain unchanged.
 
+#### Scenario: Supports trusted writable storage ancestry
+
+- **GIVEN** real root/current-UID-owned ancestor directories with group-write permission, or other-write permission protected by a sticky parent and trusted immediate-child ownership
+- **WHEN** coordination initializes, reopens, or acquires shared-store authority
+- **THEN** storage and exclusive ownership work without changing ancestor permissions, and reopening preserves durable state.
+- **AND** the final store remains current-UID-owned with mode `0700` and its regular single-link files remain current-UID-owned with mode `0600`; identity, no-follow, publication, filesystem and lock checks remain enforced.
+- **AND** group/ACL-authorized ancestor writers are trusted: subtree disruption or restoration, rollback and lost lock continuity against those writers are outside this protection boundary.
+
 #### Scenario: Holds unsafe or corrupt shared storage
 
 - **WHEN** a selected path is relative or unsafe, initialized state is missing, corrupt or unreadable, publication is incomplete, or file ownership, private modes, link or filesystem safety cannot be established
 - **THEN** coordination stays visibly held without resetting limits, losing uncertain deliveries, repairing existing permissions, following substituted files or falling back to project-local state.
 - **AND** shared state and observations have bounded reads and atomic durable publication; only genuinely uninitialized stores start empty.
+- **AND** non-sticky other-writable ancestors, untrusted owners, symlinks and observed ancestor substitution remain unsafe.
 
 #### Scenario: Preserves populated stores across manual assignments
 
@@ -207,6 +216,19 @@ The coordinator SHALL obtain native inventory through an automatically authentic
 
 - **WHEN** registration safety or destination confinement cannot be established, or a request redirects outside the verified connection
 - **THEN** the connection rejects the request without exposing credentials in output, diagnostics, or an unapproved destination.
+
+#### Scenario: Explains initial registration-directory rejection
+
+- **WHEN** initial registration ancestry validation rejects a path because it is not a directory, has a disallowed owner, or has non-sticky other-write permission
+- **THEN** the error identifies the first rejected ancestor, the specific condition, and relevant observed type, numeric ownership, or octal permissions with guidance to review the path.
+- **AND** diagnostics never reject group-write alone or claim another account actually has access; rejection occurs before opening registration contents and changes no permissions.
+
+#### Scenario: Supports trusted writable registration ancestry
+
+- **GIVEN** real root/current-UID-owned registration ancestors with group-write permission, or other-write permission protected by a sticky parent and trusted immediate-child ownership
+- **WHEN** registration is read and its ancestry revalidated
+- **THEN** the native connection succeeds without changing permissions while retaining private-file, ownership, no-follow, identity, bounded-read and destination checks.
+- **AND** the same trusted-writer boundary as shared storage applies.
 
 #### Scenario: Cancels native reads when the plugin unloads
 

@@ -13,6 +13,7 @@ import {
   link,
   mkdir,
   mkdtemp,
+  rename,
   readFile,
   rm,
   stat,
@@ -248,6 +249,59 @@ describe("Shared durable coordination store", () => {
     }
   });
 
+  it("Supports trusted writable storage ancestry", async () => {
+    const root = resolve(".opencode/backseat");
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const fixture = await mkdtemp(`${root}/writable-ancestry-`);
+    try {
+      for (const mode of [0o775, 0o2775, 0o1777]) {
+        const parent = `${fixture}/${mode}`;
+        await mkdir(parent);
+        await chmod(parent, mode);
+        const directory = `${parent}/store`;
+        const first = await openSharedStorage(directory);
+        try {
+          await first.set("limits", { followUps: 2, uncertain: true });
+        } finally {
+          await first.close();
+        }
+        const second = await openSharedStorage(directory);
+        try {
+          expect(await second.get("limits")).toEqual({
+            followUps: 2,
+            uncertain: true,
+          });
+          expect((await stat(directory)).mode & 0o777).toBe(0o700);
+          expect((await stat(`${directory}/state.json`)).mode & 0o777).toBe(
+            0o600,
+          );
+        } finally {
+          await second.close();
+        }
+        const owner = new CoordinatorOwnership(
+          directory,
+          "owner",
+          createFilesystemOwnershipPort(async () => {}),
+        );
+        const contender = new CoordinatorOwnership(
+          directory,
+          "contender",
+          createFilesystemOwnershipPort(async () => {}),
+        );
+        try {
+          expect(await owner.claim()).toBe("owned");
+          expect(await contender.claim()).not.toBe("owned");
+        } finally {
+          await contender.dispose(async () => {});
+          await owner.dispose(async () => {});
+        }
+        expect((await stat(parent)).mode & 0o7777).toBe(mode);
+      }
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+
   it("Holds unsafe or corrupt shared storage", async () => {
     for (const dataDir of ["", "relative/store"]) {
       const project = await registeredCoordinator(false, undefined, dataDir);
@@ -319,6 +373,59 @@ describe("Shared durable coordination store", () => {
     await mkdir(root, { recursive: true, mode: 0o700 });
     const fixture = await mkdtemp(`${root}/unsafe-store-`);
     try {
+      for (const mode of [0o777, 0o757]) {
+        const parent = `${fixture}/public-${mode}`;
+        await mkdir(parent);
+        await chmod(parent, mode);
+        await expect(openSharedStorage(`${parent}/store`)).rejects.toThrow(
+          "Shared storage is unsafe or incomplete; coordination held",
+        );
+      }
+      const sticky = `${fixture}/sticky`;
+      const untrusted = `${sticky}/untrusted`;
+      await mkdir(sticky, { mode: 0o1777 });
+      await chmod(sticky, 0o1777);
+      await mkdir(untrusted, { mode: 0o775 });
+      const openDirectory = filesystem.open;
+      const foreignChild = spyOn(filesystem, "open").mockImplementation(
+        async (...args) => {
+          const file = await openDirectory(...args);
+          if (
+            (await file.stat()).isDirectory() &&
+            (await filesystem.realpath(`/proc/self/fd/${file.fd}`)) ===
+              untrusted
+          ) {
+            const nativeStat = file.stat.bind(file);
+            spyOn(file, "stat").mockImplementation((async () =>
+              Object.assign(await nativeStat(), {
+                uid: process.getuid!() + 1,
+              })) as typeof file.stat);
+          }
+          return file;
+        },
+      );
+      try {
+        await expect(openSharedStorage(`${untrusted}/store`)).rejects.toThrow(
+          "Shared storage is unsafe or incomplete; coordination held",
+        );
+      } finally {
+        foreignChild.mockRestore();
+      }
+      const original = `${fixture}/original`;
+      await mkdir(original, { mode: 0o700 });
+      const anchored = await sharedStorageModule.openAnchoredDirectory(
+        `${original}/store`,
+      );
+      try {
+        await rename(original, `${fixture}/moved`);
+        await mkdir(original);
+        await mkdir(`${original}/store`, { mode: 0o700 });
+        await expect(anchored.validate()).rejects.toThrow(
+          "Shared storage is unsafe or incomplete; coordination held",
+        );
+      } finally {
+        await anchored.close();
+      }
       for (const failure of [
         "corrupt",
         "missing",

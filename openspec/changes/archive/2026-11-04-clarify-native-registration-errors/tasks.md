@@ -1,0 +1,3 @@
+- [x] Implement “Supports trusted writable registration ancestry” and “Explains initial registration-directory rejection” in the registration reader and scenario-named tests.
+- [x] Implement “Supports trusted writable storage ancestry” and the retained failures in “Holds unsafe or corrupt shared storage” through the anchored-directory guard and scenario-named tests.
+- [x] Document the design's trusted-writer boundary and supported directory modes in README.md.
