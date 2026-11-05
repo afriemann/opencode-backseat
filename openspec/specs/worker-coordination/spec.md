@@ -49,8 +49,9 @@ The coordinator SHALL apply hold, resume and takeover only to their explicitly t
 #### Scenario: Resume requires fresh eligible state
 
 - **GIVEN** a held or manually owned task
-- **WHEN** its user explicitly resumes coordination
-- **THEN** ownership is re-established only after current operation-bound native TUI reconciliation of the target, asks, observation and approval; incomplete or changed eligibility stays held and obsolete decisions are not dispatched.
+- **WHEN** its user explicitly resumes coordination through the agent
+- **THEN** ownership is re-established only after current operation-bound native approval and server reconciliation of the target, asks and observation; incomplete or changed eligibility stays held and obsolete decisions are not dispatched.
+- **AND** successful rearming schedules the already-settled target without requiring another idle event; inactive historical bindings do not require fresh observations, other active evaluations remain queued, and failed rearming is reported without leaving a falsely active target.
 
 ### Requirement: Exclusive coordinator authority
 
@@ -72,24 +73,25 @@ The coordinator SHALL allow mutations only through the active authority for the 
 
 - **GIVEN** multiple enabled projects share the active store
 - **WHEN** one project unloads or the final participant closes
-- **THEN** the unloaded project's pending operations, asks, evaluations, observations and initiating attachment cannot admit further work, while other participants retain shared ownership until final shutdown safely drains publication and releases it.
+- **THEN** the unloaded project's pending operations, asks, evaluations, observations and initiating coordinator authority cannot admit further work, while other participants retain shared ownership until final shutdown safely drains publication and releases it.
 - **AND** replacement acquisition cannot overlap closing ownership; reconnect still requires fresh approval and reconciliation, preserving uncertain deliveries and consumed limits.
 
 ### Requirement: Approved observer generation
 
-The coordinator SHALL authorise native observer mutations only through explicit operation-bound approval of the current observer generation.
+The coordinator SHALL authorise server supervision generations through explicit operation-bound native approval requested by the current coordinator agent.
 
 #### Scenario: Native approval binds observer generation
 
-- **GIVEN** the selected native TUI requests attachment from an eligible dedicated coordinator session in an enabled project
-- **WHEN** a genuine native approval decision approves that observer's verifier and generation
-- **THEN** only possession proofs bound to the selected store, actual initiating session and location, exact target, generation and authorised operation can mutate coordination state; an allow policy alone does not replace the explicit ask.
-- **AND** role, location, store and target are revalidated after approval; native session, agent, permission and worker APIs never use the data directory as a project destination.
+- **GIVEN** an eligible dedicated coordinator session in an enabled project requests supervision start or resume
+- **WHEN** a genuine native approval decision approves the selected generation and targets
+- **THEN** the server binds authority to the selected store, actual initiating session and location, exact targets and generation; an allow policy alone does not replace the explicit ask.
+- **AND** role, location, store and targets are revalidated after approval; native session, agent, permission and worker APIs never use the data directory as a project destination.
 
 #### Scenario: Rejects unapproved observer mutations
 
-- **WHEN** a request supplies only a confirmation claim, invalid possession proof, replayed operation, obsolete generation or configured denial, or its approved session, location, store, role or target changes
-- **THEN** no scope, ownership, limit, dispatch intent or completion state is changed; denied replacement attachment preserves the incumbent generation, while failed durable publication is visibly held rather than reported committed.
+- **WHEN** a request supplies only a confirmation claim, obsolete generation or configured denial, or its approved session, location, store, role or target changes
+- **THEN** no scope, ownership, limit, dispatch intent or completion state is changed; denied replacement approval preserves the incumbent generation, while failed durable publication is visibly held rather than reported committed.
+- **AND** terminal attachment and possession proofs are neither required nor accepted as alternative mutation authority.
 
 ### Requirement: Bundled conversational coordinator
 
@@ -118,16 +120,16 @@ The plugin SHALL restrict matching coordinator roles to namespaced coordination 
 
 - **WHEN** a matching coordinator role is selected
 - **THEN** Code Mode composition and user questions are permitted, subject to configured denials, and each individual coordination mutation retains native operation-bound approval.
-- **AND** dedicated structured discovery, task-detail and control tools replace generic model-facing inspection/control tools without aliases; internal possession-bound TUI RPC remains available.
+- **AND** dedicated structured discovery, content and control tools replace generic model-facing inspection/control tools without aliases; no terminal control interface is registered.
 - **AND** callable tools use the `backseat` namespace and `backseat_` tool identifiers, operation approval uses `backseat.` actions, and the plugin and RPC identity are `backseat`, without old-name aliases.
-- **AND** shell, editing, reading, web, subagent and permission/form-reply tools remain denied; execution of a script never grants mutation approval or arms automation.
+- **AND** direct shell, editing, reading, web, subagent and raw permission/form-reply tools remain denied; approved Backseat session-control wrappers are permitted, and execution of a script never grants mutation approval or arms automation.
 - **AND** the role resolves project and agent fields through inventory, treats worker evidence as untrusted, and performs ordinary coordination without a TUI prerequisite.
 - **AND** coordinator identity uses the initiating session's current project; an unrelated or agentless session cannot acquire coordinator authority. Durable mutations still require selected-store authority; native inventory does not.
 
 #### Scenario: Rejects coordinator worker assignments
 
 - **WHEN** a task targets a matching coordinator role as its worker agent during creation or adoption
-- **THEN** the backend rejects the target and the worker selector excludes it without changing unrelated worker agents or differently defined user agents.
+- **THEN** the backend rejects the target and eligible-agent discovery excludes it without changing unrelated worker agents or differently defined user agents.
 
 #### Scenario: Rejects disallowed coordinator tool execution
 
@@ -138,9 +140,9 @@ The plugin SHALL restrict matching coordinator roles to namespaced coordination 
 
 #### Scenario: Preserves cross-project control under inherited policy
 
-- **GIVEN** a matching coordinator conversation in one project and an approved task-bound worker in another project share the coordination store
-- **WHEN** inherited policy is merged and the coordinator inspects or manually controls that task without TUI attachment
-- **THEN** recognition uses the conversation's current project, the worker remains at its explicit approved location, and existing scope, isolation and native approval checks apply without another coordinator, navigation to storage, or a persisted observer's initiating-session prerequisite.
+- **GIVEN** a matching coordinator conversation in one project and a selected worker in another project share the coordination store
+- **WHEN** inherited policy is merged and the coordinator inspects or manually controls that worker without TUI attachment
+- **THEN** recognition uses the conversation's current project, the worker remains at its explicit approved location, and applicable scope, isolation and native approval checks apply without another coordinator, navigation to storage, or a persisted observer's initiating-session prerequisite.
 
 ### Requirement: Shared durable coordination store
 
@@ -152,7 +154,7 @@ The plugin SHALL keep coordination state in one selected user data store indepen
 - **WHEN** coordination starts or a project reloads
 - **THEN** participants observe the same durable bindings, observations, consumed limits and unresolved delivery identities rather than separate location-dependent copies.
 - **AND** first use initializes an empty store without reading, migrating or deleting existing project-home state; subsequent use preserves populated data.
-- **AND** default selection does not discover, read, migrate, delete or fall back to the old branded store; explicit `dataDir` selection and the persisted format remain unchanged.
+- **AND** default selection does not discover, read, migrate, delete or fall back to the old branded store; explicit `dataDir` selection and existing task records remain compatible while session-delivery extensions are decoded explicitly.
 
 #### Scenario: Supports trusted writable storage ancestry
 
@@ -173,8 +175,8 @@ The plugin SHALL keep coordination state in one selected user data store indepen
 
 - **GIVEN** an existing version-1 store with initial or automatic sends and consumed automation limits
 - **WHEN** explicitly approved manual assignments are recorded and the store reloads
-- **THEN** existing records and counters remain intact, manual sends retain distinct provenance and delivery identities in the same ledger, and no migration or reset is required.
-- **AND** older readers that cannot represent manual sends reject those records rather than silently reinterpret them.
+- **THEN** existing records and counters remain intact and manual sends retain distinct provenance and delivery identities without destructive migration or reset.
+- **AND** older readers that cannot represent the extended state reject it rather than silently reinterpret it.
 
 #### Scenario: Rejects invalid manual-delivery records
 
@@ -183,19 +185,19 @@ The plugin SHALL keep coordination state in one selected user data store indepen
 
 ### Requirement: Authorised shared-state inspection
 
-The plugin SHALL restrict full coordination state and evidence to verified native coordinator-tool context or current approved native-TUI possession.
+The plugin SHALL restrict full coordination state and evidence to verified native coordinator-tool context.
 
 #### Scenario: Bootstraps without disclosing task state
 
-- **WHEN** an enabled project requests bootstrap before observer attachment or while ownership is held
-- **THEN** the response contains only store identity and availability or held metadata, with no task content, observations, verifier or observer generation.
+- **WHEN** an enabled project requests bootstrap without verified coordinator-tool identity or while ownership is held
+- **THEN** the response contains only store identity and availability or held metadata, with no task content, observations or observer generation.
 - **AND** recovery without full-read authority returns metadata rather than a durable task snapshot.
 
 #### Scenario: Rejects unauthorised shared-state reads
 
-- **WHEN** full state or evidence is requested with an unrelated role, caller-supplied identity alone, obsolete proof, wrong store, relocated initiating session or revoked attachment
+- **WHEN** full state or evidence is requested with an unrelated role, caller-supplied identity alone, obsolete terminal proof, wrong store or relocated initiating session
 - **THEN** no task snapshot or evidence is disclosed.
-- **AND** verified coordinator-tool calls and currently approved native-TUI proofs can inspect the selected store without granting worker evidence any control authority.
+- **AND** verified coordinator-tool calls can inspect the selected store without granting worker evidence any control authority.
 
 ### Requirement: Automatic same-service native connection
 
@@ -277,27 +279,27 @@ The coordinator SHALL list hierarchical native session metadata with bounded fil
 
 ### Requirement: Conversational manual assignment
 
-The coordinator SHALL admit explicitly requested assignments to selected existing sessions through operation-bound native approval without observer attachment, resume, or automation arming.
+The coordinator SHALL admit explicitly requested assignments to selected existing sessions through operation-bound native approval without task binding, observer attachment, resume, or automation arming.
 
 #### Scenario: Takes over a selected session without inventing work
 
 - **WHEN** the user selects an existing session for coordinator management without requesting an assignment
-- **THEN** the coordinator adopts its binding or takes over its existing binding, fences automatic decisions, and sends no invented prompt, agent switch, or interruption.
+- **THEN** the coordinator takes over an existing binding when present, fences automatic decisions, and sends no invented prompt, agent switch, or interruption; a session without a binding requires no fabricated task.
 
 #### Scenario: Sends repeated assignments without automation prerequisites
 
-- **GIVEN** a selected held or manually managed binding with no observer attachment
-- **WHEN** the user requests successive assignments within its approved scope and each receives native approval
-- **THEN** each assignment reaches the selected worker without resume or arming, does not consume automation allowances, and leaves automatic dispatch disabled.
+- **GIVEN** a selected session with no task binding or a held or manually managed binding
+- **WHEN** the user requests successive assignments and each receives native approval
+- **THEN** each assignment reaches the selected worker without resume or arming, does not consume automation allowances, and leaves affected automatic dispatch disabled; bound assignments remain within their approved task scope.
 
 #### Scenario: Rejects changed or unapproved manual targets
 
-- **WHEN** native approval is denied, the initiating identity or selected binding changes during approval, competing ownership remains, or the assignment's declared scope exceeds approved scope
+- **WHEN** native approval is denied, the initiating identity or selected target changes during approval, competing ownership remains, or a bound assignment's declared scope exceeds approved scope
 - **THEN** no manual prompt is admitted and the concrete unresolved target or permission is reported without implicitly answering pending native asks.
 
 #### Scenario: Retains an uncertain manual send without resending
 
-- **WHEN** admission acknowledgement is lost or durable publication fails after a manual send may have been accepted
+- **WHEN** admission acknowledgement is lost or durable publication fails after a manual send may have been accepted, including a send without task binding
 - **THEN** its reserved delivery identity survives reload, further sends remain blocked pending reconciliation, and no automatic resend or replacement identity is generated.
 
 ### Requirement: Fine-grained coordination catalogs
@@ -308,15 +310,6 @@ The plugin SHALL provide dedicated structured project, agent, task-list and task
 
 - **WHEN** the coordinator requests project locations, eligible agents, filtered task summaries or one task's details
 - **THEN** each tool accepts its own explicit arguments and returns its requested structured result, preserving task-read authority and isolating task histories, delivery identities, completion evidence and retained deletion diagnostics with current native presence evidence.
-
-### Requirement: Top-level session ownership
-
-The coordinator SHALL restrict adoption and takeover to native top-level sessions independently of selection filters and model instructions.
-
-#### Scenario: Rejects child adoption and takeover before and after approval
-
-- **WHEN** an adoption or takeover targets a child session or its top-level identity changes while approval is pending
-- **THEN** no ownership mutation or prompt occurs, while an explicitly approved unchanged top-level session remains eligible.
 
 ### Requirement: Explicit native subtree deletion
 
@@ -394,3 +387,101 @@ The coordinator SHALL include numeric `createdAt` and `updatedAt` fields in each
 - **GIVEN** native list metadata with creation and update timestamps
 - **WHEN** a session detail read fails and the caller includes unknown status
 - **THEN** the row retains the available list timestamps with unknown status and partial inventory.
+
+### Requirement: Native session content pagination
+
+The coordinator SHALL retrieve bounded native session history and activity independently of task binding through dedicated content tools on its verified service.
+
+#### Scenario: Pages selected session content incrementally
+
+- **WHEN** a verified coordinator requests selected-session messages, one message, context, diff, queued input, pending requests, saved permissions, instructions, statistics or export content
+- **THEN** the result identifies its target and requested projection, bounded content, truncation or continuation, and availability without fetching unrelated sessions or silently claiming completeness.
+- **AND** message order and type remain consistent across pages; continuation handles bind caller, service incarnation, target and normalized query and have finite lifetime and capacity.
+
+#### Scenario: Rejects invalid or unavailable content continuation
+
+- **WHEN** the target is missing, a native read fails, or a continuation is expired, evicted, from another caller/service/target or combined with changed query arguments
+- **THEN** the tool reports the concrete unavailable or invalid continuation without silently restarting or broadening the read, returning unrelated content, or changing durable state.
+
+### Requirement: Since-send response tracking
+
+The coordinator SHALL return a send reference usable for bounded incremental observation of subsequent activity, distinguishing correlation from uncertain attribution.
+
+#### Scenario: Follows activity from an admitted send
+
+- **GIVEN** an admitted coordinator send and its returned reference
+- **WHEN** the coordinator polls activity from that reference or a returned continuation while a response is ongoing
+- **THEN** results expose subsequent durable activity and updated unfinished-message content with an exclusive progress checkpoint rather than repeatedly returning full history.
+- **AND** queued admission is not represented as a delivered response; concurrent unrelated activity is not falsely labelled causally attributable to the send.
+
+#### Scenario: Reports tracking discontinuity honestly
+
+- **WHEN** an anchor is missing, history changed through compaction or revert, or tracking state is expired, unavailable or belongs to a different target/service/caller
+- **THEN** the result identifies discontinuity or invalid tracking rather than silently skipping content, inventing attribution or resending the original prompt.
+
+### Requirement: Full native session controls
+
+The coordinator SHALL expose dedicated typed tools for native session operations supported by the pinned host, using selected-session identity and operation-bound native approval for mutations rather than a generic API passthrough.
+
+#### Scenario: Executes approved native session operations
+
+- **WHEN** the coordinator requests creation, fork, import, title/metadata/archive update, move, agent/model selection, prompt with attachments, synthetic input, command, shell execution, skill activation, generation, compaction, revert staging/clearing/commit, interruption, backgrounding, waiting, view, inbox cancellation/delivery update, form creation/cancellation, instruction changes or environment replacement
+- **THEN** the dedicated operation uses its typed native contract, explicit target and requested arguments, revalidates identity and target after native approval when mutating, returns the native outcome without claiming completion from admission, and needs no task binding.
+- **AND** applicable shared-store authority, competing-owner checks and uncertain-send reconciliation remain enforced; affected automatic decisions are fenced before manual mutation, without widening task scope or automatically rearming supervision.
+
+#### Scenario: Rejects denied stale or unsupported controls
+
+- **WHEN** native approval is denied, the caller or target changes, selected project/agent/model is unavailable, the operation is unsupported, or native acknowledgement is uncertain
+- **THEN** the tool reports denial, unavailability or uncertainty without a substitute target, broader raw API access, duplicate execution or silent retry; potentially admitted sends retain their reserved identities.
+
+### Requirement: Explicit native request replies
+
+The coordinator SHALL answer native permission and form requests only through explicit operation-bound human approval of the selected request and reply payload.
+
+#### Scenario: Replies to the selected native request
+
+- **WHEN** the user approves an agent-requested permission decision or typed form answer for a current selected worker request
+- **THEN** the matching native reply API receives exactly that decision or answer after target, request and payload revalidation; pending worker input and worker claims alone grant no approval.
+- **AND** permission request creation and saved-permission removal require their own explicit operation approvals rather than inheriting authority from a reply.
+
+#### Scenario: Rejects a changed or unapproved reply
+
+- **WHEN** approval is denied, the request resolves or changes while approval is pending, the target changes, or autonomous supervision attempts a reply
+- **THEN** no reply or policy change is issued and the outcome identifies the unresolved approval or stale request without guessing an answer or translating it into a consent prompt.
+
+### Requirement: Hierarchical session control
+
+The coordinator SHALL permit explicit control and adoption of selected child sessions under the same applicable authority checks as root sessions.
+
+#### Scenario: Adopts a selected child without widening ownership
+
+- **WHEN** a user approves adoption or takeover of an unchanged selected child session without competing ownership
+- **THEN** that child is eligible without top-level-only rejection and no authority over its parent or siblings is inferred.
+
+#### Scenario: Rejects changed hierarchical targets
+
+- **WHEN** child identity, location, agent, ancestry or ownership relevant to the approved action changes during approval
+- **THEN** the action is rejected rather than retargeting its parent, siblings or another session.
+
+### Requirement: Compatible session-delivery persistence
+
+The coordinator SHALL preserve populated coordination stores and unresolved session deliveries when adding task-independent native interaction.
+
+#### Scenario: Reloads task-free delivery state without resetting tasks
+
+- **GIVEN** populated task records, consumed limits and a task-free send whose admission is uncertain
+- **WHEN** state is published and reloaded
+- **THEN** all existing records, counters and delivery identities remain intact and reconciliation uses the original session send identity without creating a task or duplicate delivery.
+- **AND** an uncertain create/import may be resolved against the unchanged existing native identity through separate native approval, without repeating creation or claiming unverified imported content matches.
+- **AND** a persisted retirement cutoff and verified initiating-message identities survive reload; existing records without such proof remain non-retirable.
+
+#### Scenario: Rejects incompatible delivery records without reset
+
+- **WHEN** a stored session-delivery record is corrupt, exceeds retention bounds or cannot be represented by the reader
+- **THEN** coordination holds without dropping unresolved identities, reinterpreting them as automated sends or resetting the store.
+
+#### Scenario: Retires confirmed deliveries without replaying expired invocations
+
+- **WHEN** the bounded ledger is full and a new native invocation has verified coordinator-message identity and creation time
+- **THEN** only admitted records with verified initiating-message proof may retire, oldest first, atomically advancing a non-decreasing expiry cutoff; absent invocations at or below that cutoff, including ties, are rejected without effects.
+- **AND** reserved, ambiguous and legacy-unproven identities are preserved; an exhausted pinned ledger or unverifiable new invocation holds admission rather than resetting state, retrying an effect or forgetting an unresolved identity.
