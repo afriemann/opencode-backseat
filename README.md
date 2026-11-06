@@ -57,7 +57,10 @@ caused by that message. If tracking becomes unavailable, retain the send ID and
 restart the read, not the assignment.
 
 Taking over an existing session doesn't send it a message or interrupt its
-current work. You can select a child session without taking over its parent or
+current work. Select it by its title or the listing already shown; no task
+questionnaire is needed. An unbound session stays task-free. An existing task
+is taken under manual control, with automatic follow-ups held. Your native
+approval covers the selected session. You can select a child session without taking over its parent or
 siblings.
 You can ask the coordinator to answer a worker's permission request or form.
 Each reply needs your native approval for that exact request and answer.
@@ -107,6 +110,12 @@ Recovery does not reset consumed limits or resend uncertain assignments.
 - **Coordination is unavailable:** check the OpenCode version and Linux
   prerequisites. From the checkout, `make prerequisites` checks the platform and
   `flock`; it does not install missing tools.
+- **An owner is blocking coordination:** a demonstrably stopped owner is
+  reacquired automatically at startup, without starting supervision. A live
+  owner, unverifiable process identity, unsafe storage or missing host capability
+  remains blocked with a specific reason. Resolve that cause; do not delete the
+  lockfile. Recovery is only an explicit eligible fallback, not a prerequisite
+  for ordinary adoption.
 - **A task is held:** inspect its status and resolve any pending permission or
   question. Don't resend an assignment whose delivery is uncertain.
 - **You need logs:** look for `backseat` in OpenCode's host log. On the verified

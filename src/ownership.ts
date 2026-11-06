@@ -18,11 +18,34 @@ function serialQueue() {
 export interface LockInspection {
   safe: boolean;
   lock?: { owner: string; running: boolean };
+  reason?: OwnershipBlocker;
 }
+
+export type OwnershipBlocker =
+  | "live-owner"
+  | "unverifiable-owner"
+  | "unsafe-storage"
+  | "host-capability-unavailable";
+export type OwnershipAcquisition =
+  { acquired: true } | { acquired: false; reason: OwnershipBlocker };
+
+const ownershipReasons: Record<OwnershipBlocker, string> = {
+  "live-owner": "Coordination store has a live owner",
+  "unverifiable-owner": "Coordination owner identity is unverifiable",
+  "unsafe-storage": "Coordination storage is unsafe or unavailable",
+  "host-capability-unavailable":
+    "Required ownership host capability is unavailable",
+};
+
+class HostCapabilityError extends Error {}
+class LiveOwnerError extends Error {}
 
 export interface OwnershipPort {
   inspect(dataDir: string): Promise<LockInspection>;
-  acquire(dataDir: string, owner: string): Promise<boolean>;
+  acquire(
+    dataDir: string,
+    owner: string,
+  ): Promise<boolean | OwnershipAcquisition>;
   release(dataDir: string, owner: string): Promise<void>;
   approveRecovery(dataDir: string, owner: string): Promise<void>;
   recover(dataDir: string, owner: string): Promise<void>;
@@ -78,19 +101,27 @@ async function processIdentity(): Promise<ProcessIdentity> {
   };
 }
 
-async function terminated(identity: ProcessIdentity): Promise<boolean> {
+async function ownerStatus(
+  identity: ProcessIdentity,
+): Promise<"terminated" | "live" | "unverifiable"> {
   const current = await processIdentity();
   // A different host/boot/PID namespace is uncertainty, not termination proof.
   if (
     identity.boot !== current.boot ||
     identity.namespace !== current.namespace
   )
-    return false;
+    return "unverifiable";
   try {
-    return (await processStart(identity.pid)) !== identity.start;
+    return (await processStart(identity.pid)) !== identity.start
+      ? "terminated"
+      : "live";
   } catch (error) {
-    return hasCode(error, "ENOENT");
+    return hasCode(error, "ENOENT") ? "terminated" : "unverifiable";
   }
+}
+
+async function terminated(identity: ProcessIdentity): Promise<boolean> {
+  return (await ownerStatus(identity)) === "terminated";
 }
 
 function parseOwner(text: string): FilesystemOwner | undefined {
@@ -207,7 +238,7 @@ async function kernelGuard(dataDir: string): Promise<KernelGuard | undefined> {
     !constants.O_NOFOLLOW ||
     !constants.O_DIRECTORY
   )
-    throw ownershipError();
+    throw new HostCapabilityError();
   const anchor = await openAnchoredDirectory(dataDir);
   let file: FileHandle | undefined;
   const close = async () => {
@@ -235,7 +266,14 @@ async function kernelGuard(dataDir: string): Promise<KernelGuard | undefined> {
       }
     };
     await validate();
-    if (!(await acquireKernelLock(file))) {
+    let locked: boolean;
+    try {
+      locked = await acquireKernelLock(file);
+    } catch {
+      // Helper errors are capability failures, never process-termination evidence.
+      throw new HostCapabilityError();
+    }
+    if (!locked) {
       await close();
       return undefined;
     }
@@ -263,7 +301,7 @@ export function createFilesystemOwnershipPort(
   ): Promise<T> {
     const lease = owned.get(dataDir);
     const guard = lease?.guard ?? (await kernelGuard(dataDir));
-    if (!guard) throw ownershipError();
+    if (!guard) throw new LiveOwnerError();
     try {
       return await work(guard);
     } finally {
@@ -273,48 +311,86 @@ export function createFilesystemOwnershipPort(
   return {
     inspect(dataDir) {
       return serial(async () => {
+        let stage: OwnershipBlocker = "unsafe-storage";
         try {
           return await withGuard(
             dataDir,
             async (guard): Promise<LockInspection> => {
+              stage = "unverifiable-owner";
               const { record } = await readOwner(guard);
+              const status =
+                record && !record.released
+                  ? await ownerStatus(record.identity)
+                  : undefined;
               return record && !record.released
                 ? {
                     safe: true,
+                    ...(status === "unverifiable"
+                      ? { reason: "unverifiable-owner" as const }
+                      : {}),
                     lock: {
                       owner: record.owner,
-                      running: !(await terminated(record.identity)),
+                      running: status !== "terminated",
                     },
                   }
                 : { safe: true };
             },
           );
-        } catch {
-          return { safe: false };
+        } catch (error) {
+          // Only fixed classifications cross the filesystem boundary.
+          return {
+            safe: false,
+            reason:
+              error instanceof HostCapabilityError
+                ? "host-capability-unavailable"
+                : error instanceof LiveOwnerError
+                  ? "live-owner"
+                  : stage,
+          };
         }
       });
     },
     acquire(dataDir, owner) {
       return serial(async () => {
-        if (!owner || owner.length > 512 || owned.has(dataDir)) return false;
+        if (!owner || owner.length > 512)
+          return { acquired: false, reason: "unsafe-storage" };
+        if (owned.has(dataDir))
+          return { acquired: false, reason: "live-owner" };
         let guard: KernelGuard | undefined;
+        let stage: OwnershipBlocker = "unsafe-storage";
         try {
           guard = await kernelGuard(dataDir);
-          if (!guard) return false;
+          if (!guard) return { acquired: false, reason: "live-owner" };
+          stage = "unverifiable-owner";
           const { record: prior } = await readOwner(guard);
-          if (prior && !prior.released) return false;
+          if (prior && !prior.released) {
+            const status = await ownerStatus(prior.identity);
+            if (status !== "terminated")
+              return {
+                acquired: false,
+                reason: status === "live" ? "live-owner" : "unverifiable-owner",
+              };
+          }
           const record: FilesystemOwner = {
             version: 1,
             owner,
             released: false,
             identity: await processIdentity(),
           };
+          stage = "unsafe-storage";
           await writeOwner(guard, record);
           owned.set(dataDir, { guard, record });
           guard = undefined;
-          return true;
-        } catch {
-          return false;
+          return { acquired: true };
+        } catch (error) {
+          // Filesystem and process errors may contain private paths or owner text.
+          return {
+            acquired: false,
+            reason:
+              error instanceof HostCapabilityError
+                ? "host-capability-unavailable"
+                : stage,
+          };
         } finally {
           if (guard) await guard.close();
         }
@@ -385,6 +461,10 @@ export class CoordinatorOwnership {
   private readonly serial = serialQueue();
   private owned = false;
   private closed = false;
+  private blocker: OwnershipBlocker = "unsafe-storage";
+  get reason(): string {
+    return ownershipReasons[this.blocker];
+  }
   constructor(
     readonly dataDir: string,
     readonly owner: string,
@@ -392,14 +472,25 @@ export class CoordinatorOwnership {
   ) {}
   claim(): Promise<"owned" | "held"> {
     return this.serial(async () => {
+      this.blocker = "unsafe-storage";
       if (this.closed) return "held";
       if (this.owned) return "owned";
       try {
         const inspection = await this.port.inspect(this.dataDir);
-        if (!inspection.safe || inspection.lock) return "held";
-        this.owned = await this.port.acquire(this.dataDir, this.owner);
+        if (!inspection.safe || inspection.lock?.running) {
+          this.blocker =
+            inspection.reason ??
+            (inspection.lock ? "live-owner" : "unsafe-storage");
+          return "held";
+        }
+        const acquired = await this.port.acquire(this.dataDir, this.owner);
+        this.owned =
+          typeof acquired === "boolean" ? acquired : acquired.acquired;
+        if (typeof acquired !== "boolean" && !acquired.acquired)
+          this.blocker = acquired.reason;
         return this.owned && !this.closed ? "owned" : "held";
       } catch {
+        this.blocker = "unsafe-storage";
         return "held";
       }
     });

@@ -843,6 +843,11 @@ describe("Fine-grained Code Mode queries", () => {
         { task: { id: "task" }, sessionID: "worker" },
         ["adopt", "task", { goal: { id: "task" }, workerID: "worker" }],
       ],
+      [
+        "adopt_session",
+        { sessionID: "worker" },
+        ["adopt", "", { workerID: "worker" }],
+      ],
       ["take_over_task", { taskID: "task" }, ["takeover", "task", {}]],
       ["hold_task", { taskID: "task" }, ["hold", "task", {}]],
       [

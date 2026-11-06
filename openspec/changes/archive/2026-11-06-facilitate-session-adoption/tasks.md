@@ -1,0 +1,5 @@
+- [x] 1.1 Implement design ownership decisions test-first for “Requires explicit stale-owner recovery” and “Revalidates terminated ownership under exclusive acquisition”.
+- [x] 1.2 Propagate design blocker categories test-first for “Holds a competing or unsafe authority”.
+- [x] 1.3 Implement design task-free adoption decisions test-first for “Accepts task-free adoption without inventing a binding” and “Rejects stale or denied task-free adoption”.
+- [x] 1.4 Update coordinator instructions through agent-engineer for “Takes over a selected session without inventing work”.
+- [x] 1.5 Update README.md everyday adoption and startup-recovery guidance against the approved scenarios.

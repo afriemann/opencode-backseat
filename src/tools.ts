@@ -343,7 +343,9 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   const owned = async (context: ToolContext) => {
     const snapshot = await port.backend.inspect(context);
     if (snapshot.authority !== "owned")
-      throw new Error("Owned task store required for this query");
+      throw new Error(
+        snapshot.reason ?? "Owned task store required for this query",
+      );
     return snapshot;
   };
   const canonical = async (value: unknown) => {
@@ -895,7 +897,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     adopt_session: {
       description:
-        "Bind a selected native session, including a child, to a user-approved task without sending a prompt, interrupting execution or changing its agent. task.location and task.agent must match the selected session. Requires native approval; rejects changed targets and competing ownership. Does not bind its parent or siblings. Inspect the resulting binding with get_task.",
+        "Adopt the exact selected native session, including a child, with native approval and no prompt, interruption or agent change. With sessionID alone, returns its identity and an explicit unbound outcome without a task or registration, or takes over an eligible existing binding and fences automation. Completed bindings and changed targets are rejected. Supply task only when the user requests a task binding; task.location and task.agent must match the selected session. Parent and siblings are unchanged.",
       input: inputSchema(
         {
           task: taskSchema,
@@ -905,10 +907,17 @@ export function createCoordinationTools(port: CoordinationToolPort): {
               "Exact selected native session ID from list_sessions, including child sessions; not a task ID.",
           },
         },
-        ["task", "sessionID"],
+        ["sessionID"],
       ),
       async run(v, context) {
         exact(v, ["task", "sessionID"]);
+        if (!Object.hasOwn(v, "task"))
+          return port.backend.nativeControl(
+            "adopt",
+            "",
+            { workerID: text(v.sessionID) },
+            context,
+          );
         const task = object(v.task);
         return port.backend.nativeControl(
           "adopt",
