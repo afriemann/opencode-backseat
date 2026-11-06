@@ -43,6 +43,7 @@ Start with requests like these:
 Before starting a worker, agree on the goal, success criteria, constraints, and
 scope. Backseat asks for approval before creating a worker or sending an
 assignment. It can also discover sessions that weren't created through Backseat.
+Ask it to continue a session search for more matches, even after an empty result.
 You can ask it to message an existing session directly without creating a task.
 If the send reports an uncertain outcome, keep its send ID and ask the coordinator
 to reconcile it rather than sending the assignment again.

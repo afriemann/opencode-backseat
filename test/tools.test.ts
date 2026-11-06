@@ -31,6 +31,11 @@ function fixture() {
     group: "team",
   };
   const client = {
+    form: {
+      async list() {
+        return { location: { directory: "/projects/one" }, data: [] };
+      },
+    },
     session: {
       async list(input: unknown) {
         queries.push(input);
@@ -508,6 +513,59 @@ describe("Fine-grained Code Mode queries", () => {
     );
   });
 
+  it("Bounds candidate reads before status hydration", async () => {
+    for (const { query, expected, hydrated } of [
+      { query: { limit: 1 }, expected: ["running"], hydrated: ["running"] },
+      { query: { limit: 2, agent: "other" }, expected: [], hydrated: [] },
+      {
+        query: { limit: 3, taskIDs: ["task"] },
+        expected: ["running"],
+        hydrated: ["running"],
+      },
+      {
+        query: { limit: 1, statuses: ["inactive"] },
+        expected: [],
+        hydrated: ["running"],
+      },
+    ]) {
+      const f = fixture();
+      const reads: string[] = [];
+      f.client.session.list = async (input) => {
+        f.queries.push(input);
+        return {
+          data: f.rows.slice(0, input?.limit),
+          cursor: { next: "next-native" },
+        };
+      };
+      const get = f.client.session.get;
+      f.client.session.get = async (input) => {
+        reads.push(input.sessionID);
+        return get(input);
+      };
+      const result = await f.call("list_sessions", query);
+      expect(f.queries).toHaveLength(1);
+      expect(f.queries[0]).toHaveProperty("limit", query.limit);
+      expect(reads).toEqual(hydrated);
+      expect(
+        (result.sessions as { id: string }[]).map((row) => row.id),
+      ).toEqual(expected);
+      expect(result.cursor).toEqual(expect.any(String));
+      f.registry.dispose();
+    }
+    const f = fixture();
+    f.client.session.get = async () => ({
+      ...f.rows[0]!,
+      parentID: "new-parent",
+    });
+    expect(
+      await f.call("list_sessions", {
+        statuses: ["running", "unknown"],
+        taskIDs: ["task"],
+      }),
+    ).toMatchObject({ sessions: [] });
+    f.registry.dispose();
+  });
+
   it("Continues filtered queries without exposing native cursors", async () => {
     for (const { input, expectedSecond, expectedNext } of [
       { input: {}, expectedSecond: ["inactive"], expectedNext: ["next-root"] },
@@ -639,7 +697,7 @@ describe("Fine-grained Code Mode queries", () => {
         agent: "other",
         cursor: page.cursor,
       }),
-    ).toMatchObject({ sessions: [{ id: "next" }], partial: true });
+    ).toMatchObject({ sessions: [{ id: "next" }], partial: false });
     const evicted = fixture();
     const retained = await evicted.call("list_sessions", { limit: 1 });
     for (let index = 0; index < 128; index++)
