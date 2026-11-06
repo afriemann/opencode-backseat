@@ -23,7 +23,7 @@ The coordinator SHALL bind each task to an explicitly authorised goal, success c
 
 ### Requirement: Explicit adoption
 
-The coordinator SHALL require explicit adoption of an existing worker into one active task ownership binding.
+The coordinator SHALL adopt an explicitly selected existing session through native operation approval without requiring a task unless the user requests task binding.
 
 #### Scenario: Adopts the selected existing worker
 
@@ -31,10 +31,23 @@ The coordinator SHALL require explicit adoption of an existing worker into one a
 - **WHEN** adoption is authorised
 - **THEN** the coordinator binds that session without silently changing its agent or treating unrelated history as shared task context.
 
+#### Scenario: Accepts task-free adoption without inventing a binding
+
+- **GIVEN** an unbound selected root or child session and available store authority
+- **WHEN** adoption without a task receives native approval
+- **THEN** the coordinator returns the accepted session and an explicit unbound outcome without creating a task, exclusive session registration, worker prompt, interruption, agent switch or supervision eligibility.
+- **AND** an omitted task is distinct from a supplied malformed task, which is rejected; existing explicit-task callers retain approved binding semantics.
+
 #### Scenario: Rejects competing ownership
 
 - **WHEN** adoption would assign a session already owned by another active task or coordinator
 - **THEN** adoption is rejected until the previous ownership is explicitly released.
+
+#### Scenario: Rejects stale or denied task-free adoption
+
+- **WHEN** task-free adoption is denied, its selected identity, location, agent, ancestry or relevant binding changes during approval, or its binding is completed
+- **THEN** no adoption effect is committed and the concrete denial, changed target or completed binding is reported without substituting a target.
+- **AND** unavailable authority is an explicit error, never evidence that a session has no binding.
 
 ### Requirement: Explicit control transitions
 
@@ -62,12 +75,21 @@ The coordinator SHALL allow mutations only through the active authority for the 
 - **WHEN** a project selects a store conflicting with the service's first active store, another process owns the store, the runtime path is unsafe, or required host capabilities including the trusted lock helper are unavailable
 - **THEN** the new participant remains visibly read-only held and performs no worker dispatch or ownership mutation.
 - **AND** projects selecting the same store share one serialized authority, including concurrent mutation and observation publication, rather than acquiring independent state caches.
+- **AND** held metadata and task-dependent errors distinguish live contention, unverifiable owner identity, unsafe storage and unavailable host capability with fixed safe reasons, without raw owner records or exception content.
 
-#### Scenario: Requires explicit stale-owner recovery
+#### Scenario: Reacquires terminated ownership without arming supervision
 
-- **GIVEN** an authority stopped without releasing its ownership
-- **WHEN** coordination restarts
-- **THEN** ownership is not automatically expired or removed, and automation remains held until prior-owner termination is confirmed, recovery is authorised and coordination is separately rearmed.
+- **GIVEN** an authority stopped without releasing ownership and prior-owner termination is demonstrable
+- **WHEN** coordination restarts and acquires exclusive ownership
+- **THEN** manual store authority is reacquired during startup without separate recovery approval or supervision start, while automatic supervision remains held pending separately approved reconciliation and rearming.
+- **AND** durable task records, consumed limits and uncertain task and session delivery identities are preserved; unreadable state or failed publication remains held rather than initializing an empty store or repeating worker effects.
+
+#### Scenario: Revalidates terminated ownership under exclusive acquisition
+
+- **GIVEN** an unreleased owner record and competing claimants
+- **WHEN** startup attempts reacquisition
+- **THEN** termination is established again for the current record under continuous exclusive ownership through replacement and lease retention; only one claimant gains authority and others remain held.
+- **AND** missing or changed boot/namespace evidence, inaccessible process identity, malformed ownership, live owners or failed lock acquisition do not establish termination; the lock file is not cleared, deleted or recreated to bypass exclusion.
 
 #### Scenario: Fences an unloaded project without releasing other participants
 
@@ -299,6 +321,7 @@ The coordinator SHALL admit explicitly requested assignments to selected existin
 
 - **WHEN** the user selects an existing session for coordinator management without requesting an assignment
 - **THEN** the coordinator takes over an existing binding when present, fences automatic decisions, and sends no invented prompt, agent switch, or interruption; a session without a binding requires no fabricated task.
+- **AND** the coordinator resolves take-over or adoption intent from the selected inventory and available context, asks only genuine target or outcome ambiguity, and requires no task questionnaire or placeholder criteria for ordinary adoption; unavailable binding information is not treated as an unbound session.
 
 #### Scenario: Sends repeated assignments without automation prerequisites
 

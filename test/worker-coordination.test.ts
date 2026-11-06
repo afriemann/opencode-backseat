@@ -3966,7 +3966,7 @@ describe("Filesystem coordinator authority", () => {
     }
   });
 
-  it("Requires explicit stale-owner recovery", async () => {
+  it("Reacquires terminated ownership without arming supervision", async () => {
     const released: boolean[] = [];
     for (const change of ["cancel", "role"] as const) {
       const directory = await mkdtemp(
