@@ -2432,6 +2432,9 @@ describe("Bundled conversational coordinator", () => {
       time: { created: 1, updated: 1 },
     };
     const native = {
+      form: {
+        list: async () => ({ location: worker.location, data: [] }),
+      },
       session: {
         list: async () => ({ data: [worker], cursor: {} }),
         get: async () => worker,

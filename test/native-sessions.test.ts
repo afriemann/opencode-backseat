@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import type { SessionInfo } from "@opencode/client";
+import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import {
+  readNativeAsks,
   readNativeInventory,
   type NativeSessionClient,
 } from "../src/native-sessions.ts";
@@ -28,7 +29,17 @@ describe("Native session inventory", () => {
     let active: Record<string, { type: "running" }> = {};
     let failed = false;
     const requests: unknown[] = [];
-    const client: NativeSessionClient = {
+    const client: NativeSessionClient & {
+      form: Pick<OpenCodeClient["form"], "list">;
+    } = {
+      form: {
+        async list(input) {
+          return {
+            location: { directory: input!.location!.directory! },
+            data: [],
+          };
+        },
+      },
       session: {
         async list(input) {
           requests.push(input);
@@ -164,27 +175,48 @@ describe("Native session inventory", () => {
     ]);
     expect(JSON.stringify(inventory)).not.toContain("private input");
     f.client.permission.request.list = permissions;
-    f.client.session.form.list = async ({ sessionID }) =>
-      sessionID === "two"
-        ? [
-            {
-              id: "form",
-              sessionID,
-              title: "Approval",
-              fields: [{ key: "approval", type: "boolean" }],
-            },
-          ]
-        : [];
-    f.client.session.form.get = async ({ sessionID, formID }) => ({
-      id: formID,
-      sessionID,
-      title: "Approval",
-      fields: [{ key: "approval", type: "boolean" }],
-      state: { status: "pending" },
+    f.client.form.list = async (input) => ({
+      location: { directory: input!.location!.directory! },
+      data:
+        input!.location!.directory === "/projects/two"
+          ? [
+              {
+                id: "form",
+                sessionID: "two",
+                title: "Approval",
+                fields: [{ key: "approval", type: "boolean" }],
+              },
+            ]
+          : [],
     });
     expect((await readNativeInventory(f.client)).sessions[1]?.status).toBe(
       "waiting-for-input",
     );
+    const form: Awaited<
+      ReturnType<NativeSessionClient["session"]["form"]["list"]>
+    >[number] = {
+      id: "form",
+      sessionID: "two",
+      title: "Approval",
+      fields: [{ key: "approval", type: "boolean" }],
+    };
+    f.client.session.form.list = async () => [form];
+    for (const kind of ["pending", "cancelled", "mismatched"] as const) {
+      f.client.session.form.get = async () => ({
+        ...form,
+        id: kind === "mismatched" ? "other" : form.id,
+        state: { status: kind === "cancelled" ? "cancelled" : "pending" },
+      });
+      const asks = readNativeAsks(f.client, {
+        location: "/projects/two",
+        workerID: "two",
+      });
+      if (kind === "mismatched")
+        await expect(asks).rejects.toThrow(
+          "Form inventory does not match the selected worker",
+        );
+      else expect(await asks).toEqual(kind === "pending" ? ["form:form"] : []);
+    }
   });
 
   it("Reports partial or unknown inventory honestly", async () => {
@@ -234,7 +266,7 @@ describe("Native session inventory", () => {
       };
       if (phase === "permissions")
         degraded.client.permission.request.list = fail;
-      else degraded.client.session.form.list = fail;
+      else degraded.client.form.list = fail;
       const records: Record<string, unknown>[] = [];
       const result = await readNativeInventory(
         degraded.client,
@@ -255,5 +287,108 @@ describe("Native session inventory", () => {
       );
       expect(JSON.stringify(records)).not.toContain("PRIVATE_ASK_SENTINEL");
     }
+  });
+
+  it("Shares pending form reads within each inventory refresh", async () => {
+    const f = fixture();
+    while (f.workers.length < 19)
+      f.workers.push({ ...f.workers[0]!, id: `worker-${f.workers.length}` });
+    const reads: string[] = [];
+    let sessionReads = 0;
+    let detailReads = 0;
+    let pending = true;
+    f.client.session.form.list = async () => {
+      sessionReads++;
+      return [];
+    };
+    f.client.session.form.get = async () => {
+      detailReads++;
+      throw new Error("Unexpected form detail read");
+    };
+    f.client.form.list = async (input) => {
+      const directory = input!.location!.directory!;
+      reads.push(directory);
+      return {
+        location: { directory },
+        data:
+          pending && directory === "/projects/one"
+            ? [
+                {
+                  id: "pending",
+                  sessionID: "one",
+                  title: "Approval",
+                  fields: [{ key: "approval", type: "boolean" }],
+                },
+              ]
+            : [],
+      };
+    };
+    const first = await readNativeInventory(f.client);
+    expect(first.sessions[0]?.status).toBe("waiting-for-input");
+    expect(
+      first.sessions.slice(1).every((row) => row.status === "inactive"),
+    ).toBe(true);
+    expect(reads.sort()).toEqual(["/projects/one", "/projects/two"]);
+    expect(sessionReads).toBe(0);
+    expect(detailReads).toBe(0);
+    pending = false;
+    expect((await readNativeInventory(f.client)).sessions[0]?.status).toBe(
+      "inactive",
+    );
+    expect(reads).toHaveLength(4);
+  });
+
+  it.each([
+    "unavailable",
+    "location",
+    "overflow",
+    "duplicate",
+    "identity",
+    "owner",
+    "shape",
+  ])("Reports partial or unknown inventory honestly", async (kind) => {
+    const f = fixture();
+    while (f.workers.length < 11)
+      f.workers.push({ ...f.workers[0]!, id: `worker-${f.workers.length}` });
+    let failedReads = 0;
+    const list = f.client.form.list;
+    f.client.form.list = async (input) => {
+      if (input!.location!.directory !== "/projects/one") return list(input);
+      failedReads++;
+      if (kind === "unavailable") throw new Error("PRIVATE_FORM_SENTINEL");
+      const form = {
+        id: "form",
+        sessionID: "one",
+        title: "Approval",
+        fields: [{ key: "approval", type: "boolean" }],
+      };
+      return {
+        location: {
+          directory: kind === "location" ? "/wrong" : "/projects/one",
+        },
+        data:
+          kind === "overflow"
+            ? Array.from({ length: 201 }, (_, id) => ({
+                ...form,
+                id: String(id),
+              }))
+            : kind === "duplicate"
+              ? [form, form]
+              : kind === "identity"
+                ? [{ ...form, id: "" }]
+                : kind === "owner"
+                  ? [{ ...form, sessionID: "" }]
+                  : kind === "shape"
+                    ? undefined
+                    : [form],
+      } as unknown as Awaited<ReturnType<typeof list>>;
+    };
+    const result = await readNativeInventory(f.client);
+    expect(result.sessions.map((row) => row.status)).toEqual(
+      f.workers.map((worker) => (worker.id === "two" ? "inactive" : "unknown")),
+    );
+    expect(result.partial).toBe(true);
+    expect(failedReads).toBe(1);
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_FORM_SENTINEL");
   });
 });

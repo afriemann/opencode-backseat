@@ -30,11 +30,51 @@ export interface NativeAskClient {
   session: { form: Pick<NativeClient["session"]["form"], "list" | "get"> };
 }
 export type NativeSessionClient = NativeAskClient & {
+  form: Pick<NativeClient["form"], "list">;
   session: Pick<NativeClient["session"], "list" | "get" | "active"> & {
     inbox: Pick<NativeClient["session"]["inbox"], "list">;
   };
 };
 type AskFailurePhase = "permissions" | "forms";
+type LocationForms = ReadonlyMap<
+  string,
+  Awaited<ReturnType<NativeClient["form"]["list"]>>["data"]
+>;
+
+async function readLocationForms(
+  client: Pick<NativeSessionClient, "form">,
+  location: string,
+  signal?: AbortSignal,
+): Promise<LocationForms> {
+  const forms = await client.form.list(
+    { location: { directory: location } },
+    signal ? { signal } : undefined,
+  );
+  if (
+    forms.location.directory !== location ||
+    !Array.isArray(forms.data) ||
+    forms.data.length > NATIVE_BOUNDS.catalogRows
+  )
+    throw new Error("Pending-form inventory is incomplete or mismatched");
+  const ids = new Set<string>();
+  const bySession = new Map<string, typeof forms.data>();
+  for (const form of forms.data) {
+    if (
+      !form ||
+      typeof form.id !== "string" ||
+      !form.id.trim() ||
+      typeof form.sessionID !== "string" ||
+      !form.sessionID.trim() ||
+      ids.has(form.id)
+    )
+      throw new Error("Pending-form identity is missing or duplicated");
+    ids.add(form.id);
+    const selected = bySession.get(form.sessionID) ?? [];
+    selected.push(form);
+    bySession.set(form.sessionID, selected);
+  }
+  return bySession;
+}
 
 export async function readNativeAsks(
   client: NativeAskClient,
@@ -44,6 +84,7 @@ export async function readNativeAsks(
     Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
   >,
   onFailure?: (phase: AskFailurePhase) => void,
+  formsSnapshot?: Promise<LocationForms>,
 ): Promise<readonly string[]> {
   const diagnosed = <T>(
     work: Promise<T>,
@@ -70,7 +111,9 @@ export async function readNativeAsks(
       "permissions",
     ),
     diagnosed(
-      client.session.form.list({ sessionID: binding.workerID }, request),
+      formsSnapshot
+        ? formsSnapshot.then((forms) => forms.get(binding.workerID) ?? [])
+        : client.session.form.list({ sessionID: binding.workerID }, request),
       "forms",
     ),
   ]);
@@ -85,6 +128,10 @@ export async function readNativeAsks(
     .filter((r) => r.sessionID === binding.workerID)
     .map((r) => `permission:${r.id}`);
   for (const form of forms) {
+    if (formsSnapshot) {
+      asks.push(`form:${form.id}`);
+      continue;
+    }
     const detail = await diagnosed(
       client.session.form.get(
         { sessionID: binding.workerID, formID: form.id },
@@ -189,7 +236,7 @@ export class NativeDiscovery {
 }
 
 export async function readNativeLiveState(
-  client: Omit<NativeSessionClient, "session"> & {
+  client: Omit<NativeSessionClient, "session" | "form"> & {
     session: Omit<NativeSessionClient["session"], "list">;
   },
   binding: { workerID: string; location: string; agent?: string },
@@ -199,6 +246,7 @@ export async function readNativeLiveState(
     permissions: Promise<
       Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
     >;
+    forms?: Promise<LocationForms>;
   },
   onAskFailure?: (phase: AskFailurePhase) => void,
 ): Promise<{
@@ -219,6 +267,7 @@ export async function readNativeLiveState(
       signal,
       snapshot?.permissions,
       onAskFailure,
+      snapshot?.forms,
     ),
     client.session.inbox.list({ sessionID: binding.workerID }, request),
   ]);
@@ -263,6 +312,8 @@ export async function readNativeInventory(
     parentID?: string | null;
     includeArchived?: boolean;
     order?: "asc" | "desc";
+    limit?: number;
+    select?: (row: NativeInventory["sessions"][number]) => boolean;
   } = {},
   diagnostics?: DiagnosticContext,
 ): Promise<NativeInventory> {
@@ -271,7 +322,10 @@ export async function readNativeInventory(
     const request = signal ? { signal } : undefined;
     const page = await client.session.list(
       {
-        limit: NATIVE_BOUNDS.catalogRows,
+        limit: Math.min(
+          query.limit ?? NATIVE_BOUNDS.catalogRows,
+          NATIVE_BOUNDS.catalogRows,
+        ),
         ...(query.includeArchived ? {} : { archived: false }),
         ...(query.projectID !== undefined ? { project: query.projectID } : {}),
         ...(query.location !== undefined ? { directory: query.location } : {}),
@@ -290,7 +344,9 @@ export async function readNativeInventory(
     phase = "refresh";
     const sessions = await refreshNativeSessions(
       client,
-      page.data.map(sessionMetadata),
+      page.data
+        .map(sessionMetadata)
+        .filter((row) => !query.select || query.select(row)),
       signal,
       diagnostics,
     );
@@ -348,6 +404,7 @@ export async function refreshNativeSessions(
 ): Promise<NativeInventory["sessions"]> {
   if (rows.length > NATIVE_BOUNDS.catalogRows)
     throw new Error("Native inventory exceeds its bound");
+  if (!rows.length) return [];
   const request = signal ? { signal } : undefined;
   const sessions: NativeInventory["sessions"] = [];
   const askFailures: Record<AskFailurePhase, number> = {
@@ -361,6 +418,7 @@ export async function refreshNativeSessions(
       Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
     >
   >();
+  const forms = new Map<string, Promise<LocationForms>>();
   const read = async (
     worker: NativeInventory["sessions"][number],
   ): Promise<NativeInventory["sessions"][number]> => {
@@ -377,6 +435,8 @@ export async function refreshNativeSessions(
             request,
           ),
         );
+      if (!forms.has(location))
+        forms.set(location, readLocationForms(client, location, signal));
       const state = await readNativeLiveState(
         client,
         {
@@ -385,7 +445,11 @@ export async function refreshNativeSessions(
           ...(worker.agent ? { agent: worker.agent } : {}),
         },
         signal,
-        { active, permissions: permissions.get(location)! },
+        {
+          active,
+          permissions: permissions.get(location)!,
+          forms: forms.get(location)!,
+        },
         (phase) => {
           askFailures[phase]++;
         },

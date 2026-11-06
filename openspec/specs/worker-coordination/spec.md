@@ -256,6 +256,7 @@ The coordinator SHALL list hierarchical native session metadata with bounded fil
 
 - **WHEN** a bounded page is incomplete or native status reads fail or conflict
 - **THEN** the response identifies continuation, partial availability and excluded unknown rows instead of implying a complete empty inventory, idle session or completed work.
+- **AND** unavailable, malformed or oversized location-wide pending-input reads degrade affected location rows without degrading other locations.
 
 #### Scenario: Filters hierarchical sessions with multiple statuses
 
@@ -276,6 +277,19 @@ The coordinator SHALL list hierarchical native session metadata with bounded fil
 - **THEN** the response contains a short continuation handle bound to the native service incarnation, caller and original normalized query, without native cursor contents.
 - **AND** empty filtered pages can continue; changed filters, a different caller, expired or evicted handles and unloaded instances reject continuation without broadening the query or silently restarting.
 - **AND** hierarchy selection remains consistent across buffered and native continuation pages; omitted and false `includeSubagents` are equivalent, while changing its normalized value rejects continuation even with an explicit parent selector.
+
+#### Scenario: Bounds candidate reads before status hydration
+
+- **WHEN** inventory is requested with a result limit and metadata filters
+- **THEN** one native page is requested with a candidate budget no larger than that limit, and metadata mismatches avoid status hydration; surviving refreshed rows still satisfy every filter.
+- **AND** status filtering can produce short or empty pages with continuation rather than scanning additional native pages to fill the limit.
+
+#### Scenario: Shares pending form reads within each inventory refresh
+
+- **GIVEN** selected sessions sharing a location with pending forms
+- **WHEN** inventory refreshes their status
+- **THEN** one location-wide pending-form read serves that location without per-session form listing or per-form detail reads, while classifying each form only for its owning session.
+- **AND** subsequent calls obtain fresh pending-input state; non-inventory supervision and control eligibility semantics remain unchanged.
 
 ### Requirement: Conversational manual assignment
 

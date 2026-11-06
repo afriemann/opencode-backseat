@@ -469,6 +469,13 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         "Continuation unavailable or query changed; restart listing",
       );
     const expires = previous?.expires ?? now() + PAGE_TTL;
+    const matchesMetadata = (row: Row) =>
+      (!projectID || row.projectID === projectID) &&
+      (!location || row.location === location) &&
+      (!agent || row.agent === agent) &&
+      (!workers || workers.includes(row.id)) &&
+      (parentID === undefined || row.parentID === parentID) &&
+      (includeArchived || !row.archived);
     const buffered = previous?.rows ?? [];
     let rows = buffered,
       next = previous?.nativeCursor,
@@ -491,6 +498,8 @@ export function createCoordinationTools(port: CoordinationToolPort): {
               ...(parentID !== undefined ? { parentID } : {}),
               includeArchived,
               order,
+              limit,
+              select: matchesMetadata,
             },
             diagnostics,
           ),
@@ -516,7 +525,12 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       rows = await native<Row[]>(
         context,
         (client, signal) =>
-          refreshNativeSessions(client, buffered, signal, diagnostics),
+          refreshNativeSessions(
+            client,
+            buffered.filter(matchesMetadata),
+            signal,
+            diagnostics,
+          ),
         diagnostics,
       );
       unknownCount = rows.filter((row) => row.status === "unknown").length;
@@ -526,13 +540,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       (row) =>
         statuses.includes(
           row.status === "waiting-for-input" ? "waiting" : row.status,
-        ) &&
-        (!projectID || row.projectID === projectID) &&
-        (!location || row.location === location) &&
-        (!agent || row.agent === agent) &&
-        (!workers || workers.includes(row.id)) &&
-        (parentID === undefined || row.parentID === parentID) &&
-        (includeArchived || !row.archived),
+        ) && matchesMetadata(row),
     );
     const result = rows.slice(0, limit),
       remaining = rows.slice(limit);

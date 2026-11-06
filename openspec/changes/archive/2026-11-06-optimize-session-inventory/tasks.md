@@ -1,0 +1,3 @@
+- [x] Implement "Bounds candidate reads before status hydration" with its regression test and README pagination guidance.
+- [x] Implement "Shares pending form reads within each inventory refresh" with its regression test and affected shared-helper fixtures.
+- [x] Extend "Reports partial or unknown inventory honestly" regression coverage for location snapshot failures per design.md.
