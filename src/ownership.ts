@@ -47,8 +47,6 @@ export interface OwnershipPort {
     owner: string,
   ): Promise<boolean | OwnershipAcquisition>;
   release(dataDir: string, owner: string): Promise<void>;
-  approveRecovery(dataDir: string, owner: string): Promise<void>;
-  recover(dataDir: string, owner: string): Promise<void>;
 }
 
 interface ProcessIdentity {
@@ -118,10 +116,6 @@ async function ownerStatus(
   } catch (error) {
     return hasCode(error, "ENOENT") ? "terminated" : "unverifiable";
   }
-}
-
-async function terminated(identity: ProcessIdentity): Promise<boolean> {
-  return (await ownerStatus(identity)) === "terminated";
 }
 
 function parseOwner(text: string): FilesystemOwner | undefined {
@@ -285,16 +279,12 @@ async function kernelGuard(dataDir: string): Promise<KernelGuard | undefined> {
   }
 }
 
-export function createFilesystemOwnershipPort(
-  approveRecovery: (dataDir: string, owner: string) => Promise<void>,
-  validateRecovery?: () => Promise<void>,
-): OwnershipPort {
+export function createFilesystemOwnershipPort(): OwnershipPort {
   const serial = serialQueue();
   const owned = new Map<
     string,
     { guard: KernelGuard; record: FilesystemOwner }
   >();
-  const approvals = new Map<string, string>();
   async function withGuard<T>(
     dataDir: string,
     work: (guard: KernelGuard) => Promise<T>,
@@ -411,49 +401,6 @@ export function createFilesystemOwnershipPort(
         }
       });
     },
-    async approveRecovery(dataDir, owner) {
-      const text = await serial(async () => {
-        approvals.delete(dataDir);
-        return withGuard(dataDir, async (guard) => {
-          const { text, record } = await readOwner(guard);
-          if (
-            !record ||
-            record.released ||
-            record.owner !== owner ||
-            !(await terminated(record.identity))
-          )
-            throw ownershipError();
-          return text;
-        });
-      });
-      await approveRecovery(dataDir, owner);
-      await serial(async () => {
-        approvals.set(dataDir, text);
-      });
-    },
-    recover(dataDir, owner) {
-      return serial(async () => {
-        const approved = approvals.get(dataDir);
-        approvals.delete(dataDir);
-        await withGuard(dataDir, async (guard) => {
-          const { text, record } = await readOwner(guard);
-          if (
-            !approved ||
-            text !== approved ||
-            !record ||
-            record.released ||
-            record.owner !== owner ||
-            !(await terminated(record.identity))
-          )
-            throw ownershipError();
-          await writeOwner(
-            guard,
-            { ...record, released: true },
-            validateRecovery,
-          );
-        });
-      });
-    },
   };
 }
 
@@ -495,31 +442,6 @@ export class CoordinatorOwnership {
       }
     });
   }
-  recover(): Promise<"held"> {
-    return this.serial(async (): Promise<"held"> => {
-      const before = await this.port.inspect(this.dataDir);
-      if (
-        this.closed ||
-        this.owned ||
-        !before.safe ||
-        !before.lock ||
-        before.lock.running
-      )
-        throw new Error("Recovery is not eligible");
-      await this.port.approveRecovery(this.dataDir, before.lock.owner);
-      const after = await this.port.inspect(this.dataDir);
-      if (
-        this.closed ||
-        !after.safe ||
-        !after.lock ||
-        after.lock.running ||
-        after.lock.owner !== before.lock.owner
-      )
-        throw new Error("Recovery is not eligible");
-      await this.port.recover(this.dataDir, before.lock.owner);
-      return "held";
-    });
-  }
   async dispose(drain: () => Promise<void>): Promise<void> {
     this.closed = true;
     await this.serial(async () => {
@@ -528,17 +450,6 @@ export class CoordinatorOwnership {
       this.owned = false;
     });
   }
-}
-
-export interface ObserverScope {
-  dataDir: string;
-  coordinatorLocation: string;
-}
-export interface ObserverRecord extends ObserverScope {
-  coordinatorID: string;
-  generation: number;
-  verifier: string;
-  sequence: number;
 }
 
 export interface CoordinatorCoreLease<T> {
@@ -600,12 +511,4 @@ export async function acquireCoordinatorCore<
       },
     };
   });
-}
-
-export function forceNativeAsk(event: {
-  action: string;
-  effect: "allow" | "ask" | "deny";
-}): void {
-  if (event.action.startsWith("backseat.") && event.effect !== "deny")
-    event.effect = "ask";
 }

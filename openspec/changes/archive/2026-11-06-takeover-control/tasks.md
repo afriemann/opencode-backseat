@@ -1,0 +1,7 @@
+- [x] 1. Implement session-centric storage and ownership per design "Local follower core" and "Store and controls", covering "Holds unsafe or corrupt shared storage" and reload scenarios.
+- [x] 2. Replace adoption and creation paths for "Accepts task-free adoption without inventing a binding" and "Executes approved native session operations" with their scenario tests and README usage.
+- [x] 3. Implement background observation and delivery per design "Sequence-based observation" and "Bounded coordinator delivery", covering all "Background followed-session events" scenarios.
+- [x] 4. Implement "Stops following without worker effects" and "Prevents notification feedback" per design "Stop and feedback", with scenario tests and README lifecycle guidance.
+- [x] 5. Adapt typed native controls and delivery reconciliation for configured permissions, covering "Preserves native approval for conversational control", native reply and uncertain-delivery scenarios.
+- [x] 6. Remove task/supervision modules, task filters, obsolete RPC contracts and superseded tests while retaining native discovery, content and diagnostic scenarios.
+- [x] 7. Update the coordinator definition and contributor instructions through agent-engineer, covering the conversational coordinator and tool-restriction scenarios.

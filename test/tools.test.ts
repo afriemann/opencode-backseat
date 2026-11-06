@@ -21,15 +21,7 @@ function fixture() {
   const queries: unknown[] = [],
     controls: unknown[] = [];
   let nativeCursor: string | undefined,
-    clock = 0,
-    owned = true;
-  const task = {
-    id: "task",
-    workerID: "running",
-    location: "/projects/one",
-    status: "held",
-    group: "team",
-  };
+    clock = 0;
   const client = {
     form: {
       async list() {
@@ -103,27 +95,20 @@ function fixture() {
       dispose() {},
     },
     backend: {
-      async inspectDeletions() {
-        return [];
+      async listFollowedSessions() {
+        return { sessions: [{ sessionID: "running" }], deliveries: [] };
       },
-      async inspect() {
-        return {
-          authority: owned ? "owned" : "held",
-          bindings: [task],
-          intents: [
-            { intent: { taskID: "task", id: "included" } },
-            { intent: { taskID: "other", id: "excluded" } },
-          ],
-          completions: [{ taskID: "task" }, { taskID: "other" }],
-          snapshots: [
-            { id: "included", recipients: ["task"] },
-            { id: "excluded", recipients: ["other"] },
-          ],
-        };
+      async createSession(...input: unknown[]) {
+        controls.push(["create", ...input]);
+        return { following: true };
       },
-      async nativeControl(...input: unknown[]) {
-        controls.push(input);
-        return { accepted: true };
+      async adoptSession(...input: unknown[]) {
+        controls.push(["adopt", ...input]);
+        return { following: true };
+      },
+      async stopFollowing(...input: unknown[]) {
+        controls.push(["stop", ...input]);
+        return { following: false };
       },
       async sendSession(...input: unknown[]) {
         controls.push(["send_session", ...input]);
@@ -137,25 +122,9 @@ function fixture() {
         controls.push(["session_operation", ...input]);
         return { status: "completed" };
       },
-      async resumeTask(...input: unknown[]) {
-        controls.push(["resume_task", ...input]);
-        return { accepted: true };
-      },
-      async startSupervision(...input: unknown[]) {
-        controls.push(["start_supervision", ...input]);
-        return {
-          generation: 1,
-          coordinatorID: "coordinator",
-          status: "held" as const,
-        };
-      },
-      async recover(...input: unknown[]) {
-        controls.push(["recover", ...input]);
-        return { authority: "held" };
-      },
       async deleteSession(...input: unknown[]) {
         controls.push(["delete", ...input]);
-        return { sessionID: input[0], status: "deleted", affectedTasks: [] };
+        return { sessionID: input[0], status: "deleted" };
       },
     },
     async canonical(location: string) {
@@ -197,9 +166,6 @@ function fixture() {
     },
     advance(milliseconds: number) {
       clock += milliseconds;
-    },
-    hold() {
-      owned = false;
     },
   };
 }
@@ -429,9 +395,9 @@ describe("Fine-grained Code Mode queries", () => {
       project: "project",
       directory: "/projects/one",
     });
-    expect(await f.call("list_sessions", { taskIDs: ["task"] })).toMatchObject({
-      sessions: [{ id: "running" }],
-    });
+    await expect(
+      f.call("list_sessions", { taskIDs: ["task"] }),
+    ).rejects.toThrow("Unknown input field");
     expect(await f.call("list_sessions", { parentID: null })).toMatchObject({
       sessions: [{ id: "running" }, { id: "inactive" }],
     });
@@ -465,10 +431,9 @@ describe("Fine-grained Code Mode queries", () => {
       { includeSubagents: "yes" },
     ])
       await expect(f.call("list_sessions", input)).rejects.toThrow();
-    f.hold();
     await expect(
       f.call("list_sessions", { taskIDs: ["task"] }),
-    ).rejects.toThrow("task store");
+    ).rejects.toThrow("Unknown input field");
     f.client.session.list = async () => {
       throw new Error("Unavailable native inventory");
     };
@@ -518,11 +483,6 @@ describe("Fine-grained Code Mode queries", () => {
       { query: { limit: 1 }, expected: ["running"], hydrated: ["running"] },
       { query: { limit: 2, agent: "other" }, expected: [], hydrated: [] },
       {
-        query: { limit: 3, taskIDs: ["task"] },
-        expected: ["running"],
-        hydrated: ["running"],
-      },
-      {
         query: { limit: 1, statuses: ["inactive"] },
         expected: [],
         hydrated: ["running"],
@@ -558,11 +518,11 @@ describe("Fine-grained Code Mode queries", () => {
       parentID: "new-parent",
     });
     expect(
-      await f.call("list_sessions", {
-        statuses: ["running", "unknown"],
-        taskIDs: ["task"],
-      }),
-    ).toMatchObject({ sessions: [] });
+      (
+        (await f.call("list_sessions", { statuses: ["running", "unknown"] }))
+          .sessions as { id: string }[]
+      ).some((row) => row.id === "running"),
+    ).toBe(false);
     f.registry.dispose();
   });
 
@@ -728,7 +688,7 @@ describe("Fine-grained Code Mode queries", () => {
     ).rejects.toThrow("Continuation");
   });
 
-  it("Lists catalogs and retrieves task details independently", async () => {
+  it("Creates an assignment through separate catalog and mutation calls", async () => {
     const f = fixture();
     expect(await f.call("list_projects")).toMatchObject({
       projects: [{ projectID: "project", location: "/projects/one" }],
@@ -736,30 +696,9 @@ describe("Fine-grained Code Mode queries", () => {
     expect(
       await f.call("list_agents", { location: "/projects/one" }),
     ).toMatchObject({ agents: ["engineer"] });
-    expect(
-      await f.call("list_tasks", { statuses: ["held"], group: "team" }),
-    ).toMatchObject({ tasks: [{ id: "task" }] });
-    expect(await f.call("get_task", { taskID: "task" })).toMatchObject({
-      task: { id: "task" },
-      intents: [{ intent: { id: "included" } }],
-      completions: [{ taskID: "task" }],
-      snapshots: [{ id: "included" }],
-      deletions: [],
+    expect(await f.call("list_followed_sessions")).toMatchObject({
+      sessions: [{ sessionID: "running" }],
     });
-    expect(
-      await f.call("list_tasks", { statuses: ["complete"] }),
-    ).toMatchObject({ tasks: [] });
-    await f.call("dispatch_task", {
-      taskID: "task",
-      text: "Requested work",
-      scope: ["source"],
-    });
-    expect(f.controls[0]).toMatchObject([
-      "dispatch",
-      "task",
-      { text: "Requested work", scope: ["source"] },
-      expect.objectContaining({ sessionID: "coordinator" }),
-    ]);
     const send = {
       sessionID: "worker",
       location: "/projects/one",
@@ -824,39 +763,15 @@ describe("Fine-grained Code Mode queries", () => {
         expect.objectContaining({ sessionID: "coordinator" }),
       ]);
     }
-    expect(await f.call("resume_task", { taskID: "task" })).toEqual({
-      accepted: true,
-    });
-    expect(f.controls.at(-1)).toMatchObject([
-      "resume_task",
-      "task",
-      expect.objectContaining({ sessionID: "coordinator" }),
-    ]);
     for (const [name, input, expected] of [
       [
         "create_session",
-        { task: { id: "task" } },
-        ["create", "task", { id: "task" }],
+        { location: "/projects/one", agent: "engineer" },
+        ["create", { location: "/projects/one", agent: "engineer" }],
       ],
-      [
-        "adopt_session",
-        { task: { id: "task" }, sessionID: "worker" },
-        ["adopt", "task", { goal: { id: "task" }, workerID: "worker" }],
-      ],
-      [
-        "adopt_session",
-        { sessionID: "worker" },
-        ["adopt", "", { workerID: "worker" }],
-      ],
-      ["take_over_task", { taskID: "task" }, ["takeover", "task", {}]],
-      ["hold_task", { taskID: "task" }, ["hold", "task", {}]],
-      [
-        "share_context",
-        { taskID: "task", shared: [] },
-        ["share", "task", { shared: [] }],
-      ],
+      ["adopt_session", { sessionID: "worker" }, ["adopt", "worker"]],
     ] as const) {
-      expect(await f.call(name, input)).toMatchObject({ accepted: true });
+      expect(await f.call(name, input)).toMatchObject({ following: true });
       expect(f.controls.at(-1)).toMatchObject([
         ...expected,
         expect.objectContaining({
@@ -867,12 +782,12 @@ describe("Fine-grained Code Mode queries", () => {
         }),
       ]);
     }
-    expect(await f.call("recover_runtime")).toMatchObject({
-      authority: "held",
-    });
-    expect((f.controls.at(-1) as unknown[]).slice(0, 3)).toMatchObject([
-      "recover",
-      { coordinatorID: "coordinator" },
+    expect(
+      await f.call("stop_following", { sessionID: "worker" }),
+    ).toMatchObject({ following: false });
+    expect(f.controls.at(-1)).toMatchObject([
+      "stop",
+      "worker",
       expect.objectContaining({ sessionID: "coordinator" }),
     ]);
     expect(
@@ -883,10 +798,5 @@ describe("Fine-grained Code Mode queries", () => {
       "worker",
       expect.objectContaining({ sessionID: "coordinator" }),
     ]);
-    f.hold();
-    await expect(f.call("list_tasks")).rejects.toThrow("task store");
-    await expect(f.call("get_task", { taskID: "task" })).rejects.toThrow(
-      "task store",
-    );
   });
 });

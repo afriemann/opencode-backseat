@@ -1,6 +1,95 @@
 import type { OpenCodeClient, MessageListInput } from "@opencode/client";
 import { randomUUID } from "node:crypto";
-import { exact, fingerprint, integer, text } from "./state.ts";
+import {
+  emptyPending,
+  exact,
+  fingerprint,
+  integer,
+  text,
+  type FollowPending,
+} from "./state.ts";
+import { readNativeAsks } from "./native-sessions.ts";
+
+export async function observeFollowedSession(
+  client: OpenCodeClient,
+  sessionID: string,
+  location: string,
+  afterSeq: number | undefined,
+  signal: AbortSignal,
+): Promise<{ afterSeq: number; pending: FollowPending }> {
+  const pending = emptyPending();
+  let boundary = afterSeq ?? 0;
+  let bytes = 0;
+  let synced = false;
+  for await (const event of client.experimental.session.log(
+    { sessionID, after: boundary, follow: false },
+    { signal },
+  )) {
+    signal.throwIfAborted();
+    if (event.type === "log.synced") {
+      if (event.aggregateID !== sessionID || (event.seq ?? 0) < boundary) {
+        pending.discontinuity = true;
+      }
+      if (event.aggregateID !== sessionID)
+        throw new Error("Native follow target changed");
+      boundary = event.seq ?? boundary;
+      synced = true;
+      break;
+    }
+    if (
+      event.durable.aggregateID !== sessionID ||
+      !Number.isSafeInteger(event.durable.seq) ||
+      event.durable.seq <= boundary
+    )
+      throw new Error("Native follow sequence changed");
+    boundary = event.durable.seq;
+    if (
+      afterSeq === undefined ||
+      event.metadata?.["backseat.notification"] === true
+    )
+      continue;
+    if (bytes <= CONTENT_BOUNDS.nativeBytes)
+      bytes += Buffer.byteLength(JSON.stringify(event));
+    if (bytes > CONTENT_BOUNDS.nativeBytes) {
+      pending.discontinuity = true;
+      continue;
+    }
+    pending.progress++;
+    if (
+      event.type === "session.execution.failed" ||
+      event.type === "session.step.failed"
+    )
+      pending.failed = true;
+    if (
+      event.type === "session.execution.succeeded" ||
+      event.type === "session.execution.interrupted"
+    )
+      pending.idle = true;
+    if (
+      event.type === "session.revert.committed" ||
+      event.type === "session.moved" ||
+      event.type === "session.deleted"
+    )
+      pending.discontinuity = true;
+  }
+  if (!synced)
+    throw new Error(
+      "Native follow history did not establish its sequence boundary",
+    );
+  const requests = await readNativeAsks(
+    client,
+    { workerID: sessionID, location },
+    signal,
+  );
+  pending.requests = requests.map((request) => {
+    const split = request.indexOf(":");
+    const kind = request.slice(0, split);
+    if (kind !== "permission" && kind !== "form")
+      throw new Error("Invalid native request kind");
+    return { kind, id: text(request.slice(split + 1)) };
+  });
+  return { afterSeq: boundary, pending };
+}
 
 export const CONTENT_BOUNDS = {
   pageItems: 100,
