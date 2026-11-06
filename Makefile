@@ -1,15 +1,11 @@
-.PHONY: help install test native-test native-coverage coverage typecheck lint hooks hooks-install secrets prerequisites check
+.PHONY: help install test coverage typecheck lint hooks hooks-install secrets prerequisites check
 TEST_PATH = ./test
 help:
-	@printf '%s\n' 'install test native-test native-coverage coverage typecheck lint hooks hooks-install secrets prerequisites check'
+	@printf '%s\n' 'install test coverage typecheck lint hooks hooks-install secrets prerequisites check'
 install:
 	bun install
 test:
 	bun test $(TEST_PATH)
-native-test:
-	BACKSEAT_NATIVE_HOST_TESTS=1 bun test ./test/native-observation.test.ts ./test/worker-supervision.test.ts --timeout 60000
-native-coverage:
-	BACKSEAT_NATIVE_HOST_TESTS=1 bun test ./test/native-observation.test.ts ./test/worker-supervision.test.ts --timeout 60000 --coverage --coverage-reporter=lcov --coverage-dir=coverage/native
 coverage:
 	bun test ./test --coverage --coverage-reporter=lcov
 typecheck:

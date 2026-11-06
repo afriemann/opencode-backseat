@@ -1,7 +1,5 @@
 import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import { isCoordinatorAgent } from "./coordinator-agent.ts";
-import type { WorkerBinding } from "./state.ts";
-import type { DispatchIntent } from "./dispatch.ts";
 import type { DiagnosticContext } from "./native-connection.ts";
 
 export type NativeClient = OpenCodeClient;
@@ -78,7 +76,7 @@ async function readLocationForms(
 
 export async function readNativeAsks(
   client: NativeAskClient,
-  binding: Pick<WorkerBinding, "location" | "workerID">,
+  binding: { location: string; workerID: string },
   signal?: AbortSignal,
   permissionsSnapshot?: Promise<
     Awaited<ReturnType<NativeAskClient["permission"]["request"]["list"]>>
@@ -513,37 +511,13 @@ export async function refreshNativeSessions(
   return sessions;
 }
 
-export async function readNativeDelivery(
+export async function readNativeSessionDelivery(
   client: {
     session: Pick<NativeClient["session"], "get"> & {
       inbox: Pick<NativeClient["session"]["inbox"], "list">;
     };
     message: Pick<NativeClient["message"], "list">;
   },
-  binding: WorkerBinding,
-  intent: DispatchIntent,
-  signal: AbortSignal,
-): Promise<"admitted" | "unknown"> {
-  if (
-    binding.id !== intent.taskID ||
-    binding.workerID !== intent.workerID ||
-    signal.aborted
-  )
-    return "unknown";
-  return readNativeSessionDelivery(
-    client,
-    {
-      id: intent.id,
-      sessionID: intent.workerID,
-      agent: binding.agent,
-      location: binding.location,
-    },
-    signal,
-  );
-}
-
-export async function readNativeSessionDelivery(
-  client: Parameters<typeof readNativeDelivery>[0],
   delivery: {
     id: string;
     sessionID: string;

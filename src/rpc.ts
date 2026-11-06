@@ -1,64 +1,9 @@
 import { Rpc } from "@opencode/plugin/rpc";
-import type { EvaluationContext, TaskEvidence } from "./context.ts";
-import type { DecisionIdentity, Suggestion } from "./evaluator.ts";
-import { exact, object, text, type CoordinatorState } from "./state.ts";
-
-export const CONTROL_OPERATIONS = [
-  "create",
-  "adopt",
-  "dispatch",
-  "hold",
-  "resume",
-  "takeover",
-  "share",
-  "reserve",
-  "finish",
-  "record",
-] as const;
-export type ControlOperation = (typeof CONTROL_OPERATIONS)[number];
-export interface SuggestInput {
-  taskID: string;
-  revision: number;
-  epoch: number;
-  evidence: TaskEvidence;
-  generation: number;
-}
-export interface SuggestResult {
-  context?: EvaluationContext;
-  suggestion?: Suggestion;
-  reason?: string;
-}
-export interface ObserveInput {
-  taskID: string;
-  workerID: string;
-}
-export interface ObserveResult {
-  snapshot?: import("./state.ts").WorkerSnapshot;
-  reason?: string;
-}
-export interface ValidateInput {
-  generation: number;
-  identity: DecisionIdentity;
-  evidence: TaskEvidence;
-  suggestion: Suggestion;
-}
-export interface CoordinatorSnapshot extends CoordinatorState {
-  dataDir: string;
-  authority: "owned" | "held";
-  reason?: string;
-}
+import { exact, object, text } from "./state.ts";
 export interface CoordinatorBootstrap {
   dataDir?: string;
   authority: "owned" | "held";
   reason?: string;
-}
-export interface ControlResult {
-  snapshot?: CoordinatorSnapshot;
-  accepted: boolean;
-  reason?: string;
-}
-export interface RecoverInput {
-  coordinatorID: string;
 }
 
 function schema<T>(parse: (value: unknown) => T): {

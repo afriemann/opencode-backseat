@@ -104,7 +104,7 @@ export const NATIVE_SEND_DESCRIPTIONS = {
   synthetic:
     "Insert native synthetic text, optionally hidden when options.description is omitted. resume false stores without starting a turn.",
   shell:
-    "Execute text as a native shell command in the selected session. The exact command requires native human approval.",
+    "Execute text as a native shell command in the selected session under configured OpenCode permissions.",
   compact:
     "Compact the selected native session with optional delivery. text is not used by compaction.",
   command:
@@ -308,7 +308,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
 export const NATIVE_OPERATIONS = {
   create_native_session: {
     description:
-      "Create a native session without a Backseat task. sessionID is a new stable native session ID, not an existing target. location and agent select its destination; optional parentID selects native ancestry only. Retain the returned identity on uncertainty and never create a replacement as a retry.",
+      "Create and follow a native session. sessionID is a new stable native session ID, not an existing target. location and agent select its destination; optional parentID selects native ancestry only. Retain the returned identity on uncertainty and never create a replacement as a retry.",
     input: schema(
       {
         title: string,
@@ -335,7 +335,7 @@ export const NATIVE_OPERATIONS = {
   },
   import_session: {
     description:
-      "Import a native exported transfer into the selected location without creating a Backseat task. sessionID and agent must exactly match transfer.info; the native location override selects the destination. Import requires approval of the transfer and retains the identity on uncertainty, never automatic retry.",
+      "Import and follow a native exported transfer in the selected location. sessionID and agent must exactly match transfer.info; the native location override selects the destination. Configured OpenCode permissions apply to the transfer. Retain the identity on uncertainty, never retry automatically.",
     input: schema(
       {
         transfer: schema(
@@ -387,7 +387,7 @@ export const NATIVE_OPERATIONS = {
   },
   fork_session: {
     description:
-      "Fork the selected native session, optionally before messageID, without adopting it into a task. Returns the new native session.",
+      "Fork the selected native session, optionally before messageID, and follow the new session. Returns the new native session.",
     input: schema({ before: string }, []),
   },
   switch_session_agent: {
@@ -433,19 +433,18 @@ export const NATIVE_OPERATIONS = {
   },
   move_session: {
     description:
-      "Move the selected native session to absolute workdir, with steer or queue delivery. Does not move repository files or a Backseat task binding.",
+      "Move the selected native session to absolute workdir, with steer or queue delivery. Does not move repository files.",
     input: schema({ workdir: string, delivery: { enum: ["steer", "queue"] } }, [
       "workdir",
     ]),
   },
   interrupt_session: {
     description:
-      "Interrupt native worker execution. Optional resume uses the host execution option, not Backseat supervision rearming.",
+      "Interrupt native worker execution. Optional resume uses the host execution option.",
     input: schema({ resume: boolean }, []),
   },
   background_session: {
-    description:
-      "Put the selected native execution in the background. Does not mark task completion.",
+    description: "Put the selected native execution in the background.",
     input: schema({}, []),
   },
   wait_session: {
@@ -470,7 +469,7 @@ export const NATIVE_OPERATIONS = {
   },
   commit_session_revert: {
     description:
-      "Commit the selected session's staged native revert. Requires a separate operation-bound approval for the current staged revert.",
+      "Commit the selected session's staged native revert under configured OpenCode permissions.",
     input: schema({}, []),
   },
   set_session_environment: {
@@ -500,7 +499,7 @@ export const NATIVE_OPERATIONS = {
   },
   reply_permission: {
     description:
-      "Reply to one pending native permission request using once, always, or reject. The selected request and exact decision require separate human native approval; this never grants approval to the coordinator itself or rearms supervision. Returns completed or throws when approval, request, or target changed.",
+      "Reply to one pending native permission request using once, always, or reject. Configured OpenCode permissions apply to the selected request and decision. This does not grant permissions to the coordinator itself. Returns completed or throws when the request or target changed.",
     input: schema(
       {
         requestID: string,
@@ -512,7 +511,7 @@ export const NATIVE_OPERATIONS = {
   },
   reply_form: {
     description:
-      "Answer one pending native session form. answer maps field IDs to strings, finite numbers, booleans, or string arrays from the inspected form. Native approval binds the form and answers; changed or completed forms are rejected. Does not rearm supervision.",
+      "Answer one pending native session form. answer maps field IDs to strings, finite numbers, booleans, or string arrays from the inspected form. Configured OpenCode permissions apply to the form and answers; changed or completed forms are rejected.",
     input: schema(
       {
         formID: string,
@@ -533,7 +532,7 @@ export const NATIVE_OPERATIONS = {
   },
   request_permission: {
     description:
-      "Create a native permission request for the selected worker with explicit action, resources and optional save patterns. Creating the request requires its own native human approval and does not answer it. Returns the native request ID and effect.",
+      "Create a native permission request for the selected worker with explicit action, resources and optional save patterns. Configured OpenCode permissions apply; creating the request does not answer it. Returns the native request ID and effect.",
     input: schema({ action: string, resources: strings, save: strings }, [
       "action",
       "resources",
