@@ -1096,6 +1096,7 @@ export async function createNativeBackend(
   const claimRecovered = async () => {
     if (!recovered) return;
     authority = await ownership.claim();
+    if (authority !== "owned") reason = ownership.reason;
     if (authority === "owned") {
       try {
         await load();
@@ -1113,12 +1114,13 @@ export async function createNativeBackend(
     )
       throw new Error("Invalid canonical coordination store");
     authority = await ownership.claim();
+    if (authority !== "owned") reason = ownership.reason;
     if (authority === "owned") {
       await load();
     }
   } catch {
     authority = "held";
-    reason = "Unsafe or unreadable durable runtime; explicit recovery required";
+    reason = "Durable coordination state could not be loaded or published";
   }
 
   const invocationProof = async (
@@ -1335,6 +1337,72 @@ export async function createNativeBackend(
         throw error;
       }
     };
+    if (operation === "adopt" && !Object.hasOwn(body, "goal")) {
+      exact(body, ["workerID"]);
+      const workerID = text(body.workerID);
+      if (workerID === coordinatorID)
+        throw new Error("Coordinator cannot be its own worker");
+      const selectedBinding = () =>
+        state.bindings.find((b) => b.workerID === workerID);
+      const before = selectedBinding();
+      if (before?.status === "complete")
+        throw new Error("Task is not automatically owned");
+      const bindingIdentity = fingerprint(before ?? null);
+      const readSelection = async () => {
+        const selected = await selectedWorker(workerID);
+        const target = {
+          location: await host.canonical(selected.location.directory),
+          agent: text(selected.agent),
+        };
+        await validateTarget(target, workerID);
+        const ancestry = [selected];
+        const maximumAncestry = 32;
+        while (ancestry.at(-1)!.parentID) {
+          const id = ancestry.at(-1)!.parentID!;
+          if (
+            ancestry.length >= maximumAncestry ||
+            ancestry.some((entry) => entry.id === id)
+          )
+            throw new Error("Unverifiable selected worker ancestry");
+          ancestry.push(await selectedWorker(id));
+        }
+        mutable();
+        return { target, ancestry };
+      };
+      const selected = await readSelection();
+      if (
+        before &&
+        (before.location !== selected.target.location ||
+          before.agent !== selected.target.agent)
+      )
+        throw new Error("Mismatched worker target");
+      await ask(
+        coordinatorID,
+        "adopt",
+        JSON.stringify([dataDir, workerID, selected, before ?? null]),
+        identity,
+        requestAbortSignal,
+      );
+      mutable();
+      if (
+        fingerprint(await readSelection()) !== fingerprint(selected) ||
+        fingerprint(selectedBinding() ?? null) !== bindingIdentity
+      )
+        throw new Error(
+          "Selected adoption target or binding changed during approval",
+        );
+      if (before) {
+        Object.assign(before, takeoverWorker(before));
+        for (const entry of state.intents)
+          if (
+            entry.intent.taskID === before.id &&
+            entry.intent.status === "reserved"
+          )
+            entry.intent.status = "ambiguous";
+        await persist();
+      }
+      return true;
+    }
     if (operation === "create" || operation === "adopt") {
       const goal = parseGoal(operation === "create" ? body : body.goal);
       exact(operation === "create" ? body : object(body.goal), [
@@ -3049,7 +3117,25 @@ export async function createNativeBackend(
               "Operation committed; inventory withheld because coordinator authority changed. Do not retry; inspect and reconcile the existing delivery identity.",
           };
         }
-        return { accepted, snapshot: snapshot() };
+        const request = object(body);
+        const taskFree =
+          operation === "adopt" && !Object.hasOwn(request, "goal");
+        const selected = taskFree
+          ? state.bindings.find(
+              (binding) => binding.workerID === request.workerID,
+            )
+          : undefined;
+        return {
+          accepted,
+          snapshot: snapshot(),
+          ...(taskFree
+            ? {
+                sessionID: text(request.workerID),
+                binding: selected ? "manual" : "unbound",
+                ...(selected ? { taskID: selected.id } : {}),
+              }
+            : {}),
+        };
       });
     },
     async fenceProject(location) {
@@ -3861,8 +3947,9 @@ async function createNativeCore(
   const ownership = new CoordinatorOwnership(dataDir, randomUUID(), {
     ...port,
     async acquire(...args) {
-      ownsStorage = await port.acquire(...args);
-      return ownsStorage;
+      const result = await port.acquire(...args);
+      ownsStorage = typeof result === "boolean" ? result : result.acquired;
+      return result;
     },
     async release(...args) {
       await port.release(...args);
@@ -4098,9 +4185,12 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         core = unavailableCore(
           dataDir,
           adapter,
-          error instanceof Error
+          // Anchor failures can contain private paths; expose only fixed reasons.
+          error instanceof Error &&
+            error.message ===
+              "Conflicting coordination stores in one native service"
             ? error.message
-            : "Coordination store unavailable",
+            : "Coordination storage is unsafe or unavailable",
         );
       }
       const existing = core.projects.get(location);

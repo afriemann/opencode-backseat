@@ -1661,7 +1661,9 @@ describe("Shared durable coordination store", () => {
         const metadata = await project.rpc.bootstrap();
         expect(metadata).toMatchObject({ authority: "held" });
         expect(metadata).not.toHaveProperty("dataDir");
-        expect(metadata.reason).toContain("absolute");
+        expect(metadata.reason).toBe(
+          "Coordination storage is unsafe or unavailable",
+        );
         expect(
           BackseatRpc.methods.bootstrap.output["~standard"].validate(metadata),
         ).toEqual({ value: metadata });
@@ -1669,22 +1671,32 @@ describe("Shared durable coordination store", () => {
         await project.close();
       }
     }
-    {
+    for (const failure of ["mode", "exception"]) {
       const directory = await mkdtemp(
         resolve(".opencode/backseat/unsafe-registration-"),
       );
-      await chmod(directory, 0o755);
+      if (failure === "mode") await chmod(directory, 0o755);
+      const failedOpen =
+        failure === "exception"
+          ? spyOn(filesystem, "open").mockRejectedValueOnce(
+              new Error("EACCES /private/storage-detail"),
+            )
+          : undefined;
       const project = await registeredCoordinator(false, undefined, directory);
       try {
         expect(project.setupError).toBeUndefined();
         expect(project.catalog.has(coordinatorAgent.id)).toBe(true);
-        expect((await project.rpc.bootstrap()).authority).toBe("held");
+        expect(await project.rpc.bootstrap()).toMatchObject({
+          authority: "held",
+          reason: "Coordination storage is unsafe or unavailable",
+        });
         expect(
           await readFile(`${directory}/state.json`, "utf8").catch(
             () => undefined,
           ),
         ).toBeUndefined();
       } finally {
+        failedOpen?.mockRestore();
         await project.close();
         await rm(directory, { recursive: true, force: true });
       }
@@ -2526,7 +2538,9 @@ describe("Bundled conversational coordinator", () => {
           text: "Approved assignment",
           scope: goal.scope,
         }),
-      ).rejects.toThrow("recovery required");
+      ).rejects.toThrow(
+        "Durable coordination state could not be loaded or published",
+      );
       await expect(
         unavailable.invoke("backseat_dispatch_task", {
           operation: "invalid",
@@ -2534,7 +2548,7 @@ describe("Bundled conversational coordinator", () => {
         }),
       ).rejects.toThrow();
       await expect(unavailable.invoke("backseat_list_tasks")).rejects.toThrow(
-        "task store",
+        "Durable coordination state could not be loaded or published",
       );
       unavailable.setAgent("engineer");
       await expect(
@@ -2708,6 +2722,64 @@ describe("Bundled conversational coordinator", () => {
     }
   });
 });
+
+function completionFixture(
+  b: WorkerBinding,
+): import("../src/state.ts").CompletionRecord {
+  const ref = {
+    messageID: "verified-message",
+    callID: "verified-call",
+    state: "completed" as const,
+    inputFingerprint: fingerprint("input"),
+    resultFingerprint: fingerprint("result"),
+    inspectedContentFingerprint: fingerprint("content"),
+  };
+  return {
+    taskID: b.id,
+    workerID: b.workerID,
+    revision: b.revision,
+    epoch: b.epoch,
+    generation: 1,
+    support: b.criteria.map((criterion) => ({
+      criterion,
+      evidenceID: ref.callID,
+    })),
+    evidence: {
+      taskID: b.id,
+      workerID: b.workerID,
+      turn: 1,
+      fingerprint: fingerprint("evidence"),
+      native: [ref],
+    },
+    validation: {
+      receiptID: "verified-receipt",
+      status: "accept",
+      rationale: "Verified criterion evidence",
+      identity: {
+        taskID: b.id,
+        workerID: b.workerID,
+        location: b.location,
+        revision: b.revision,
+        epoch: b.epoch,
+        generation: 1,
+        turn: 1,
+        nativeBoundary: ref.messageID,
+        snapshotIncarnation: "incarnation",
+        snapshotSequence: 1,
+        snapshotInvalidationVersion: 0,
+        evidenceFingerprint: fingerprint("evidence"),
+        sharedVersions: [],
+        suggestionFingerprint: fingerprint("suggestion"),
+      },
+      criteria: b.criteria.map((criterion) => ({
+        criterion,
+        status: "accept",
+        rationale: "Verified criterion evidence",
+        evidence: [ref],
+      })),
+    },
+  };
+}
 
 async function backendFixture(
   bindings: WorkerBinding[] = [],
@@ -3223,6 +3295,29 @@ describe("Filesystem coordinator authority", () => {
       ).toContain('"owner":"first"');
       const inode = (await stat(lock)).ino;
       expect(await child(home, "independent")).toBe("held");
+      const competing = authority(home, "competing");
+      expect(await competing.claim()).toBe("held");
+      expect(competing.reason).toBe("Coordination store has a live owner");
+      await competing.dispose(async () => {});
+      let contended = true;
+      const retried = new CoordinatorOwnership(home, "retried", {
+        ...createFilesystemOwnershipPort(async () => {}),
+        inspect: async () =>
+          contended ? { safe: false, reason: "live-owner" } : { safe: true },
+        acquire: async () => false,
+      });
+      expect(await retried.claim()).toBe("held");
+      expect(retried.reason).toBe("Coordination store has a live owner");
+      contended = false;
+      expect(await retried.claim()).toBe("held");
+      expect(retried.reason).toBe(
+        "Coordination storage is unsafe or unavailable",
+      );
+      await retried.dispose(async () => {});
+      expect(await retried.claim()).toBe("held");
+      expect(retried.reason).toBe(
+        "Coordination storage is unsafe or unavailable",
+      );
       await expect(
         first.dispose(async () => {
           throw new Error("Drain failed");
@@ -3295,6 +3390,11 @@ describe("Filesystem coordinator authority", () => {
               await link(lock, resolve(directory, "ownership.lock"));
           }
           expect(await blocked.claim(), unsafe).toBe("held");
+          expect(blocked.reason, unsafe).toBe(
+            ["malformed", "invalid-utf8", "oversized"].includes(unsafe)
+              ? "Coordination owner identity is unverifiable"
+              : "Coordination storage is unsafe or unavailable",
+          );
           await expect(blocked.recover()).rejects.toThrow(
             "Recovery is not eligible",
           );
@@ -3317,8 +3417,10 @@ describe("Filesystem coordinator authority", () => {
           return helper;
         }) as typeof subprocess.spawn);
         try {
-          expect(await authority(helperHome, `helper-${failure}`).claim()).toBe(
-            "held",
+          const unavailable = authority(helperHome, `helper-${failure}`);
+          expect(await unavailable.claim()).toBe("held");
+          expect(unavailable.reason).toBe(
+            "Required ownership host capability is unavailable",
           );
         } finally {
           spawn.mockRestore();
@@ -3490,73 +3592,6 @@ describe("Filesystem coordinator authority", () => {
       } finally {
         finish();
         await project.close();
-        await rm(directory, { recursive: true, force: true });
-      }
-    }
-    for (const startup of ["unload", "failure"] as const) {
-      const directory = await mkdtemp(
-        resolve(".opencode/backseat/late-observer-"),
-      );
-      expect(await child(directory, "terminated-project", true)).toBe("owned");
-      let enter!: () => void, finish!: () => void;
-      const entered = new Promise<void>((resolve) => {
-        enter = resolve;
-      });
-      const waiting = new Promise<void>((resolve) => {
-        finish = resolve;
-      });
-      const sessions = new Map<string, string>();
-      const first = await registeredCoordinator(
-        false,
-        undefined,
-        directory,
-        sessions,
-        {
-          hook: async (name) => {
-            if (name === "experimental.idle") {
-              enter();
-              await waiting;
-              if (startup === "failure")
-                throw new Error("Observer startup failed");
-            }
-          },
-        },
-      );
-      const second = await registeredCoordinator(
-        true,
-        undefined,
-        directory,
-        sessions,
-      );
-      try {
-        await first.invoke("backseat_recover_runtime");
-        const attaching = first
-          .invoke("backseat_start_supervision")
-          .catch(() => undefined);
-        await entered;
-        const closing =
-          startup === "unload" ? first.close() : Promise.resolve();
-        finish();
-        const [, attached] = await Promise.all([closing, attaching]);
-        if (startup === "unload")
-          expect(first.disposedHooks).toContain("experimental.idle");
-        else {
-          expect(attached?.output).toBeDefined();
-          const values = JSON.parse(
-            await readFile(`${directory}/state.json`, "utf8"),
-          ).values as Record<string, { usable?: boolean }>;
-          expect(
-            Object.values(values)
-              .filter((value) => typeof value.usable === "boolean")
-              .map((value) => value.usable)
-              .sort(),
-          ).toEqual([false, true]);
-        }
-        expect((await second.rpc.bootstrap()).authority).toBe("owned");
-      } finally {
-        finish();
-        await first.close();
-        await second.close();
         await rm(directory, { recursive: true, force: true });
       }
     }
@@ -3849,6 +3884,88 @@ describe("Filesystem coordinator authority", () => {
     }
   });
 
+  it("Revalidates terminated ownership under exclusive acquisition", async () => {
+    const home = await fixture();
+    try {
+      const port = createFilesystemOwnershipPort(async () => {});
+      expect(await port.acquire(home, "seed")).toEqual({ acquired: true });
+      expect(await port.acquire(home, "duplicate")).toEqual({
+        acquired: false,
+        reason: "live-owner",
+      });
+      await port.release(home, "seed");
+      const lock = resolve(home, "ownership.lock");
+      const liveRecord = JSON.parse(await readFile(lock, "utf8"));
+      for (const change of ["live", "boot", "namespace", "malformed"]) {
+        expect(await child(home, "terminated-before-inspection", true)).toBe(
+          "owned",
+        );
+        expect(await port.inspect(home)).toEqual({
+          safe: true,
+          lock: { owner: "terminated-before-inspection", running: false },
+        });
+        const changed = {
+          ...liveRecord,
+          released: false,
+          identity: {
+            ...liveRecord.identity,
+            ...(change === "boot"
+              ? { boot: "00000000-0000-0000-0000-000000000000" }
+              : {}),
+            ...(change === "namespace" ? { namespace: "0" } : {}),
+          },
+        };
+        await writeFile(
+          lock,
+          change === "malformed" ? "not-json" : JSON.stringify(changed),
+        );
+        const before = await readFile(lock, "utf8");
+        const inode = (await stat(lock)).ino;
+        expect(await port.acquire(home, "stale-claimant"), change).toEqual({
+          acquired: false,
+          reason: change === "live" ? "live-owner" : "unverifiable-owner",
+        });
+        expect(await readFile(lock, "utf8")).toBe(before);
+        expect((await stat(lock)).ino).toBe(inode);
+        await writeFile(lock, JSON.stringify(liveRecord));
+      }
+      const failedHelper = spyOn(subprocess, "spawn").mockImplementation(
+        (() => {
+          const helper = new subprocess.ChildProcess();
+          queueMicrotask(() => {
+            helper.emit("error", new Error("Helper unavailable"));
+            helper.emit("close", 2);
+          });
+          return helper;
+        }) as typeof subprocess.spawn,
+      );
+      try {
+        expect(await port.acquire(home, "unavailable-helper")).toEqual({
+          acquired: false,
+          reason: "host-capability-unavailable",
+        });
+      } finally {
+        failedHelper.mockRestore();
+      }
+      expect(await child(home, "terminated", true)).toBe("owned");
+      const inode = (await stat(lock)).ino;
+      const contenders = [
+        contender(home, "restart-a"),
+        contender(home, "restart-b"),
+      ];
+      try {
+        expect(
+          (await Promise.all(contenders.map((child) => child.result()))).sort(),
+        ).toEqual(["held", "owned"]);
+        expect((await stat(lock)).ino).toBe(inode);
+      } finally {
+        await Promise.all(contenders.map((child) => child.close()));
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it("Requires explicit stale-owner recovery", async () => {
     const released: boolean[] = [];
     for (const change of ["cancel", "role"] as const) {
@@ -3896,6 +4013,45 @@ describe("Filesystem coordinator authority", () => {
       const directory = await mkdtemp(
         resolve(".opencode/backseat/recover-project-"),
       );
+      const location = await mkdtemp(
+        resolve(".opencode/backseat/recovered-worker-"),
+      );
+      const storage = await openSharedStorage(directory);
+      const retained: WorkerBinding = {
+        ...goal,
+        location,
+        workerID: "recover-worker",
+        status: "active",
+        revision: 1,
+        epoch: 1,
+        followups: 2,
+        nonprogress: 1,
+      };
+      await storage.set("coordinator:state", {
+        version: 1,
+        bindings: [retained],
+        snapshots: [],
+        completions: [],
+        intents: [
+          {
+            intent: {
+              id: "msg_retained",
+              taskID: retained.id,
+              workerID: retained.workerID,
+              identity: "retained",
+              text: "Approved assignment",
+              nonprogress: 0,
+              status: "reserved",
+            },
+            kind: "manual",
+            revision: 1,
+            epoch: 1,
+            generation: 0,
+            createdAt: 1,
+          },
+        ],
+      });
+      await storage.close();
       expect(await child(directory, "terminated-project", true)).toBe("owned");
       let approvals = 0;
       const project = await registeredCoordinator(
@@ -3910,28 +4066,33 @@ describe("Filesystem coordinator authority", () => {
         },
       );
       try {
-        expect((await project.rpc.bootstrap()).authority).toBe("held");
-        expect(
-          (await project.invoke("backseat_recover_runtime")).output,
-        ).toMatchObject({
-          dataDir: directory,
-          authority: "held",
-          reason:
-            "Recovery approved; start supervision and explicitly resume tasks",
+        const bootstrap = await project.rpc.bootstrap();
+        expect(bootstrap.authority, JSON.stringify(bootstrap)).toBe("owned");
+        expect(approvals).toBe(0);
+        const recovered = parseCoordinatorState(
+          JSON.parse(await readFile(`${directory}/state.json`, "utf8")).values[
+            "coordinator:state"
+          ],
+        );
+        expect(recovered.bindings).toEqual([
+          { ...retained, status: "held", epoch: 2 },
+        ]);
+        expect(recovered.intents[0]!.intent).toMatchObject({
+          id: "msg_retained",
+          status: "ambiguous",
         });
-        expect(approvals).toBe(1);
-        expect(
-          await readFile(`${directory}/state.json`, "utf8").catch(
-            () => undefined,
-          ),
-        ).toBeUndefined();
+        expect(recovered.supervision).toBeUndefined();
+        await expect(
+          project.invoke("backseat_recover_runtime"),
+        ).rejects.toThrow("Recovery is not eligible");
+        expect(await readFile(`${directory}/state.json`, "utf8")).toBeDefined();
         const started = await project.invoke("backseat_start_supervision");
         expect(started.output).toEqual({
           generation: 1,
           coordinatorID: project.coordinatorID,
           status: "held",
         });
-        expect(approvals).toBe(2);
+        expect(approvals).toBe(1);
         expect((await project.rpc.bootstrap()).authority).toBe("owned");
         expect(await readFile(`${directory}/state.json`, "utf8")).toContain(
           "supervision",
@@ -3939,6 +4100,7 @@ describe("Filesystem coordinator authority", () => {
       } finally {
         await project.close();
         await rm(directory, { recursive: true, force: true });
+        await rm(location, { recursive: true, force: true });
       }
     }
     await mockAuthority("recovery");
@@ -3946,13 +4108,11 @@ describe("Filesystem coordinator authority", () => {
     const approvals: string[] = [];
     const next = authority(home, "next", async (_home, owner) => {
       approvals.push(owner);
-      expect(await child(home, "approval-racer")).toBe("held");
     });
     try {
       expect(await child(home, "crashed", true)).toBe("owned");
       const lock = resolve(home, "ownership.lock");
       const inode = (await stat(lock)).ino;
-      expect(await next.claim()).toBe("held");
       const denied = authority(home, "denied", async () => {
         throw new Error("Denied");
       });
@@ -3994,8 +4154,6 @@ describe("Filesystem coordinator authority", () => {
         }),
       );
       const reused = authority(home, "pid-reused");
-      expect(await reused.claim()).toBe("held");
-      expect(await reused.recover()).toBe("held");
       expect(await reused.claim()).toBe("owned");
       await reused.dispose(async () => {});
 
@@ -4023,7 +4181,6 @@ describe("Filesystem coordinator authority", () => {
         await expect(changed.recover()).rejects.toThrow(
           "Recovery is not eligible",
         );
-        expect(await changed.claim()).toBe("held");
         await changed.dispose(async () => {});
         const fresh = authority(home, "fresh");
         expect(await fresh.recover()).toBe("held");
@@ -4039,6 +4196,201 @@ describe("Filesystem coordinator authority", () => {
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Explicit adoption", () => {
+  it("Accepts task-free adoption without inventing a binding", async () => {
+    for (const status of [undefined, "active", "held", "manual"] as const) {
+      const task: WorkerBinding = {
+        ...goal,
+        workerID: "selected",
+        revision: 1,
+        epoch: 1,
+        status: status ?? "held",
+        followups: 2,
+        nonprogress: 1,
+      };
+      const f = await backendFixture(
+        status ? [task] : [],
+        0,
+        false,
+        false,
+        [],
+        status === "active"
+          ? {
+              version: 1,
+              bindings: [task],
+              snapshots: [],
+              completions: [],
+              intents: [
+                {
+                  intent: {
+                    id: "reserved-adoption",
+                    taskID: task.id,
+                    workerID: task.workerID,
+                    identity: "reserved-adoption",
+                    text: "Approved assignment",
+                    nonprogress: 0,
+                    status: "reserved",
+                  },
+                  revision: task.revision,
+                  epoch: task.epoch,
+                  generation: 0,
+                  createdAt: 1,
+                  kind: "manual",
+                },
+              ],
+            }
+          : undefined,
+      );
+      const get = f.host.session.get;
+      f.host.session.get = async (input) => ({
+        ...(await get(input)),
+        ...(status && input.sessionID === "selected"
+          ? { parentID: "parent" }
+          : {}),
+      });
+      try {
+        const before = await f.backend.inspect();
+        const result = await f.backend.nativeControl(
+          "adopt",
+          "",
+          { workerID: "selected" },
+          nativeIdentity(),
+        );
+        expect(result).toMatchObject({
+          accepted: true,
+          sessionID: "selected",
+          binding: status ? "manual" : "unbound",
+        });
+        const after = await f.backend.inspect();
+        expect(after.bindings).toEqual(
+          status
+            ? [
+                {
+                  ...before.bindings[0]!,
+                  status: "manual",
+                  epoch: before.bindings[0]!.epoch + 1,
+                },
+              ]
+            : [],
+        );
+        expect(after.intents).toEqual(before.intents);
+        if (status === "active")
+          expect(after.intents[0]!.intent).toMatchObject({
+            id: "reserved-adoption",
+            status: "ambiguous",
+          });
+        expect(after.supervision).toBeUndefined();
+        expect(after.observer).toBeUndefined();
+        expect(f.effects).toEqual([]);
+        expect(f.asks).toEqual(["backseat.adopt"]);
+      } finally {
+        await f.backend.dispose();
+      }
+    }
+  });
+
+  it("Rejects stale or denied task-free adoption", async () => {
+    for (const change of [
+      "denied",
+      "agent",
+      "location",
+      "parent",
+      "project",
+      "complete",
+      "malformed",
+      "cycle",
+      "limit",
+      "binding-agent",
+      "self",
+    ] as const) {
+      const task: WorkerBinding = {
+        ...goal,
+        workerID: "selected",
+        revision: 1,
+        epoch: 1,
+        status: change === "complete" ? "complete" : "held",
+        agent: change === "binding-agent" ? "other" : goal.agent,
+        followups: 0,
+        nonprogress: 0,
+      };
+      const f = await backendFixture(
+        change === "complete" || change === "binding-agent" ? [task] : [],
+        0,
+        false,
+        false,
+        change === "complete" ? [completionFixture(task)] : [],
+      );
+      let approved = false;
+      const get = f.host.session.get;
+      f.host.session.get = async (input) => {
+        const session = await get(input);
+        if (change === "cycle") return { ...session, parentID: session.id };
+        if (change === "limit")
+          return { ...session, parentID: `${session.id}-parent` };
+        if (!approved || input.sessionID !== "selected") return session;
+        return {
+          ...session,
+          ...(change === "agent" ? { agent: "other" } : {}),
+          ...(change === "location"
+            ? { location: { directory: "/other" } }
+            : {}),
+          ...(change === "parent" ? { parentID: "new-parent" } : {}),
+          ...(change === "project" ? { projectID: "other" } : {}),
+        };
+      };
+      f.approve(async () => {
+        if (change === "denied") throw new Error("Denied");
+        approved = true;
+      });
+      try {
+        const before = await f.backend.inspect();
+        expect(before.authority, change).toBe("owned");
+        await expect(
+          f.backend.nativeControl(
+            "adopt",
+            "",
+            {
+              workerID: change === "self" ? "coordinator" : "selected",
+              ...(change === "malformed" ? { goal: null } : {}),
+            },
+            nativeIdentity(),
+          ),
+        ).rejects.toThrow(
+          change === "denied"
+            ? "Denied"
+            : change === "agent" || change === "location"
+              ? "Unavailable target agent"
+              : change === "complete"
+                ? "Task is not automatically owned"
+                : change === "malformed"
+                  ? "Invalid object"
+                  : change === "cycle" || change === "limit"
+                    ? "Unverifiable selected worker ancestry"
+                    : change === "binding-agent"
+                      ? "Mismatched worker target"
+                      : change === "self"
+                        ? "Coordinator cannot be its own worker"
+                        : "Selected adoption target or binding changed during approval",
+        );
+        expect(f.asks, change).toHaveLength(
+          [
+            "complete",
+            "malformed",
+            "cycle",
+            "limit",
+            "binding-agent",
+            "self",
+          ].includes(change)
+            ? 0
+            : 1,
+        );
+        expect((await f.backend.inspect()).bindings).toEqual(before.bindings);
+        expect(f.effects).toEqual([]);
+      } finally {
+        await f.backend.dispose();
+      }
+    }
+  });
+
   it("Adopts the selected existing worker", async () => {
     const saved: WorkerBinding[] = [];
     const approved: string[] = [];
@@ -4125,59 +4477,7 @@ describe("Conversational manual assignment", () => {
         followups: 2,
         nonprogress: 1,
       };
-      const ref = {
-        messageID: "verified-message",
-        callID: "verified-call",
-        state: "completed" as const,
-        inputFingerprint: fingerprint("input"),
-        resultFingerprint: fingerprint("result"),
-        inspectedContentFingerprint: fingerprint("content"),
-      };
-      const completion: import("../src/state.ts").CompletionRecord = {
-        taskID: b.id,
-        workerID: b.workerID,
-        revision: b.revision,
-        epoch: b.epoch,
-        generation: 1,
-        support: b.criteria.map((criterion) => ({
-          criterion,
-          evidenceID: ref.callID,
-        })),
-        evidence: {
-          taskID: b.id,
-          workerID: b.workerID,
-          turn: 1,
-          fingerprint: fingerprint("evidence"),
-          native: [ref],
-        },
-        validation: {
-          receiptID: "verified-receipt",
-          status: "accept",
-          rationale: "Verified criterion evidence",
-          identity: {
-            taskID: b.id,
-            workerID: b.workerID,
-            location: b.location,
-            revision: b.revision,
-            epoch: b.epoch,
-            generation: 1,
-            turn: 1,
-            nativeBoundary: ref.messageID,
-            snapshotIncarnation: "incarnation",
-            snapshotSequence: 1,
-            snapshotInvalidationVersion: 0,
-            evidenceFingerprint: fingerprint("evidence"),
-            sharedVersions: [],
-            suggestionFingerprint: fingerprint("suggestion"),
-          },
-          criteria: b.criteria.map((criterion) => ({
-            criterion,
-            status: "accept",
-            rationale: "Verified criterion evidence",
-            evidence: [ref],
-          })),
-        },
-      };
+      const completion = completionFixture(b);
       const child = {
         ...b,
         id: `${b.id}-child`,
@@ -5750,13 +6050,11 @@ async function mockAuthority(scenario: "competing" | "recovery") {
       "current-owner",
       stale.port,
     );
-    expect(await authority.claim()).toBe("held");
-    expect(await authority.recover()).toBe("held");
-    expect(stale.events).toEqual([
-      "approval:stopped-owner",
-      "recover:stopped-owner",
-    ]);
     expect(await authority.claim()).toBe("owned");
+    expect(stale.events).toEqual(["acquire:current-owner"]);
+    await expect(authority.recover()).rejects.toThrow(
+      "Recovery is not eligible",
+    );
     const live = lockPort({
       safe: true,
       lock: { owner: "running-owner", running: true },
