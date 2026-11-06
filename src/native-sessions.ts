@@ -2,10 +2,20 @@ import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import { isCoordinatorAgent } from "./coordinator-agent.ts";
 import type { WorkerBinding } from "./state.ts";
 import type { DispatchIntent } from "./dispatch.ts";
-import type { ProjectChoice, WorkerChoice } from "./ui.ts";
 import type { DiagnosticContext } from "./native-connection.ts";
 
 export type NativeClient = OpenCodeClient;
+export interface ProjectChoice {
+  id: string;
+  title: string;
+  location: string;
+}
+export interface WorkerChoice {
+  workerID: string;
+  title: string;
+  location: string;
+  agent: string;
+}
 export const NATIVE_BOUNDS = Object.freeze({
   catalogRows: 200,
   concurrentReads: 8,
@@ -456,32 +466,64 @@ export async function readNativeDelivery(
     signal.aborted
   )
     return "unknown";
+  return readNativeSessionDelivery(
+    client,
+    {
+      id: intent.id,
+      sessionID: intent.workerID,
+      agent: binding.agent,
+      location: binding.location,
+    },
+    signal,
+  );
+}
+
+export async function readNativeSessionDelivery(
+  client: Parameters<typeof readNativeDelivery>[0],
+  delivery: {
+    id: string;
+    sessionID: string;
+    agent: string;
+    location: string;
+    operation?: string;
+  },
+  signal: AbortSignal,
+): Promise<"admitted" | "unknown"> {
+  if (signal.aborted) return "unknown";
+  if (delivery.operation === "command" || delivery.operation === "skill")
+    return "unknown";
+  const expectedType =
+    delivery.operation === "compact"
+      ? "compaction"
+      : delivery.operation === undefined || delivery.operation === "prompt"
+        ? "user"
+        : delivery.operation;
   try {
     const request = { signal };
     const worker = await client.session.get(
-      { sessionID: intent.workerID },
+      { sessionID: delivery.sessionID },
       request,
     );
     if (
-      worker.id !== intent.workerID ||
-      worker.agent !== binding.agent ||
-      worker.location.directory !== binding.location ||
+      worker.id !== delivery.sessionID ||
+      worker.agent !== delivery.agent ||
+      worker.location.directory !== delivery.location ||
       worker.time.archived
     )
       return "unknown";
     const inbox = await client.session.inbox.list(
-      { sessionID: intent.workerID },
+      { sessionID: delivery.sessionID },
       request,
     );
     if (
       inbox.length > NATIVE_BOUNDS.catalogRows ||
-      inbox.some((i) => i.sessionID !== intent.workerID)
+      inbox.some((i) => i.sessionID !== delivery.sessionID)
     )
       return "unknown";
-    const queued = inbox.filter((i) => i.id === intent.id);
+    const queued = inbox.filter((i) => i.id === delivery.id);
     if (queued.length)
       return queued.length === 1 &&
-        queued[0]?.type === "user" &&
+        queued[0]?.type === expectedType &&
         !signal.aborted
         ? "admitted"
         : "unknown";
@@ -492,7 +534,7 @@ export async function readNativeDelivery(
     do {
       const page = await client.message.list(
         {
-          sessionID: intent.workerID,
+          sessionID: delivery.sessionID,
           limit: NATIVE_BOUNDS.catalogRows,
           ...(cursor ? { cursor } : { order: "asc" as const }),
         },
@@ -502,8 +544,8 @@ export async function readNativeDelivery(
         if (seen.has(message.id) || seen.size >= NATIVE_BOUNDS.catalogRows)
           return "unknown";
         seen.add(message.id);
-        if (message.id === intent.id) {
-          if (message.type !== "user") return "unknown";
+        if (message.id === delivery.id) {
+          if (message.type !== expectedType) return "unknown";
           delivered = true;
         }
       }

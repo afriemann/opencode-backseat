@@ -7,9 +7,9 @@ install:
 test:
 	bun test $(TEST_PATH)
 native-test:
-	BACKSEAT_NATIVE_HOST_TESTS=1 bun test ./test/coordination-tui.test.ts ./test/worker-supervision.test.ts --timeout 60000
+	BACKSEAT_NATIVE_HOST_TESTS=1 bun test ./test/native-observation.test.ts ./test/worker-supervision.test.ts --timeout 60000
 native-coverage:
-	BACKSEAT_NATIVE_HOST_TESTS=1 bun test ./test/coordination-tui.test.ts ./test/worker-supervision.test.ts --timeout 60000 --coverage --coverage-reporter=lcov --coverage-dir=coverage/native
+	BACKSEAT_NATIVE_HOST_TESTS=1 bun test ./test/native-observation.test.ts ./test/worker-supervision.test.ts --timeout 60000 --coverage --coverage-reporter=lcov --coverage-dir=coverage/native
 coverage:
 	bun test ./test --coverage --coverage-reporter=lcov
 typecheck:

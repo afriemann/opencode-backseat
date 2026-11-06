@@ -4,7 +4,6 @@ import { DiagnosticToken } from "../src/native-connection.ts";
 import {
   buildContext,
   nativeToolEvidence,
-  decisionIdentity,
   type TaskEvidence,
 } from "../src/context.ts";
 import {
@@ -13,6 +12,7 @@ import {
   type WorkerObservation,
 } from "../src/lifecycle.ts";
 import type { DispatchIntent, SupervisionResult } from "../src/dispatch.ts";
+import { ServerSupervision } from "../src/supervision.ts";
 import { parseCoordinatorState, type WorkerBinding } from "../src/state.ts";
 import { dispatchFollowup, followupText } from "../src/dispatch.ts";
 import {
@@ -23,21 +23,9 @@ import {
   type NativeBackendHost,
   type WorkerObserverHost,
 } from "../src/server.ts";
-import {
-  CoordinatorOwnership,
-  createObserverCapability,
-} from "../src/ownership.ts";
+import { CoordinatorOwnership } from "../src/ownership.ts";
 import { createHash } from "node:crypto";
-import {
-  captureNativeCoordinator,
-  captureNativeOverview,
-  fixtureApproval,
-} from "./host.ts";
-import {
-  reasoningPayload,
-  type ControlOperation,
-  type ControlBody,
-} from "../src/rpc.ts";
+import { fixtureApproval } from "./host.ts";
 
 import { coordinatorDefinition } from "./host.ts";
 
@@ -87,22 +75,6 @@ describe("Operational diagnostic boundaries", () => {
     >[0]);
     expect(JSON.stringify(records)).toContain("setup.degraded");
     expect(JSON.stringify(records)).toContain("validation");
-    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
-      const capture = await captureNativeOverview(
-        [],
-        80,
-        24,
-        false,
-        {},
-        false,
-        "ready",
-        false,
-        undefined,
-        "coordinator",
-      );
-      expect(capture.hostLog).toContain("setup.completed");
-      expect(capture.hostLog).toContain("backseat");
-    }
   });
   it("Excludes sensitive diagnostic data", async () => {
     const records: unknown[] = [];
@@ -364,31 +336,14 @@ async function completionFixture(
       },
     ],
   });
-  const capability = createObserverCapability();
-  const { generation } = await f.backend.attach({
-    coordinatorID: "coordinator",
-    verifier: capability.verifier,
-  });
+  const identity = {
+    sessionID: "coordinator",
+    agent: coordinatorDefinition.id,
+    messageID: "message",
+    id: "fixture",
+  };
+  const { generation } = await f.backend.startSupervision(identity);
   const held = (await f.backend.inspect()).bindings[0]!;
-  const observerScope = (await f.backend.inspect()).observer!;
-  let sequence = 0;
-  const signControl = (
-    operation: ControlOperation,
-    body: ControlBody,
-    binding: WorkerBinding,
-  ) =>
-    capability.sign(
-      generation,
-      ++sequence,
-      {
-        operation,
-        taskID: binding.id,
-        revision: binding.revision,
-        epoch: binding.epoch,
-        body,
-      },
-      observerScope,
-    );
   const call = {
     type: "tool" as const,
     id: "native-call",
@@ -413,35 +368,32 @@ async function completionFixture(
   const entry = nativeToolEvidence("assistant-7", call)!;
   const terminal = projection === "pre-idle" ? f.messages.pop() : undefined;
   await f.observer.idle({ sessionID: held.workerID, background: [] });
-  const snapshot = (await f.read()).snapshot!;
   if (terminal) f.messages.push(terminal);
-  await f.backend.control({
-    operation: "resume",
-    taskID: held.id,
-    proof: signControl(
-      "resume",
-      {
-        reconciliation: {
-          generation,
-          workerID: held.workerID,
-          revision: held.revision,
-          epoch: held.epoch,
-          snapshotFingerprint: hash(snapshot),
-          observedAt: Date.now(),
-          state: "settled",
-          asks: [],
-        },
-      },
-      held,
-    ),
-  });
-  const task = (await f.backend.inspect()).bindings[0]!;
   const evidence: TaskEvidence = {
-    taskID: task.id,
-    workerID: task.workerID,
+    taskID: held.id,
+    workerID: held.workerID,
     turn: 7,
     entries: [entry],
   };
+  let afterValidation: (() => Promise<void> | void) | undefined;
+  let validated = false;
+  f.nativeHost.observeNative = async (binding, snapshots, snapshot) => {
+    if (validated && afterValidation) {
+      const callback = afterValidation;
+      afterValidation = undefined;
+      await callback();
+    }
+    const context = buildContext(binding, evidence, snapshots, 10000);
+    if (context.status !== "ready") throw new Error(context.reason);
+    return {
+      turn: evidence.turn,
+      state: "settled",
+      asks: [],
+      snapshot,
+      context: context.context,
+    };
+  };
+  const task = (await f.backend.inspect()).bindings[0]!;
   let calls = 0;
   let validation: unknown =
     action === "complete"
@@ -465,74 +417,56 @@ async function completionFixture(
         };
   f.nativeHost.generate = async (_context, request) => {
     calls++;
-    return request
-      ? validation
-      : action === "complete"
-        ? {
-            taskID: task.id,
-            workerID: task.workerID,
-            action: "complete",
-            support: [{ criterion: "API verified", evidenceID: entry.id }],
-          }
-        : {
-            taskID: task.id,
-            workerID: task.workerID,
-            action: "continue",
-            nextStep: "Verify API",
-            scope: task.scope,
-            progress: true,
-          };
+    if (request) {
+      validated = true;
+      return validation;
+    }
+    return action === "complete"
+      ? {
+          taskID: task.id,
+          workerID: task.workerID,
+          action: "complete",
+          support: [{ criterion: "API verified", evidenceID: entry.id }],
+        }
+      : {
+          taskID: task.id,
+          workerID: task.workerID,
+          action: "continue",
+          nextStep: "Verify API",
+          scope: task.scope,
+          progress: true,
+        };
   };
-  const suggestionInput = {
-    taskID: task.id,
-    revision: task.revision,
-    epoch: task.epoch,
-    generation,
-    evidence,
+  const sends: { id: string; text: string }[] = [];
+  f.nativeHost.session.prompt = async (input) => {
+    sends.push({ id: input.id!, text: input.text });
+    return {
+      id: input.id!,
+      sessionID: input.sessionID,
+      time: { created: Date.now() },
+      type: "user",
+      payload: { text: input.text },
+      delivery: input.delivery ?? "steer",
+    };
   };
-  const suggestion = (
-    await f.backend.suggest({
-      ...suggestionInput,
-      proof: capability.sign(
-        generation,
-        ++sequence,
-        reasoningPayload("suggest", suggestionInput),
-        observerScope,
-      ),
-    })
-  ).suggestion!;
-  const identity = decisionIdentity(
-    task,
-    generation,
-    evidence,
-    snapshot,
-    suggestion,
-  );
   return {
     ...f,
     task,
     entry,
     evidence,
-    suggestion,
-    identity,
-    capability,
     generation,
-    signControl,
-    async validate() {
-      const input = { generation, identity, evidence, suggestion };
-      return f.backend.validate({
-        ...input,
-        proof: capability.sign(
-          generation,
-          ++sequence,
-          reasoningPayload("validate", input),
-          observerScope,
-        ),
-      });
-    },
+    identity,
+    sends,
     calls: () => calls,
-    validation: (value: unknown) => {
+    validation(value: unknown) {
       validation = value;
+    },
+    afterValidation(callback: () => Promise<void> | void) {
+      afterValidation = callback;
+    },
+    async run() {
+      await f.backend.resumeTask(task.id, identity);
+      return parseCoordinatorState(f.values.get(f.root));
     },
   };
 }
@@ -798,8 +732,22 @@ async function assertBoundedReservationRejections() {
 }
 
 // spec: openspec/specs/worker-supervision/spec.md
-describe("Native TUI-owned worker supervision", () => {
+describe("Settled-work supervision", () => {
   it("Evaluates a settled cross-project worker", async () => {
+    const server = fixture();
+    const runtime = new ServerSupervision(server.port);
+    await runtime.start(1);
+    await runtime.wake("worker");
+    expect(server.sends).toHaveLength(0);
+    expect((await runtime.rearm(1)).status).toBe("reconciled");
+    await runtime.wake("unrelated-session");
+    expect(server.sends).toHaveLength(0);
+    await Promise.all([runtime.wake("worker"), runtime.wake("worker")]);
+    expect(server.sends).toHaveLength(1);
+    expect(server.sends[0]?.workerID).toBe("worker");
+    runtime.close();
+    await runtime.wake("worker");
+    expect(server.sends).toHaveLength(1);
     const f = fixture();
     await ready(f);
     expect((await f.supervisor.supervise("task")).status).toBe("continued");
@@ -1040,32 +988,6 @@ describe("Native TUI-owned worker supervision", () => {
     expect(availability).toEqual(
       modes.map((mode) => ({ mode, available: true })),
     );
-    if (process.env.BACKSEAT_NATIVE_HOST_TESTS) {
-      const view = [
-        f.task,
-        {
-          ...f.task,
-          id: "other-task",
-          workerID: "other-worker",
-          location: "/project/web",
-        },
-      ];
-      const capture = await captureNativeOverview(
-        view,
-        80,
-        24,
-        false,
-        {},
-        true,
-      );
-      const proof = capture.observation;
-      expect(proof?.runtime).toEqual({ app: "2.2.5", bun: "1.4.4" });
-      expect(proof?.modelCalls).toBeGreaterThan(0);
-      expect(proof?.snapshot.background).toEqual([]);
-      expect(proof?.snapshot.incarnation).toBe(proof?.registry.incarnation);
-      expect(proof?.registry.usable).toBe(true);
-      expect(proof?.snapshot.invalidationVersion).toBe(proof?.invalidation);
-    }
   });
   it("Defers background work and holds abnormal termination", async () => {
     const overflowAvailability: boolean[] = [];
@@ -1383,26 +1305,6 @@ describe("Native TUI-owned worker supervision", () => {
     }
   });
   it("Continues an eligible task within scope", async () => {
-    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
-      const proof = await captureNativeCoordinator("continue");
-      expect(proof.error).toBeUndefined();
-      expect(proof.stage).toBe("done");
-      expect(proof.denied).toBe(true);
-      expect(proof.runtime).toEqual({ app: "2.2.5", bun: "1.4.4" });
-      expect(proof.home).not.toBe(proof.workerHome);
-      expect(
-        proof.requests.filter((request) => request.kind === "suggestion"),
-      ).toHaveLength(1);
-      expect(
-        proof.requests.filter((request) => request.kind === "validation"),
-      ).toHaveLength(1);
-      expect(proof.snapshot).toMatchObject({
-        bindings: [{ followups: 1 }],
-        intents: [
-          { intent: { id: "msg_owned-original-followup", status: "admitted" } },
-        ],
-      });
-    }
     for (const action of ["continue", "redirect"]) {
       const f = fixture();
       await ready(f);
@@ -1423,79 +1325,56 @@ describe("Native TUI-owned worker supervision", () => {
       expect(f.task.followups).toBe(1);
       expect(f.task.agent).toBe("engineer");
     }
-    for (const mode of ["accepted", "wrong-text", "wrong-receipt"] as const) {
+    for (const mode of ["admitted", "ambiguous"] as const) {
       const native = await completionFixture("continue");
-      const validation = await native.validate();
-      const intent: DispatchIntent = {
-        id: "original-prompt-id",
-        taskID: native.task.id,
-        workerID: native.task.workerID,
-        identity: hash(native.identity),
-        text:
-          mode === "wrong-text"
-            ? "Read secrets"
-            : followupText(native.task, "Verify API"),
-        nonprogress: 0,
-        status: "reserved",
-      };
-      const request = {
-        operation: "reserve" as const,
-        taskID: native.task.id,
-        proof: native.signControl(
-          "reserve",
-          {
-            intent,
-            decisionAt: Date.now(),
-            receiptID:
-              mode === "wrong-receipt" ? "unavailable" : validation.receiptID,
-            identity: native.identity,
-          },
-          native.task,
-        ),
-      };
-      if (mode === "wrong-receipt")
-        await expect(native.backend.control(request)).rejects.toThrow();
-      else
-        expect((await native.backend.control(request)).accepted).toBe(
-          mode === "accepted",
-        );
-      const stored = await native.backend.inspect();
-      expect(stored.bindings[0]?.followups).toBe(mode === "accepted" ? 1 : 0);
-      if (mode === "accepted")
-        expect(stored.intents[0]).toMatchObject({
-          intent: { id: "original-prompt-id" },
-          validation: {
-            receiptID: validation.receiptID,
-            identity: native.identity,
-          },
-        });
-      expect(native.calls()).toBe(2);
-      if (mode === "accepted") {
-        native.nativeHost.session.list = async () => ({ data: [], cursor: {} });
-        let removals = 0;
-        native.nativeHost.session.remove = async () => {
-          removals++;
+      try {
+        let reserved: unknown;
+        const prompt = native.nativeHost.session.prompt;
+        native.nativeHost.session.prompt = async (input) => {
+          reserved = parseCoordinatorState(native.values.get(native.root))
+            .intents[0];
+          expect(reserved).toMatchObject({
+            intent: {
+              id: input.id,
+              text: followupText(native.task, "Verify API"),
+              status: "reserved",
+            },
+            generation: native.generation,
+            validation: { status: "accept" },
+          });
+          if (mode === "ambiguous")
+            throw new Error("Unconfirmed native admission");
+          return prompt(input);
         };
-        expect(stored.bindings[0]?.status).toBe("active");
-        expect(stored.intents[0]?.intent.status).toBe("reserved");
-        await native.backend.deleteSession(native.task.workerID, {
-          sessionID: "coordinator",
-          agent: coordinatorDefinition.id,
-          messageID: "delete-message",
-          id: "delete-call",
-        });
-        const fenced = await native.backend.inspect();
-        expect(fenced.bindings[0]).toMatchObject({
-          status: "held",
-          epoch: stored.bindings[0]!.epoch + 1,
-        });
-        expect(fenced.intents[0]).toEqual({
-          ...stored.intents[0]!,
-          intent: { ...stored.intents[0]!.intent, status: "ambiguous" },
-        });
-        expect(removals).toBe(1);
+        const stored = await native.run();
+        expect(reserved).toBeDefined();
+        expect(stored.bindings[0]?.followups).toBe(1);
+        expect(stored.intents[0]?.intent.status).toBe(mode);
+        expect(native.calls()).toBe(2);
+        if (mode === "admitted") {
+          expect(native.sends).toHaveLength(1);
+          expect(stored.intents[0]?.intent.id).toBe(native.sends[0]?.id);
+        } else {
+          native.nativeHost.session.list = async () => ({
+            data: [],
+            cursor: {},
+          });
+          let removals = 0;
+          native.nativeHost.session.remove = async () => {
+            removals++;
+          };
+          await native.backend.deleteSession(native.task.workerID, {
+            ...native.identity,
+            id: "delete-call",
+          });
+          const fenced = await native.backend.inspect();
+          expect(fenced.bindings[0]?.status).toBe("held");
+          expect(fenced.intents[0]).toEqual(stored.intents[0]);
+          expect(removals).toBe(1);
+        }
+      } finally {
+        await native.cleanup();
       }
-      await native.cleanup();
     }
   });
   it("Preserves human approval requests", async () => {
@@ -1610,34 +1489,14 @@ describe("Native TUI-owned worker supervision", () => {
             return result;
           };
         }
-        const validation = await native.validate();
-        if (phase === "record") changeInput();
-        expect(validation.status).toBe(
-          phase === "validate" ? "unknown" : "accept",
-        );
-        await expect(
-          native.backend.control({
-            operation: "record",
-            taskID: native.task.id,
-            proof: native.signControl(
-              "record",
-              {
-                result: {
-                  status: "complete",
-                  reason: "Validated native criterion",
-                },
-                receiptID: validation.receiptID,
-                identity: native.identity,
-              },
-              native.task,
-            ),
-          }),
-        ).rejects.toThrow();
+        if (phase === "record") native.afterValidation(changeInput);
+        const state = await native.run();
+        expect(state.completions).toEqual([]);
         expect((await native.read()).snapshot).toEqual(snapshot);
         expect((await native.backend.inspect()).bindings[0]?.status).not.toBe(
           "complete",
         );
-        expect(native.calls()).toBe(2);
+        expect(native.calls()).toBe(phase === "validate" ? 1 : 2);
       } finally {
         await native.cleanup();
       }
@@ -1809,34 +1668,6 @@ describe("Native TUI-owned worker supervision", () => {
       { criterion: "API verified", evidenceID: "tool-7" },
     ]);
     expect(untagged.sends).toHaveLength(0);
-    if (process.env.BACKSEAT_NATIVE_HOST_TESTS === "1") {
-      const proof = await captureNativeCoordinator("complete");
-      expect(proof.error).toBeUndefined();
-      expect(proof.stage).toBe("done");
-      expect(
-        proof.requests.filter((request) => request.kind === "suggestion"),
-      ).toHaveLength(1);
-      expect(
-        proof.requests.filter((request) => request.kind === "validation"),
-      ).toHaveLength(1);
-      expect(proof.snapshot).toMatchObject({
-        bindings: [{ status: "complete", followups: 0 }],
-        completions: [
-          {
-            validation: {
-              status: "accept",
-              criteria: [
-                {
-                  evidence: [
-                    { state: "completed", callID: "owned-native-read" },
-                  ],
-                },
-              ],
-            },
-          },
-        ],
-      });
-    }
     const f = fixture();
     await ready(f);
     f.suggestion = {
@@ -1860,27 +1691,7 @@ describe("Native TUI-owned worker supervision", () => {
       expect(hash(native.messages.slice(0, hook.messageIDs.length))).toBe(
         hook.contextFingerprint,
       );
-      const validation = await native.validate();
-      expect(validation.status).toBe("accept");
-      expect(native.calls()).toBe(2);
-      const recorded = await native.backend.control({
-        operation: "record",
-        taskID: native.task.id,
-        proof: native.signControl(
-          "record",
-          {
-            result: {
-              status: "complete",
-              reason:
-                "Criteria independently rechecked against native evidence",
-            },
-            receiptID: validation.receiptID,
-            identity: native.identity,
-          },
-          native.task,
-        ),
-      });
-      expect(recorded.accepted).toBe(true);
+      const recorded = { snapshot: await native.run() };
       if (!recorded.snapshot)
         throw new Error(
           "Current eligible coordinator must receive the completion inventory",
@@ -1919,7 +1730,8 @@ describe("Native TUI-owned worker supervision", () => {
         snapshots: recorded.snapshot.snapshots,
         intents: recorded.snapshot.intents,
         completions: recorded.snapshot.completions,
-        observer: recorded.snapshot.observer,
+        supervision: recorded.snapshot.supervision,
+        sessionDeliveries: recorded.snapshot.sessionDeliveries,
       };
       expect(parseCoordinatorState(durable).completions).toEqual(
         recorded.snapshot.completions,
@@ -2012,41 +1824,66 @@ describe("Native TUI-owned worker supervision", () => {
           rationale: "Assistant claims success",
           criteria: [],
         });
-      const validation = await native.validate();
-      if (mode === "bad-ref" || mode === "missing")
-        expect(validation.status).toBe("unknown");
       if (mode === "stale")
-        await native.observer.event({
-          id: "new-work",
-          type: "session.execution.started",
-          created: 3,
-          durable: { aggregateID: "worker", seq: 1, version: 1 },
-          data: { sessionID: "worker" },
-        });
-      await expect(
-        native.backend.control({
-          operation: "record",
-          taskID: native.task.id,
-          proof: native.signControl(
+        native.afterValidation(() =>
+          native.observer.event({
+            id: "new-work",
+            type: "session.execution.started",
+            created: 3,
+            durable: { aggregateID: "worker", seq: 1, version: 1 },
+            data: { sessionID: "worker" },
+          }),
+        );
+      if (mode === "forged")
+        await expect(
+          native.backend.nativeControl(
             "record",
+            native.task.id,
             {
               result: { status: "complete", reason: "Claim" },
-              receiptID:
-                mode === "forged" ? "caller-invented" : validation.receiptID,
-              identity: native.identity,
+              receiptID: "caller-invented",
             },
-            native.task,
+            native.identity,
           ),
-        }),
-      ).rejects.toThrow();
+        ).rejects.toThrow();
+      else expect((await native.run()).completions).toEqual([]);
       expect((await native.backend.inspect()).bindings[0]?.status).not.toBe(
         "complete",
       );
-      expect(native.calls()).toBe(2);
+      expect(native.calls()).toBe(mode === "forged" ? 0 : 2);
       await native.cleanup();
     }
   });
   it("Disconnect stops future follow-ups", async () => {
+    const server = fixture();
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const suggest = server.port.suggest;
+    server.port.suggest = async (input) => {
+      entered();
+      await blocked;
+      return suggest(input);
+    };
+    const runtime = new ServerSupervision(server.port);
+    await runtime.start(1);
+    await runtime.rearm(1);
+    const old = runtime.wake("worker");
+    await started;
+    runtime.close();
+    server.port.suggest = suggest;
+    await runtime.start(1);
+    await runtime.rearm(1);
+    const next = runtime.wake("worker");
+    release();
+    await Promise.all([old, next]);
+    expect(server.sends).toHaveLength(1);
+    runtime.close();
     const f = fixture();
     await ready(f);
     f.onAdmit = () => f.supervisor.close();

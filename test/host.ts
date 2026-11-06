@@ -1,37 +1,24 @@
-import type { CreationHost, TaskGoal, WorkerBinding } from "../src/state.ts";
+import type {
+  CreationHost,
+  TaskGoal,
+  WorkerBinding,
+  WorkerSnapshot,
+} from "../src/state.ts";
 import {
   coordinatorAgent,
   type CoordinatorPermissionRule,
 } from "../src/coordinator-agent.ts";
-import { spawn, type ChildProcess } from "node:child_process";
-import {
-  mkdir,
-  mkdtemp,
-  readFile,
-  readlink,
-  rm,
-  watch,
-  writeFile,
-} from "node:fs/promises";
-import { join, resolve } from "node:path";
-import type { WorkerSnapshot } from "../src/state.ts";
-import { Rpc } from "@opencode/plugin/rpc";
-import { createServer } from "node:http";
 import type { NativeBackendHost } from "../src/server.ts";
-import { coordinationStatusDetails } from "../src/ui.ts";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { createServer } from "node:http";
 
 export const coordinatorDefinition = {
   ...coordinatorAgent,
   permissions: coordinatorAgent.permissions.map((rule) => ({ ...rule })),
   request: { settings: {}, headers: {}, body: {} },
 };
-
-function nativeExecutable() {
-  const executable = Bun.which("opencode");
-  if (!executable)
-    throw new Error("Native host tests require opencode on PATH");
-  return executable;
-}
 
 export const inheritedPolicy: CoordinatorPermissionRule[] = [
   { action: "question", resource: "*", effect: "allow" },
@@ -43,7 +30,6 @@ export const inheritedPolicy: CoordinatorPermissionRule[] = [
   { action: "browser", resource: "*", effect: "deny" },
 ];
 
-/** A scoped approval boundary, not an unconditional permission fake. */
 export function fixtureApproval(
   home: string,
   coordinatorID = "coordinator",
@@ -53,7 +39,7 @@ export function fixtureApproval(
       if (
         input.sessionID !== coordinatorID ||
         ![
-          "backseat.attach",
+          "backseat.start_supervision",
           "backseat.resume",
           "backseat.adopt",
           "backseat.create",
@@ -81,66 +67,21 @@ export interface NativeObservationProof {
   modelCalls: number;
 }
 
-const fixtureDefinition = Rpc.define({
-  id: "backseat.native-observation-fixture",
-  methods: {
-    proof: {
-      input: {
-        type: "object",
-        properties: { sessionID: { type: "string" } },
-        required: ["sessionID"],
-      },
-      output: { type: "object", additionalProperties: true },
-    },
-  },
-  events: {},
-});
-const fixtureRpc = `import { Rpc } from "@opencode/plugin/rpc"; export const FixtureRpc = Rpc.define(${JSON.stringify(fixtureDefinition)});`;
-
-const nativeModelProbe = (home: string, endpoint: string) => `
-import { Plugin } from "@opencode/plugin";
-import { realpath } from "node:fs/promises";
-import { appendFileSync } from "node:fs";
-import { FixtureRpc } from "./rpc.js";
-import { createWorkerObserver, workerObservationKeys } from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
-export default Plugin.define({id:"backseat",async setup(ctx){
-  const home=${JSON.stringify(home)}, abort=new AbortController(), completed=new Set(), waiters=new Map();
-  let modelCalls=0;
-  const trace=value=>appendFileSync(home+"/model-trace.jsonl",JSON.stringify(value)+"\\n");
-  const endpoint=${JSON.stringify(endpoint)};
-  await ctx.session.hook("title",event=>{event.result="Local native observation fixture"});
-  await ctx.session.hook("http.request",event=>{
-    trace({hook:"http.request",kind:event.kind,model:event.model,ownedURL:event.request.url===endpoint,method:event.request.method});
-    if(event.model.providerID!=="backseat-fixture"||event.model.id!=="local"||event.kind!=="primary"||
-      event.request.url!==endpoint||event.request.method!=="POST")
-      throw new Error("External model HTTP is forbidden in the local fixture");
-    event.request=new Request(endpoint,{method:"POST",headers:{"content-type":"application/json"},
-      body:event.request.body,signal:event.request.signal,redirect:"error",duplex:"half"});
-    modelCalls++;
-  });
-  await ctx.session.hook("experimental.ws.handshake",()=>{throw new Error("Model WebSocket is forbidden in the local fixture")});
-  const observer=await createWorkerObserver({session:ctx.session,storage:ctx.storage,canonical:realpath,plugin:ctx.plugin},home,home);
-  await ctx.session.hook("experimental.idle",event=>observer.idle(event));
-  await ctx.rpc.register(FixtureRpc,{proof:async({sessionID})=>{
-    if(!completed.has(sessionID))await new Promise(resolve=>waiters.set(sessionID,resolve));
-    const keys=workerObservationKeys(home,home,sessionID);
-    return {snapshot:await ctx.storage.get(keys.snapshot),invalidation:(await ctx.storage.get(keys.invalidation))??0,
-      registry:await ctx.storage.get(keys.observer),runtime:{app:ctx.app.version,bun:Bun.version},modelCalls};
-  }});
-  void(async()=>{try{for await(const event of ctx.event.subscribe({signal:abort.signal})){
-    if(event.type.startsWith("session."))trace({event:event.type});
-    await observer.event(event);
-    if(event.type==="session.execution.succeeded"){
-      completed.add(event.data.sessionID);waiters.get(event.data.sessionID)?.();waiters.delete(event.data.sessionID);
-    }
-  }}catch(error){if(!abort.signal.aborted)process.stderr.write(JSON.stringify({service:"native-fixture",message:String(error)})+"\\n")}})();
-  return async()=>{abort.abort();await observer.dispose()};
-}});
-`;
-
-async function localModelServer() {
-  // @opencode/ai 2.2.5 openai-compatible-chat reuses OpenAIChat.protocol:
-  // choices[].delta.content, finish_reason, usage, then the SSE [DONE] sentinel.
+export async function captureNativeObservation(): Promise<{
+  observation: NativeObservationProof;
+  hostLog: string;
+}> {
+  const executable = Bun.which("opencode");
+  if (!executable)
+    throw new Error("Native host tests require opencode on PATH");
+  const root = resolve(
+    import.meta.dir,
+    "../.opencode/backseat/native-fixtures",
+  );
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const home = await mkdtemp(join(root, "observation-"));
+  const probe = join(home, "probe");
+  await mkdir(probe, { mode: 0o700 });
   const stream =
     [
       {
@@ -158,7 +99,7 @@ async function localModelServer() {
     ]
       .map((event) => `data: ${JSON.stringify(event)}\n\n`)
       .join("") + "data: [DONE]\n\n";
-  const server = createServer((request, response) => {
+  const model = createServer((request, response) => {
     request.resume();
     if (
       request.method !== "POST" ||
@@ -173,1217 +114,125 @@ async function localModelServer() {
       .end(stream);
   });
   await new Promise<void>((ready, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.removeListener("error", reject);
+    model.once("error", reject);
+    model.listen(0, "127.0.0.1", () => {
+      model.removeListener("error", reject);
       ready();
     });
   });
-  const address = server.address();
+  const address = model.address();
   if (!address || typeof address === "string")
     throw new Error("Native fixture has no owned loopback address");
-  return {
-    endpoint: `http://127.0.0.1:${address.port}/chat/completions`,
-    async close() {
-      server.closeAllConnections();
-      await new Promise<void>((closed, reject) =>
-        server.close((error) => (error ? reject(error) : closed())),
-      );
-    },
-  };
-}
-
-export interface NativeCoordinatorProof {
-  stage: string;
-  error?: string;
-  home: string;
-  workerHome: string;
-  runtime: { app: string; bun: string };
-  workerBootstrap?: unknown;
-  denied?: boolean;
-  observation?: unknown;
-  snapshot?: unknown;
-  validation?: unknown;
-  admission?: unknown;
-  coordinatorTools?: Array<{ name: string; status: string }>;
-  policyApproved?: boolean;
-  guardErrors?: Array<{ name: string; message: string }>;
-  nestedResult?: {
-    status: string;
-    content: Array<{ type: string; text?: string }>;
-    metadata: {
-      error: boolean;
-      toolCalls: Array<{ tool: string; status: string }>;
-    };
-  };
-  forbiddenDispatched?: boolean;
-  requests: Array<{ kind: string; tools?: string[] }>;
-}
-
-// Product server owns observation, RPC, permissions, validation and persistence.
-// The fixture confines transport and injects declarations to exercise its guard.
-const nativeFlowGuard = (home: string, endpoint: string, policy: boolean) => `
+  const endpoint = `http://127.0.0.1:${address.port}/chat/completions`;
+  let hostLog = "";
+  try {
+    await writeFile(
+      join(probe, "package.json"),
+      JSON.stringify({ type: "module", exports: { ".": "./server.js" } }),
+    );
+    await writeFile(
+      join(probe, "server.js"),
+      `
 import { Plugin } from "@opencode/plugin";
-import { appendFileSync } from "node:fs";
-export default Plugin.define({id:"backseat.native-flow-driver",async setup(ctx){
-  const endpoint=${JSON.stringify(endpoint)},home=${JSON.stringify(home)};
-  await ctx.session.hook("title",event=>{event.result="Owned coordinator flow"});
-  if(${JSON.stringify(policy)}){
-    const probe={description:"Owned forbidden execution probe",input:{type:"object",properties:{}}};
-    await ctx.tool.transform(editor=>{
-      for(const [name,codemode] of [["policy_probe",false],["nested_probe",true]])
-        editor.add({name,...probe,options:codemode?{namespace:"policy",codemode:true,permission:"backseat_list_sessions"}:{codemode:false},async execute(){appendFileSync(home+"/policy-probe-dispatched","executed");return "Forbidden body executed";}});
-    });
-    // Re-expose declarations only in owned fault-injection turns so rejection
-    // must come from the independent native execution hook, not catalog removal.
-    await ctx.session.hook("context",event=>{
-      if(event.agent!=="backseat-coordinator")return;
-      const user=event.messages.findLast(message=>message.role==="user");
-      const text=JSON.stringify(user?.content);
-      if(text?.includes("Probe the ordinary execution guard"))event.tools.policy_probe=probe;
-      if(text?.includes("Probe the Code Mode execution guard"))event.tools.execute={description:"Owned Code Mode probe",input:{type:"object",properties:{code:{type:"string"}},required:["code"]}};
-    });
-  }
+import { realpath, writeFile } from "node:fs/promises";
+import { createWorkerObserver, workerObservationKeys } from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
+export default Plugin.define({id:"backseat",async setup(ctx){
+  const home=${JSON.stringify(home)},endpoint=${JSON.stringify(endpoint)},abort=new AbortController();
+  let modelCalls=0,writing=Promise.resolve();
+  await ctx.session.hook("title",event=>{event.result="Local native observation fixture"});
   await ctx.session.hook("http.request",event=>{
-    if(event.model.providerID!=="backseat-fixture"||event.model.id!=="local"||
-      !["primary","generate"].includes(event.kind)||event.request.url!==endpoint||event.request.method!=="POST")
-      throw new Error("Unowned model route is forbidden");
-    appendFileSync(home+"/flow-route.jsonl",JSON.stringify({kind:event.kind})+"\\n");
-    event.request=new Request(endpoint,{method:"POST",headers:{"content-type":"application/json"},
-      body:event.request.body,signal:event.request.signal,redirect:"error",duplex:"half"});
+    if(event.model.providerID!=="backseat-fixture"||event.model.id!=="local"||event.kind!=="primary"||event.request.url!==endpoint||event.request.method!=="POST")throw new Error("Unowned model route is forbidden");
+    event.request=new Request(endpoint,{method:"POST",headers:{"content-type":"application/json"},body:event.request.body,signal:event.request.signal,redirect:"error",duplex:"half"});
+    modelCalls++;
   });
   await ctx.session.hook("experimental.ws.handshake",()=>{throw new Error("Model WebSocket is forbidden")});
+  const observer=await createWorkerObserver({session:ctx.session,storage:ctx.storage,canonical:realpath,plugin:ctx.plugin},home,home);
+  await ctx.session.hook("experimental.idle",event=>observer.idle(event));
+  void(async()=>{try{for await(const event of ctx.event.subscribe({signal:abort.signal})){
+    await observer.event(event);
+    if(event.type==="session.execution.succeeded"||event.type==="session.idle"){
+      const sessionID=event.data.sessionID,keys=workerObservationKeys(home,home,sessionID);
+      writing=writing.then(async()=>{const snapshot=await ctx.storage.get(keys.snapshot);if(snapshot)await writeFile(home+"/proof.json",JSON.stringify({snapshot,invalidation:(await ctx.storage.get(keys.invalidation))??0,registry:await ctx.storage.get(keys.observer),runtime:{app:ctx.app.version,bun:Bun.version},modelCalls}))});
+      await writing;
+    }
+  }}catch(error){if(!abort.signal.aborted)process.stderr.write(JSON.stringify({service:"native-fixture",message:"Observation fixture failed",errorClass:error?.constructor?.name})+"\\n")}})();
+  return async()=>{abort.abort();await writing;await observer.dispose()};
 }});
-`;
-
-const nativeFlowDriver = (options: Record<string, unknown>) => `
-import { Plugin } from "@opencode/plugin/tui";
-import { writeFileSync, existsSync } from "node:fs";
-import { BackseatRpc, reasoningPayload } from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
-import { createObserverCapability } from ${JSON.stringify(new URL("../src/ownership.ts", import.meta.url).href)};
-import { readNativeObservation } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
-import { decisionIdentity, fingerprint } from ${JSON.stringify(new URL("../src/context.ts", import.meta.url).href)};
-import { followupText } from ${JSON.stringify(new URL("../src/dispatch.ts", import.meta.url).href)};
-export default Plugin.define({id:"backseat.native-flow-driver",setup(ctx){
-  const o=${JSON.stringify(options)},signal=AbortSignal.timeout(20000),client=ctx.client,rpc=client.rpc(BackseatRpc);
-   const proof={stage:"bootstrap",home:o.home,workerHome:o.workerHome,runtime:{app:ctx.app.version,bun:Bun.version},requests:[]};
-   const errorMessage=error=>error?.message??error?.reason??error?.data?.message??String(error);
-  writeFileSync(o.pid,JSON.stringify({pid:process.pid}));
-  const record=stage=>{proof.stage=stage;writeFileSync(o.proof,JSON.stringify(proof))};
-  let expected,terminal,sequence=0,generation,binding;
-  const remove=ctx.data.listen(({details:event})=>{
-    if(event.type==="permission.asked"){
-      const pending=expected;
-      if(!pending||(event.location&&event.location.directory!==o.home)||event.data.sessionID!==pending.sessionID||
-        event.data.action!==pending.action||JSON.stringify(event.data.resources)!==JSON.stringify(pending.resources)){
-        proof.unexpectedAsk={location:event.location,sessionID:event.data.sessionID,action:event.data.action,resources:event.data.resources,
-          expected:pending?{sessionID:pending.sessionID,action:pending.action,resources:pending.resources}:undefined};
-        proof.error="Unexpected native permission request; no reply issued";record("unexpected-ask");return;
-      }
-      expected=undefined;
-      void(async()=>{try{
-        const inventory=await client.permission.request.list({location:{directory:o.home}},{signal});
-        const session=await client.session.get({sessionID:pending.sessionID},{signal});
-        if(session.location.directory!==o.home||session.id!==pending.sessionID||session.time.archived)throw new Error("Permission coordinator left owned home");
-         if(inventory.location.directory!==o.home||!inventory.data.some(r=>r.id===event.data.id&&r.sessionID===pending.sessionID&&r.action===pending.action&&JSON.stringify(r.resources)===JSON.stringify(pending.resources)))
-           throw new Error("Permission request not confirmed in owned inventory");
-         await pending.verify?.();
-         pending.asked=true;
-        await client.permission.reply({sessionID:pending.sessionID,requestID:event.data.id,decision:pending.decision},{signal});
-       }catch(error){proof.error=errorMessage(error);record("permission-reply-failed")}})();
-    }
-    if(event.type==="session.execution.succeeded"&&terminal?.sessionID===event.data.sessionID){terminal.resolve();terminal=undefined;}
-  });
-  const run=async(sessionID,text,id)=>{
-    const completed=new Promise((resolve,reject)=>{terminal={sessionID,resolve};signal.addEventListener("abort",()=>reject(new Error("Native terminal event unavailable")),{once:true})});
-    const admitted=await client.session.prompt({sessionID,text,resume:true,...(id?{id}: {})},{signal});
-    await completed;return admitted;
-  };
-  const history=async sessionID=>{
-    let page=await client.message.list({sessionID,order:"asc",limit:200},{signal});
-    const messages=[],cursors=new Set();
-    for(;;){
-      messages.push(...page.data);if(messages.length>200)throw new Error("Owned history exceeds fixture bound");
-      const cursor=page.cursor.next;if(!cursor)break;
-      if(cursors.has(cursor))throw new Error("Owned history cursor repeated");cursors.add(cursor);
-      page=await client.message.list({sessionID,limit:200,cursor},{signal});
-    }
-    return messages;
-  };
-  queueMicrotask(async()=>{try{
-     proof.workerBootstrap=await rpc.bootstrap({},{location:{directory:o.workerHome},signal});
-     if(proof.workerBootstrap.dataDir!==o.dataDir||Object.keys(proof.workerBootstrap).some(key=>!["dataDir","authority","reason"].includes(key)))throw new Error("Worker bootstrap disclosed unexpected authority state");
-    const agents=await client.agent.list({location:{directory:o.workerHome}},{signal});
-    if(!agents.data.some(value=>value.id==="backseat-coordinator"&&value.mode==="primary"&&!value.hidden))throw new Error("Bundled coordinator unavailable in second enabled project");
-    const agent=agents.data.find(a=>!a.hidden&&a.mode!=="subagent");
-    if(agents.location.directory!==o.workerHome||!agent)throw new Error("Native target agent unavailable");
-    const coordinators=await client.agent.list({location:{directory:o.home}},{signal});
-    const role=coordinators.data.find(a=>a.id==="backseat-coordinator");
-    if(coordinators.location.directory!==o.home||!role)throw new Error("Bundled coordinator unavailable at owned home");
-    const coordinator=await client.session.create({title:"Owned coordinator",agent:role.id,location:{directory:o.home}},{signal});
-    const worker=await client.session.create({title:"Owned worker",agent:agent.id,location:{directory:o.workerHome}},{signal});
-    const capability=createObserverCapability();
-    const attachRequest={coordinatorID:coordinator.id,verifier:capability.verifier};
-     const scopedResource=value=>JSON.stringify([o.dataDir,o.home,coordinator.id,JSON.stringify(value)]);
-     const observerScope={dataDir:o.dataDir,coordinatorLocation:o.home};
-     const resources=[scopedResource([o.dataDir,coordinator.id,capability.verifier,1])];
-    record("attach-denial");
-    const denied={sessionID:coordinator.id,action:"backseat.attach",resources,decision:"reject"};expected=denied;
-    let denialError;
-    try{await rpc.attach(attachRequest,{location:{directory:o.home},signal})}catch(error){denialError=error;}
-    if(!denied.asked||!denialError)throw new Error("Native denial did not reject attach");
-    const afterDenial=await rpc.bootstrap({},{location:{directory:o.home},signal});
-    if(Object.keys(afterDenial).some(key=>!["dataDir","authority","reason"].includes(key)))throw new Error("Bootstrap disclosed observer authority");
-    let unsignedRead;
-    try {await rpc.inspect({},{location:{directory:o.home},signal}); unsignedRead=true;} catch {unsignedRead=false;}
-     if(unsignedRead)throw new Error("Unsigned inventory read was accepted");
-     let unapprovedError;
-     try {await rpc.inspect({proof:capability.sign(1,1,{operation:"inspect",taskID:coordinator.id,revision:0,epoch:0},observerScope)},{location:{directory:o.home},signal});} catch(error) {unapprovedError=error;}
-     // Native RPC hides internal exception text; a schema-valid proof must reach the server rejection boundary.
-     if(unapprovedError?.type!=="rpc.internal"||unapprovedError.message!=="RPC call failed")throw new Error("Denied capability was not rejected by the server");
-    proof.denied=true;
-    record("attach-approval");
-    const approved={sessionID:coordinator.id,action:"backseat.attach",resources,decision:"once"};expected=approved;
-    generation=(await rpc.attach(attachRequest,{location:{directory:o.home},signal})).generation;
-    if(!approved.asked)throw new Error("Attach bypassed scripted native approval");
-     const inspect=()=>rpc.inspect({proof:capability.sign(generation,++sequence,{operation:"inspect",taskID:coordinator.id,revision:0,epoch:0},observerScope)},{location:{directory:o.workerHome},signal});
-    const observe=()=>rpc.observe({taskID:goal.id,workerID:worker.id,proof:capability.sign(generation,++sequence,{operation:"observe",taskID:goal.id,revision:binding.revision,epoch:binding.epoch,body:{workerID:worker.id}},observerScope)},{location:{directory:o.home},signal});
-    const goal={id:"owned-seed-task",title:"Inspect owned seed",goal:"Read the owned seed file",criteria:["Owned seed contents inspected by native read"],
-      constraints:["Read only the owned seed file; no external requests"],scope:[o.seed],location:o.workerHome,agent:agent.id};
-    const control=async(operation,body,zero=false)=>rpc.control({operation,taskID:goal.id,proof:capability.sign(generation,++sequence,
-       {operation,taskID:goal.id,revision:zero?0:binding.revision,epoch:zero?0:binding.epoch,body},observerScope)},{location:{directory:o.home},signal});
-    record("adopt");
-     const adoption={sessionID:coordinator.id,action:"backseat.adopt",resources:[scopedResource([o.dataDir,goal,worker.id])],decision:"once"};expected=adoption;
-    const adopted=await control("adopt",{goal,workerID:worker.id},true);
-    binding=adopted.snapshot.bindings[0];
-     if(!adoption.asked||!adopted.accepted||binding.workerID!==worker.id||binding.location!==o.workerHome)throw new Error("Approved native adoption did not bind owned worker");
-     const shared=await inspect();
-      if(shared.dataDir!==o.dataDir||JSON.stringify(shared.bindings[0])!==JSON.stringify(binding))throw new Error("Projects did not share the approved store");
-     if(o.action==="policy"){
-        record("coordinator-list");await run(coordinator.id,"List the coordinated tasks through Code Mode.");
-       record("coordinator-hold");
-       const holding={sessionID:coordinator.id,action:"backseat.hold",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,{}])],decision:"once"};expected=holding;
-        await run(coordinator.id,"Hold only owned-seed-task through Code Mode.");
-       proof.policyApproved=holding.asked===true;
-       record("ordinary-guard");await run(coordinator.id,"Probe the ordinary execution guard.");
-       record("codemode-guard");await run(coordinator.id,"Probe the Code Mode execution guard.");
-       const calls=(await history(coordinator.id)).flatMap(message=>message.type==="assistant"?message.content.filter(part=>part.type==="tool"):[]);
-        proof.coordinatorTools=calls.map(part=>({name:part.name,status:part.state.status}));
-        proof.nestedResult=calls.find(part=>part.name==="execute"&&part.state.input.code==="await tools.policy.nested_probe({})")?.state;
-        proof.guardErrors=calls.filter(part=>part.state.status==="error").map(part=>({name:part.name,message:part.state.error.message}));
-       proof.forbiddenDispatched=existsSync(o.home+"/policy-probe-dispatched");
-       proof.snapshot=await inspect();record("done");return;
-     }
-    record("worker-read");await run(worker.id,"Read only this owned seed file: "+o.seed);
-    record("observe");
-      let observed=await observe();
-    if(!observed.snapshot)throw new Error("Product worker observation unavailable: "+observed.reason);
-     proof.workerSnapshot=observed.snapshot;
-    const page=await client.message.list({sessionID:worker.id,limit:200,order:"asc"},{signal});
-    proof.historyMetadata={count:page.data.length,hasNext:!!page.cursor.next,hasPrevious:!!page.cursor.previous,types:page.data.map(message=>message.type),
-      tools:page.data.flatMap(message=>message.type==="assistant"?message.content.filter(part=>part.type==="tool").map(part=>({messageID:message.id,callID:part.id,name:part.name,status:part.state.status,executed:part.executed,time:part.time,input:part.state.input,result:part.state.content})):[])};
-    let observation;
-    try{observation=await readNativeObservation(client,binding,[],signal,observed.snapshot)}catch(error){
-      if(String(error).includes("Cursor cannot be combined with order")&&page.cursor.next){
-        const continuation=await client.message.list({sessionID:worker.id,limit:200,cursor:page.cursor.next},{signal});
-        proof.historyMetadata.continuationWithoutOrder={count:continuation.data.length,hasNext:!!continuation.cursor.next,types:continuation.data.map(message=>message.type)};
-      }
-      throw error;
-    }
-    proof.observation=observation;
-    if(observation.state!=="settled"||observation.asks.length){
-      const replay=[];
-      for await(const event of client.experimental.session.log({sessionID:worker.id,follow:false},{signal})){
-        if(replay.length>=1000)throw new Error("Diagnostic replay exceeds bound");
-        replay.push({type:event.type,seq:event.durable?.seq,sessionID:event.data?.sessionID,assistantMessageID:event.data?.assistantMessageID,keys:Object.keys(event)});
-      }
-      proof.replay=replay;
-      const replayFromZero=[];
-      for await(const event of client.experimental.session.log({sessionID:worker.id,after:0,follow:false},{signal})){
-        if(replayFromZero.length>=1000)throw new Error("Diagnostic zero-cursor replay exceeds bound");
-        replayFromZero.push({type:event.type,seq:event.durable?.seq,sessionID:event.data?.sessionID,assistantMessageID:event.data?.assistantMessageID,keys:Object.keys(event)});
-      }
-      proof.replayFromZero=replayFromZero;
-      throw new Error("Native full-client correlation did not settle: "+observation.state);
-     }
-     record("resume");
-     const reconciliation={generation,workerID:worker.id,revision:binding.revision,epoch:binding.epoch,
-       snapshotFingerprint:fingerprint(observed.snapshot),observedAt:Date.now(),state:observation.state,asks:[...observation.asks]};
-     const resumeBody={reconciliation};
-     const verifyResume=async()=>{
-       // Do not recursively enter serialized coordinator RPC during its native
-       // ask. Full native client reads remain live; the server checks its fresh
-       // worker snapshot/context again after this actual permission reply.
-       const read=await readNativeObservation(client,binding,[],signal,observed.snapshot);
-       if(read.state!=="settled"||read.asks.length||fingerprint(observed.snapshot)!==reconciliation.snapshotFingerprint||fingerprint(read.context)!==fingerprint(observation.context))
-         throw new Error("Resume native reconciliation changed around approval");
-     };
-     await verifyResume();
-       const resume={sessionID:coordinator.id,action:"backseat.resume",resources:[scopedResource([o.dataDir,binding.id,binding.revision,binding.epoch,resumeBody])],decision:"once",verify:verifyResume};expected=resume;
-     const resumed=await control("resume",resumeBody,false);
-    if(!resume.asked||!resumed.accepted)throw new Error("Native resume was not explicitly approved");
-     binding=resumed.snapshot.bindings[0];
-      observed=await observe();
-     observation=await readNativeObservation(client,binding,[],signal,observed.snapshot);
-     if(observation.state!=="settled"||observation.asks.length||fingerprint(observed.snapshot)!==reconciliation.snapshotFingerprint)throw new Error("Native resume eligibility changed");
-    const entries=observation.context.evidence;
-    if(!entries.some(e=>e.kind==="tool"&&e.native?.state==="completed"&&JSON.stringify(e.input).includes(o.seed)&&JSON.stringify(e.result).includes(o.seedContent))){
-      // Failure-only diagnostics; never synchronize the product observer or
-      // substitute this read for the correlation/provenance gates above.
-      proof.nativeProjection=await client.session.get({sessionID:worker.id},{signal});
-      throw new Error("No current completed native read inputs/results support owned seed criterion");
-    }
-    const evidence={taskID:goal.id,workerID:worker.id,turn:observation.turn,entries};
-    record("suggest");
-     const suggestInput={taskID:goal.id,revision:binding.revision,epoch:binding.epoch,generation,evidence};
-      const issued=await rpc.suggest({...suggestInput,proof:capability.sign(generation,++sequence,reasoningPayload("suggest",suggestInput),observerScope)},{location:{directory:o.home},signal});
-    if(!issued.suggestion||issued.suggestion.action!==o.action)throw new Error("Product did not issue expected task-only suggestion: "+issued.reason);
-    const identity=decisionIdentity(binding,generation,evidence,observed.snapshot,issued.suggestion);
-     const validateInput={generation,identity,evidence,suggestion:issued.suggestion};
-      record("validate");proof.validation=await rpc.validate({...validateInput,proof:capability.sign(generation,++sequence,reasoningPayload("validate",validateInput),observerScope)},{location:{directory:o.home},signal});
-    if(proof.validation.status!=="accept"){
-       proof.validationState=await inspect();
-       proof.validationObserved=await observe();
-      proof.validationIdentity=identity;
-      throw new Error("Product validation did not accept inspected evidence: "+proof.validation.rationale);
-    }
-    if(o.action==="continue"){
-      const intent={id:"msg_owned-original-followup",taskID:goal.id,workerID:worker.id,identity:fingerprint(identity),text:followupText(binding,issued.suggestion.nextStep),nonprogress:0,status:"reserved"};
-      record("reserve");const reserved=await control("reserve",{intent,decisionAt:Date.now(),receiptID:proof.validation.receiptID,identity});
-      if(!reserved.accepted||reserved.snapshot.bindings[0].followups!==1)throw new Error("Follow-up was not durably reserved exactly once");
-      const stored=reserved.snapshot.intents[0].intent;
-       record("follow-up");proof.admission=await run(worker.id,stored.text,stored.id);
-       if(proof.admission.id!==stored.id)throw new Error("Native prompt changed persisted original ID");
-        const deliveryFound=(await history(worker.id)).some(message=>message.type==="user"&&message.id===stored.id);
-       if(!deliveryFound)throw new Error("Original persisted prompt ID absent from native delivered user history");
-       proof.deliveryIdentity={sessionID:worker.id,callerID:stored.id,deliveredUserID:stored.id};
-      proof.snapshot=(await control("finish",{intentID:stored.id,status:"admitted"})).snapshot;
-    }else{
-      record("record-completion");proof.snapshot=(await control("record",{result:{status:"complete",reason:"Current native read inputs and results independently inspected"},receiptID:proof.validation.receiptID,identity})).snapshot;
-    }
-    record("done");
-   }catch(error){proof.error??=errorMessage(error);proof.stack=error?.stack;
-     proof.failure={type:error?.type,tag:error?._tag,name:error?.name,code:error?.code,message:error?.message,reason:error?.reason};
-     record(proof.stage)}finally{remove()}});
-  return remove;
-}});
-`;
-
-export async function captureNativeCoordinator(
-  action: "continue" | "complete" | "policy",
-): Promise<NativeCoordinatorProof> {
-  const executable = nativeExecutable();
-  const root = resolve(
-    import.meta.dir,
-    "../.opencode/backseat/native-fixtures",
-  );
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  const fixture = await mkdtemp(join(root, "flow-"));
-  const home = join(fixture, "coordinator"),
-    workerHome = join(fixture, "worker"),
-    probe = join(home, "probe");
-  await mkdir(home, { mode: 0o700 });
-  await mkdir(workerHome, { mode: 0o700 });
-  await mkdir(probe, { mode: 0o700 });
-  const seed = join(workerHome, "owned-seed.txt"),
-    seedContent = "Owned fixture seed: native read evidence";
-  await writeFile(seed, seedContent);
-  const requests: NativeCoordinatorProof["requests"] = [];
-  let reads = 0;
-  const coordinatorCalls = new Set<string>();
-  const server = createServer(async (request, response) => {
-    try {
-      if (
-        request.method !== "POST" ||
-        request.url !== "/chat/completions" ||
-        request.headers.authorization
-      ) {
-        response.writeHead(403).end();
-        return;
-      }
-      let body = "";
-      for await (const chunk of request) {
-        body += String(chunk);
-        if (body.length > 200000)
-          throw new Error("Owned model request exceeds bound");
-      }
-      const input = JSON.parse(body) as {
-        messages: Array<{ content?: unknown; role: string }>;
-        tools?: Array<{
-          type: string;
-          function?: {
-            name: string;
-            description: string;
-            parameters: {
-              properties?: Record<
-                string,
-                { type?: string; description?: string }
-              >;
-              required?: string[];
-            };
-          };
-        }>;
-      };
-      const prompt = input.messages
-        .map((message) =>
-          typeof message.content === "string"
-            ? message.content
-            : JSON.stringify(message.content),
-        )
-        .join("\n");
-      let delta: unknown,
-        finish = "stop";
-      if (prompt.includes("Return ONLY strict JSON")) {
-        requests.push({ kind: "validation" });
-        const data = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1)) as {
-          context: {
-            evidence: Array<{
-              native?: unknown;
-              input?: unknown;
-              result?: unknown;
-            }>;
-          };
-        };
-        const entry = data.context.evidence.find(
-          (e) =>
-            e.native &&
-            JSON.stringify(e.input).includes(seed) &&
-            JSON.stringify(e.result).includes(seedContent),
-        );
-        const judgment = entry
-          ? {
-              status: "accept",
-              rationale:
-                "The actual completed native read inspected the owned seed only.",
-              ...(action === "complete"
-                ? {
-                    criteria: [
-                      {
-                        criterion:
-                          "Owned seed contents inspected by native read",
-                        status: "accept",
-                        rationale:
-                          "Native read input identifies owned seed and result includes exact seed contents.",
-                        evidence: [entry.native],
-                      },
-                    ],
-                  }
-                : {}),
-            }
-          : {
-              status: "unknown",
-              rationale: "No inspected current read supports this judgment.",
-            };
-        delta = { content: JSON.stringify(judgment) };
-      } else if (prompt.includes("Return only a JSON suggestion")) {
-        requests.push({ kind: "suggestion" });
-        const context = JSON.parse(
-          prompt.slice(prompt.lastIndexOf("\n") + 1),
-        ) as {
-          task: { id: string; workerID: string; scope: string[] };
-          evidence: Array<{
-            id: string;
-            native?: unknown;
-            input?: unknown;
-            result?: unknown;
-          }>;
-        };
-        const entry = context.evidence.find(
-          (e) =>
-            e.native &&
-            JSON.stringify(e.input).includes(seed) &&
-            JSON.stringify(e.result).includes(seedContent),
-        );
-        if (!entry)
-          throw new Error("Suggestion has no inspectable owned native read");
-        delta = {
-          content: JSON.stringify({
-            taskID: context.task.id,
-            workerID: context.task.workerID,
-            action,
-            ...(action === "complete"
-              ? {
-                  support: [
-                    {
-                      criterion: "Owned seed contents inspected by native read",
-                      evidenceID: entry.id,
-                    },
-                  ],
-                }
-              : {
-                  nextStep: "Read the owned seed file again: " + seed,
-                  scope: context.task.scope,
-                  progress: true,
-                }),
-          }),
-        };
-      } else if (action === "policy") {
-        const tools =
-          input.tools?.flatMap((tool) =>
-            tool.function ? [tool.function.name] : [],
-          ) ?? [];
-        const user = JSON.stringify(
-          input.messages.findLast((message) => message.role === "user")
-            ?.content,
-        );
-        const operation = user?.includes("Probe the ordinary execution guard")
-          ? "ordinary"
-          : user?.includes("Probe the Code Mode execution guard")
-            ? "nested"
-            : user?.includes("Hold only owned-seed-task")
-              ? "hold"
-              : "list";
-        const name = operation === "ordinary" ? "policy_probe" : "execute";
-        if (
-          tools.length !== (operation === "ordinary" ? 3 : 2) ||
-          ![
-            "execute",
-            "question",
-            ...(operation === "ordinary" ? [name] : []),
-          ].every((name) => tools.includes(name))
-        )
-          throw new Error(
-            "Merged-policy coordinator exposed an unexpected tool catalog",
-          );
-        requests.push({ kind: `coordinator-${operation}`, tools });
-        if (coordinatorCalls.has(operation))
-          delta = { content: "Owned coordinator operation finished." };
-        else {
-          coordinatorCalls.add(operation);
-          delta = {
-            tool_calls: [
-              {
-                index: 0,
-                id: `owned-${name}`,
-                type: "function",
-                function: {
-                  name,
-                  arguments: JSON.stringify(
-                    operation === "ordinary"
-                      ? {}
-                      : {
-                          code:
-                            operation === "nested"
-                              ? "await tools.policy.nested_probe({})"
-                              : operation === "hold"
-                                ? 'return await tools.backseat.hold_task({taskID:"owned-seed-task"})'
-                                : "return await tools.backseat.list_tasks({})",
-                        },
-                  ),
-                },
-              },
-            ],
-          };
-          finish = "tool_calls";
-        }
-      } else if (reads === 0) {
-        const tools =
-          input.tools?.flatMap((tool) =>
-            tool.function ? [tool.function] : [],
-          ) ?? [];
-        requests.push({
-          kind: "worker-read",
-          tools: tools.map((tool) => tool.name),
-        });
-        const tool = tools.find(
-          (tool) => /read/i.test(tool.name) && /file/i.test(tool.description),
-        );
-        const properties = tool?.parameters.properties ?? {};
-        const path = Object.entries(properties).find(
-          ([key, value]) => value.type === "string" && /path/i.test(key),
-        );
-        if (
-          !tool ||
-          !path ||
-          tool.parameters.required?.some((key) => key !== path[0])
-        )
-          throw new Error(
-            "Actual native catalog has no supported file-read schema",
-          );
-        reads++;
-        delta = {
-          tool_calls: [
-            {
-              index: 0,
-              id: "owned-native-read",
-              type: "function",
-              function: {
-                name: tool.name,
-                arguments: JSON.stringify({ [path[0]]: seed }),
-              },
-            },
-          ],
-        };
-        finish = "tool_calls";
-      } else {
-        requests.push({ kind: "worker-finish" });
-        delta = { content: "Owned native read finished." };
-      }
-      const events = [
-        { choices: [{ delta, finish_reason: null }] },
-        {
-          choices: [{ delta: {}, finish_reason: finish }],
-          usage: {
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            total_tokens: 2,
-          },
-        },
-      ];
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(
-        events.map((value) => `data: ${JSON.stringify(value)}\n\n`).join("") +
-          "data: [DONE]\n\n",
-      );
-    } catch (error) {
-      requests.push({ kind: `error:${String(error)}` });
-      response.writeHead(500).end();
-    }
-  });
-  await new Promise<void>((ready, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.removeListener("error", reject);
-      ready();
-    });
-  });
-  const address = server.address();
-  if (!address || typeof address === "string")
-    throw new Error("Owned flow listener unavailable");
-  const endpoint = `http://127.0.0.1:${address.port}/chat/completions`;
-  let stopped = true;
-  try {
-    const proofPath = join(home, "flow-proof.json"),
-      pidPath = join(home, "flow-pid.json");
-    await writeFile(
-      join(probe, "package.json"),
-      JSON.stringify({
-        type: "module",
-        exports: { ".": "./server.js", "./tui": "./tui.js" },
-      }),
-    );
-    await writeFile(
-      join(probe, "server.js"),
-      nativeFlowGuard(home, endpoint, action === "policy"),
-    );
-    await writeFile(
-      join(probe, "tui.js"),
-      nativeFlowDriver({
-        action,
-        home,
-        dataDir: join(home, "backseat-state"),
-        workerHome,
-        seed,
-        seedContent,
-        proof: proofPath,
-        pid: pidPath,
-      }),
-    );
-    const config = {
-      model: "backseat-fixture/local",
-      permissions: [
-        ...inheritedPolicy,
-        ...(action === "policy"
-          ? [{ action: "policy_probe", resource: "*", effect: "allow" }]
-          : []),
-      ],
-      providers: {
-        "backseat-fixture": {
-          package: "@opencode/ai/providers/openai-compatible",
-          env: [],
-          settings: { baseURL: endpoint.replace(/\/chat\/completions$/, "") },
-          models: { local: {} },
-        },
-      },
-      plugins: [
-        {
-          package: resolve(import.meta.dir, ".."),
-          options: { dataDir: join(home, "backseat-state") },
-        },
-        { package: probe },
-      ],
-    };
-    await writeFile(join(home, "opencode.json"), JSON.stringify(config));
-    await writeFile(join(workerHome, "opencode.json"), JSON.stringify(config));
-    const child = spawn(
-      "/usr/bin/script",
-      [
-        "-q",
-        "-f",
-        "-e",
-        "-c",
-        'exec "$OPENCODE_TEST_EXECUTABLE" --standalone',
-        "/dev/null",
-      ],
-      {
-        cwd: home,
-        env: {
-          PATH: "/usr/bin:/bin",
-          OPENCODE_TEST_EXECUTABLE: executable,
-          HOME: home,
-          LANG: "C.UTF-8",
-          TERM: "xterm-256color",
-          COLUMNS: "100",
-          LINES: "30",
-          XDG_CONFIG_HOME: join(home, "config"),
-          XDG_DATA_HOME: join(home, "data"),
-          XDG_CACHE_HOME: join(home, "cache"),
-          XDG_STATE_HOME: join(home, "state"),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    stopped = false;
-    let terminal = "";
-    child.stdout?.on("data", (bytes) => {
-      terminal = (terminal + String(bytes)).slice(-200000);
-    });
-    child.stderr?.on("data", (bytes) => {
-      terminal = (terminal + String(bytes)).slice(-200000);
-    });
-    try {
-      const proof = await readCapture<NativeCoordinatorProof>(
-        proofPath,
-        (value) => value.stage === "done" || !!value.error,
-      );
-      proof.requests = requests;
-      await writeFile(
-        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-proof.log`,
-        JSON.stringify(proof),
-      );
-      return proof;
-    } finally {
-      await writeFile(
-        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-terminal.log`,
-        terminal,
-      );
-      await writeFile(
-        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-host.log`,
-        await readFile(
-          join(home, "data/opencode/log/opencode.log"),
-          "utf8",
-        ).catch(() => "Native log unavailable"),
-      );
-      await writeFile(
-        `/tmp/opencode/backseat-review-frontend-native-flow-${action}-requests.log`,
-        JSON.stringify(requests),
-      );
-      const pid = JSON.parse(
-        await readFile(pidPath, "utf8").catch(() => "{}"),
-      ) as { pid?: number };
-      await stopNative(child, home, pid.pid);
-      stopped = true;
-    }
-  } finally {
-    server.closeAllConnections();
-    await new Promise<void>((closed, reject) =>
-      server.close((error) => (error ? reject(error) : closed())),
-    );
-    if (stopped) await rm(fixture, { recursive: true, force: true });
-  }
-}
-
-export interface NativeFrame {
-  commands?: Array<{ id?: string; title?: string; slash?: { name: string } }>;
-  pid: number;
-  width: number;
-  height: number;
-  text: string;
-  pages?: string[];
-  spans: Array<{
-    text: string;
-    fg: number[];
-    bg: number[];
-    attributes: number;
-  }>;
-}
-
-const nativeProbe = (options: Record<string, unknown>) => `
-import { Plugin } from "@opencode/plugin/tui";
-import { writeFileSync } from "node:fs";
-import { applyNativeNoColor, coordinationStatusDetails, overview, sharedVersionDetails } from ${JSON.stringify(new URL("../src/ui.ts", import.meta.url).href)};
-import { setupNativeTui } from ${JSON.stringify(new URL("../src/tui.ts", import.meta.url).href)};
-import { FixtureRpc } from "./rpc.js";
-export default Plugin.define({ id: ${JSON.stringify(options.modelTurn || typeof options.discovery === "string" ? "backseat" : "backseat.native-frame-probe")}, setup(context) {
-  const o = ${JSON.stringify(options)};
-  writeFileSync(o.optionsLog, JSON.stringify({ pid: process.pid, keys: Object.keys(context.options), widthType: typeof context.options.width, bun: globalThis.Bun?.version }));
-  context.renderer.resize(o.width, o.height);
-  const restore = applyNativeNoColor(context.renderer);
-  const pages = [];
-  let openAgentPicker = typeof o.discovery === "string";
-  const capture = buffer => {
-    if (buffer.width !== o.width || buffer.height !== o.height) return;
-    const text = new TextDecoder().decode(buffer.getRealCharBytes(true));
-    if (openAgentPicker && context.location?.directory) {openAgentPicker=false;queueMicrotask(()=>context.keymap.dispatch("agent.list"));}
-      if (!o.discovery && !text.includes(o.versions ? "Shared versions" : "Coordinate / search") && !text.includes("Status (read only)")) return;
-     if (o.statusReason && text.includes("Status (read only)") && !pages.includes(text)) pages.push(text);
-    const spans = buffer.getSpanLines().flatMap(line => line.spans.map(span => ({
-      text: span.text, fg: span.fg.toInts(), bg: span.bg.toInts(), attributes: span.attributes,
-    })));
-      writeFileSync(o.frame, JSON.stringify({ pid: process.pid, width: buffer.width, height: buffer.height, text, spans, pages,
-        commands: o.discovery ? context.keymap.commands().filter(command=>command.id?.startsWith("backseat.")).map(command=>({id:command.id,title:command.title,slash:command.slash})) : undefined }));
-  };
-  context.renderer.addPostProcessFn(capture);
-  if(o.discovery){
-    const close=setupNativeTui(context);
-    if(typeof o.discovery !== "string") queueMicrotask(()=>context.keymap.dispatch("command.palette.show"));
-    return ()=>{close();context.renderer.removePostProcessFn(capture);restore()};
-  }
-  let action;
-   const actions = ["Create", "Adopt", "Open", "Share", "Hold", "Resume", "Manual"].map((title, i) => ({
-    title, bind: ["alt+c", "alt+a", "alt+o", "alt+s", "alt+h", "alt+r", "alt+t"][i],
-    selection: "none", onTrigger() { action = title; },
-  }));
-  queueMicrotask(async () => {
-    if(o.modelTurn){
-      const session=await context.client.session.create({title:"Local native observation fixture",location:{directory:o.home}});
-      await context.client.session.prompt({sessionID:session.id,text:"Finish the local fixture without tools or external requests.",resume:true});
-      const signal=AbortSignal.timeout(15000);
-      const proof=await context.client.rpc(FixtureRpc).proof({sessionID:session.id},{location:{directory:o.home},signal});
-      writeFileSync(o.proof,JSON.stringify(proof));
-    }
-      const status = { title: "Status", bind: "alt+i", selection: "none", onTrigger() { action = "Status"; context.ui.dialog.clear(); } };
-      let selected = await context.ui.dialog.select(o.versions ? sharedVersionDetails(o.bindings[0], o.width) :
-        { ...overview(o.bindings, o.state, o.bindings[0].workerID, o.width, o.nativeStatus), actions: o.state === "ready" ? actions : [status] });
-      if (action === "Status") selected = await context.ui.dialog.select(coordinationStatusDetails(o.bindings, o.state, o.statusReason, o.width, o.nativeStatus));
-     writeFileSync(o.selection, JSON.stringify({ selected, action, closed: true }));
-  });
-  return () => { context.renderer.removePostProcessFn(capture); restore(); };
-}});
-`;
-
-async function readCapture<T>(
-  path: string,
-  accept: (value: T) => boolean,
-): Promise<T> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
-  const read = async () => {
-    try {
-      const value = JSON.parse(await readFile(path, "utf8")) as T;
-      return accept(value) ? value : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-  try {
-    const events = watch(resolve(path, ".."), { signal: controller.signal });
-    const first = await read();
-    if (first) return first;
-    for await (const event of events) {
-      if (event.filename === path.split("/").at(-1)) {
-        const value = await read();
-        if (value) return value;
-      }
-    }
-    throw new Error("Native capture stream ended");
-  } finally {
-    clearTimeout(timeout);
-    controller.abort();
-  }
-}
-
-async function stopNative(
-  process: ChildProcess,
-  home: string,
-  nativePID?: number,
-) {
-  if (nativePID) {
-    const cwd = await readlink(`/proc/${nativePID}/cwd`).catch(() => undefined);
-    const command = await readFile(`/proc/${nativePID}/cmdline`, "utf8").catch(
-      () => "",
-    );
-    if (cwd !== home || !command.includes("--standalone"))
-      throw new Error("Refusing to stop an unverified native fixture process");
-    globalThis.process.kill(nativePID, "SIGTERM");
-  }
-  if (process.exitCode !== null) return;
-  await new Promise<void>((resolveClose, reject) => {
-    const timeout = setTimeout(() => {
-      process.kill("SIGTERM");
-      reject(new Error("Private native host did not close"));
-    }, 5000);
-    process.once("close", () => {
-      clearTimeout(timeout);
-      resolveClose();
-    });
-  });
-}
-
-export async function captureNativeOverview(
-  bindings: readonly WorkerBinding[],
-  width: number,
-  height: number,
-  noColor = false,
-  nativeStatus: Record<string, "needs-input" | "running"> = {},
-  modelTurn = false,
-  state: import("../src/ui.ts").UiState = "ready",
-  versions = false,
-  statusReason?: string,
-  discovery: boolean | "coordinator" | "coordinator-denied" = false,
-) {
-  const root = resolve(
-    import.meta.dir,
-    "../.opencode/backseat/native-fixtures",
-  );
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  const home = await mkdtemp(join(root, "host-"));
-  const probe = join(home, "probe");
-  await mkdir(probe, { mode: 0o700 });
-  const modelServer =
-    modelTurn || typeof discovery === "string"
-      ? await localModelServer()
-      : undefined;
-  let nativeStopped = true;
-  try {
-    const framePath = join(home, "frame.json"),
-      selectionPath = join(home, "selection.json"),
-      optionsLog = join(home, "probe-options.json"),
-      proofPath = join(home, "proof.json");
-    await writeFile(
-      join(probe, "package.json"),
-      JSON.stringify({
-        type: "module",
-        exports: {
-          ".": "./server.js",
-          "./tui": "./tui.js",
-          "./rpc": "./rpc.js",
-        },
-      }),
-    );
-    await writeFile(join(probe, "rpc.js"), fixtureRpc);
-    await writeFile(
-      join(probe, "server.js"),
-      typeof discovery === "string"
-        ? `
-import {Plugin} from "@opencode/plugin";
-import {Plugin as EffectPlugin} from "@opencode/plugin/effect";
-import {fromPromise} from "@opencode/plugin/promise/adapter";
-import {Effect} from "effect";
-import {writeFileSync} from "node:fs";
-import product from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).href)};
-import {coordinatorAgent} from ${JSON.stringify(new URL("../src/coordinator-agent.ts", import.meta.url).href)};
-import {BackseatRpc} from ${JSON.stringify(new URL("../src/rpc.ts", import.meta.url).href)};
-const probe=Plugin.define({id:"backseat.probe",async setup(ctx){
-  let attachmentRequests=0;
-  await ctx.permission.hook("evaluate",event=>{if(event.action==="backseat.attach")attachmentRequests++;});
-  await ctx.session.hook("title",event=>{event.result="Owned coordination conversation"});
-  await ctx.session.hook("context",async event=>{
-    const session=await ctx.session.get({sessionID:event.sessionID});
-    const history=await ctx.session.context({sessionID:event.sessionID});
-    const metadata=await ctx.rpc(BackseatRpc).bootstrap({});
-    const catalog=await ctx.agent.list();
-    let dispatchPermission;
-    if(${JSON.stringify(discovery === "coordinator-denied")}){
-      try{
-        await ctx.permission.assert({sessionID:event.sessionID,agent:event.agent,action:"backseat_dispatch_task",resources:["*"]});
-        dispatchPermission={allowed:true};
-      }catch(error){dispatchPermission={allowed:false,error:error.message};}
-    }
-    writeFileSync(${JSON.stringify(proofPath)},JSON.stringify({agent:event.agent,sessionAgent:session.agent,
-      dispatchPermission,
-      permissions:catalog.data.find(agent=>agent.id===coordinatorAgent.id)?.permissions,
-      attachmentRequests,bootstrapKeys:Object.keys(metadata),userMessages:history.filter(message=>message.type==="user").map(message=>message.text),
-      tools:Object.keys(event.tools),instructions:event.system.some(part=>part.type==="text"&&part.text.includes(coordinatorAgent.system))}));
-    throw new Error("Native entry verified before model transport");
-  });
-  await ctx.session.hook("http.request",()=>{throw new Error("Model transport is forbidden in native entry verification")});
-  await ctx.session.hook("experimental.ws.handshake",()=>{throw new Error("Model WebSocket is forbidden in native entry verification")});
-}});
-export default EffectPlugin.define({id:"backseat",effect:ctx=>Effect.gen(function*(){
-  yield* product.effect({...ctx,options:{}});
-  yield* fromPromise(probe).effect(ctx);
-})});`
-        : modelServer
-          ? nativeModelProbe(home, modelServer.endpoint)
-          : 'import { Plugin } from "@opencode/plugin"; export default Plugin.define({id:"backseat.native-frame-probe",async setup(ctx){await ctx.session.hook("context",()=>{throw new Error("Model requests are forbidden in native rendering fixtures")});}});',
-    );
-    await writeFile(
-      join(probe, "tui.js"),
-      nativeProbe({
-        bindings,
-        width,
-        height,
-        nativeStatus,
-        modelTurn,
-        state,
-        versions,
-        statusReason,
-        discovery,
-        home,
-        proof: proofPath,
-        frame: framePath,
-        selection: selectionPath,
-        optionsLog,
-      }),
+`,
     );
     await writeFile(
       join(home, "opencode.json"),
       JSON.stringify({
-        ...(typeof discovery === "string"
-          ? {
-              permissions: [
-                ...inheritedPolicy,
-                ...(discovery === "coordinator-denied"
-                  ? [
-                      {
-                        action: "backseat_dispatch_task",
-                        resource: "*",
-                        effect: "deny",
-                      },
-                    ]
-                  : []),
-              ],
-            }
-          : {}),
-        ...(modelServer
-          ? {
-              model: "backseat-fixture/local",
-              providers: {
-                "backseat-fixture": {
-                  package: "@opencode/ai/providers/openai-compatible",
-                  env: [],
-                  settings: {
-                    baseURL: modelServer.endpoint.replace(
-                      /\/chat\/completions$/,
-                      "",
-                    ),
-                  },
-                  models: { local: {} },
-                },
-              },
-            }
-          : {}),
-        plugins: [
-          {
-            package: probe,
-            options: {
-              bindings,
-              width,
-              height,
-              nativeStatus,
-              frame: framePath,
-              selection: selectionPath,
-            },
+        model: "backseat-fixture/local",
+        providers: {
+          "backseat-fixture": {
+            package: "@opencode/ai/providers/openai-compatible",
+            env: [],
+            settings: { baseURL: endpoint.replace(/\/chat\/completions$/, "") },
+            models: { local: {} },
           },
-        ],
+        },
+        plugins: [{ package: probe }],
       }),
     );
     const child = spawn(
-      "/usr/bin/script",
+      executable,
       [
-        "-q",
-        "-f",
-        "-e",
-        "-c",
-        'exec "$OPENCODE_TEST_EXECUTABLE" --standalone',
-        "/dev/null",
+        "run",
+        "--standalone",
+        "--print-logs",
+        "Inspect the owned local fixture.",
       ],
       {
         cwd: home,
         env: {
           PATH: "/usr/bin:/bin",
-          OPENCODE_TEST_EXECUTABLE: nativeExecutable(),
           HOME: home,
           LANG: "C.UTF-8",
-          TERM: "xterm-256color",
-          COLUMNS: String(width),
-          LINES: String(height),
           XDG_CONFIG_HOME: join(home, "config"),
           XDG_DATA_HOME: join(home, "data"),
           XDG_CACHE_HOME: join(home, "cache"),
           XDG_STATE_HOME: join(home, "state"),
-          ...(noColor ? { NO_COLOR: "1" } : {}),
         },
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
       },
     );
-    nativeStopped = false;
-    let terminal = "",
-      frame: NativeFrame | undefined;
-    child.stdout?.on("data", (bytes) => {
-      terminal = (terminal + String(bytes)).slice(-200000);
+    child.stdout.on("data", (bytes) => {
+      hostLog = (hostLog + String(bytes)).slice(-200000);
     });
-    child.stderr?.on("data", (bytes) => {
-      terminal = (terminal + String(bytes)).slice(-200000);
+    child.stderr.on("data", (bytes) => {
+      hostLog = (hostLog + String(bytes)).slice(-200000);
     });
-    try {
-      if (typeof discovery === "string") {
-        await readCapture<NativeFrame>(framePath, (value) =>
-          value.text.includes("Select agent"),
-        );
-        child.stdin?.write("Backseat Coordinator");
-        frame = await readCapture<NativeFrame>(framePath, (value) =>
-          value.text
-            .split("\n")
-            .some((line) => line.trim() === "Backseat Coordinator"),
-        );
-        await writeFile(
-          `/tmp/opencode/backseat-dedicated-picker-${width}.json`,
-          JSON.stringify(frame, null, 2),
-        );
-        child.stdin?.write("\r");
-        await readCapture<NativeFrame>(
-          framePath,
-          (value) => !value.text.includes("Select agent"),
-        );
-        child.stdin?.write("Inspect the current coordination state.\r");
-        const entry = await readCapture<{
-          agent: string;
-          sessionAgent: string;
-          tools: string[];
-          instructions: boolean;
-          attachmentRequests: number;
-          bootstrapKeys: string[];
-          userMessages: string[];
-          permissions: typeof coordinatorAgent.permissions;
-          dispatchPermission?: { allowed: boolean; error?: string };
-        }>(proofPath, (value) => !!value.sessionAgent);
-        const hostLog = await readFile(
-          join(home, "data/opencode/log/opencode.log"),
-          "utf8",
-        );
-        return { frame, entry, terminal, hostLog };
-      }
-      if (discovery) {
-        frame = await readCapture<NativeFrame>(framePath, (value) =>
-          value.text.includes("Commands"),
-        );
-        child.stdin?.write("coord");
-        const palette = await readCapture<NativeFrame>(
-          framePath,
-          (value) =>
-            value.text.includes("Commands") &&
-            /^\s+coord\s*$/m.test(value.text),
-        );
-        await writeFile(
-          "/tmp/opencode/backseat-command-palette.json",
-          JSON.stringify(palette, null, 2),
-        );
-        if (
-          !palette.commands?.some(
-            (command) => command.id === "backseat.overview",
-          )
-        )
-          return { frame: palette, terminal };
-        child.stdin?.write("\u001b");
-        await readCapture<NativeFrame>(
-          framePath,
-          (value) => !value.text.includes("Commands"),
-        );
-        child.stdin?.write("/coord");
-        const slash = await readCapture<NativeFrame>(
-          framePath,
-          (value) =>
-            !value.text.includes("Commands") &&
-            value.text.includes("/coordinate"),
-        );
-        await writeFile(
-          "/tmp/opencode/backseat-command-slash.json",
-          JSON.stringify(slash, null, 2),
-        );
-        return { frame: palette, slash, terminal };
-      }
-      frame = await readCapture<NativeFrame>(
-        framePath,
-        (value) =>
-          value.width === width &&
-          value.height === height &&
-          value.text.includes(
-            versions ? "Shared versions" : "Coordinate / search",
-          ),
-      );
-      if (statusReason) {
-        child.stdin?.write("\u001bi");
-        frame = await readCapture<NativeFrame>(framePath, (value) =>
-          value.text.includes("Status (read only)"),
-        );
-        const rows = coordinationStatusDetails(
-          bindings,
-          state,
-          statusReason,
-          width,
-          nativeStatus,
-        ).options;
-        for (let row = 1; row < rows.length; row++) {
-          child.stdin?.write("\u001b[B");
-          await new Promise((resolveFrame) => setTimeout(resolveFrame, 50));
-          frame = await readCapture<NativeFrame>(framePath, (value) =>
-            value.text.includes(rows[row]!.title),
+    await new Promise<void>((done, reject) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error("Native observation fixture timed out"));
+      }, 45000);
+      child.once("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        if (code === 0) done();
+        else
+          reject(
+            new Error(`Native observation fixture exited ${code}: ${hostLog}`),
           );
-        }
-      }
-      child.stdin?.write(
-        statusReason
-          ? "\r"
-          : versions
-            ? "\u001b[B\r"
-            : state === "ready"
-              ? "\u001b[B\u001bt\r"
-              : "\u001b",
-      );
-      const selection = await readCapture<{
-        selected?: string | number;
-        action?: string;
-        closed?: boolean;
-      }>(selectionPath, (value) => value.closed === true);
-      const observation = modelTurn
-        ? (JSON.parse(
-            await readFile(proofPath, "utf8"),
-          ) as NativeObservationProof)
-        : undefined;
-      if (observation)
-        await writeFile(
-          "/tmp/opencode/backseat-review-frontend-native-observation-proof.log",
-          JSON.stringify(observation),
-        );
-      return {
-        frame,
-        selection: selection.selected,
-        action: selection.action,
-        terminal,
-        observation,
-      };
-    } finally {
-      await writeFile(
-        modelTurn
-          ? "/tmp/opencode/backseat-review-frontend-native-model-terminal.log"
-          : `/tmp/opencode/backseat-review-frontend-native-terminal-${width}-${versions ? "versions" : state}${statusReason ? "-status" : ""}${noColor ? "-no-color" : ""}.log`,
-        terminal,
-      );
-      if (modelTurn)
-        await writeFile(
-          "/tmp/opencode/backseat-review-frontend-native-model-host.log",
-          await readFile(
-            join(home, "data/opencode/log/opencode.log"),
-            "utf8",
-          ).catch(() => "Native log unavailable"),
-        );
-      if (modelTurn)
-        await writeFile(
-          "/tmp/opencode/backseat-review-frontend-native-local-trace.log",
-          await readFile(join(home, "model-trace.jsonl"), "utf8").catch(
-            () => "Native trace unavailable",
-          ),
-        );
-      const setup = JSON.parse(
-        await readFile(optionsLog, "utf8").catch(() => "{}"),
-      ) as { pid?: number; keys?: string[]; widthType?: string; bun?: string };
-      await writeFile(
-        "/tmp/opencode/backseat-review-frontend-native-probe-options.log",
-        JSON.stringify(setup),
-      );
-      if (frame)
-        await writeFile(
-          `/tmp/opencode/backseat-review-frontend-native-frame-${width}-${versions ? "versions" : state}${statusReason ? "-status" : ""}${noColor ? "-no-color" : ""}.log`,
-          JSON.stringify(frame),
-        );
-      await stopNative(child, home, frame?.pid ?? setup.pid);
-      nativeStopped = true;
-    }
+      });
+    });
+    const observation = JSON.parse(
+      await readFile(join(home, "proof.json"), "utf8"),
+    ) as NativeObservationProof;
+    if (!observation.snapshot || !observation.registry)
+      throw new Error("Native observation proof is unavailable");
+    return { observation, hostLog };
   } finally {
-    await modelServer?.close();
-    if (nativeStopped) await rm(home, { recursive: true, force: true });
+    model.closeAllConnections();
+    await new Promise<void>((done, reject) =>
+      model.close((error) => (error ? reject(error) : done())),
+    );
+    await rm(home, { recursive: true, force: true });
   }
 }
 
@@ -1401,9 +250,9 @@ export const goal: TaskGoal = {
 export function creationHost(
   options: { location?: boolean; agent?: boolean } = {},
 ) {
-  const events: string[] = [];
-  const starts: Array<{ sessionID: string; text: string }> = [];
-  const saved: WorkerBinding[] = [];
+  const events: string[] = [],
+    starts: Array<{ sessionID: string; text: string }> = [],
+    saved: WorkerBinding[] = [];
   const host: CreationHost = {
     async locationExists() {
       return options.location ?? true;
