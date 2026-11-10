@@ -72,9 +72,14 @@ export interface NativeIdentity {
   signal?: AbortSignal;
   revalidate?: () => Promise<void>;
 }
+export interface FollowTakeover {
+  previousCoordinatorID: string;
+  reason: string;
+}
 export interface FollowHost {
   storage: Pick<SharedStorage, "get" | "set">;
   target(sessionID: string): Promise<{ sessionID: string; location: string }>;
+  ownerState(coordinatorID: string): Promise<"gone" | "idle" | "active">;
   observe(
     sessionID: string,
     afterSeq: number | undefined,
@@ -116,6 +121,23 @@ export class SessionController {
       async target(sessionID) {
         const session = await controller.target(sessionID);
         return { sessionID: session.id, location: session.location.directory };
+      },
+      async ownerState(coordinatorID) {
+        return host.native.read(async (client, signal) => {
+          const owner = await client.session
+            .get({ sessionID: coordinatorID }, { signal })
+            .catch((error: unknown) => {
+              if (
+                (error as { _tag?: string } | null)?._tag ===
+                "SessionNotFoundError"
+              )
+                return undefined;
+              throw error;
+            });
+          if (!owner || owner.id !== coordinatorID) return "gone";
+          const active = await client.session.active({ signal });
+          return active[coordinatorID] ? "active" : "idle";
+        });
       },
       async observe(sessionID, afterSeq) {
         const session = await controller.target(sessionID);
@@ -270,12 +292,13 @@ export class SessionController {
       context,
     );
     await this.unchanged(selected);
-    await this.follower.follow(sessionID, context.sessionID);
+    const takeover = await this.follower.follow(sessionID, context.sessionID);
     return {
       sessionID,
       location: selected.location.directory,
       agent: selected.agent,
       following: true,
+      ...(takeover ? { takeover } : {}),
     };
   }
   async createSession(
@@ -821,15 +844,49 @@ export class NativeFollower {
     timer.unref();
     this.timers.set(coordinatorID, timer);
   }
-  async follow(sessionID: string, coordinatorID: string): Promise<void> {
-    await this.serial(async () => {
+  async follow(
+    sessionID: string,
+    coordinatorID: string,
+  ): Promise<FollowTakeover | undefined> {
+    return this.serial(async () => {
       const current = this.state.followers.find(
         (follower) => follower.sessionID === sessionID,
       );
       if (current) {
-        if (current.coordinatorID !== coordinatorID)
-          throw new Error("Session already followed by another coordinator");
-        return;
+        if (current.coordinatorID === coordinatorID) return undefined;
+        const previous = current.coordinatorID,
+          owner = await this.host.ownerState(previous);
+        if (owner === "active")
+          throw new Error(
+            "Session already followed by another coordinator that is active",
+          );
+        const next = this.snapshot(),
+          row = next.followers.find((f) => f.sessionID === sessionID)!;
+        row.coordinatorID = coordinatorID;
+        parseFollowerState(next);
+        await this.save(next);
+        if (!next.followers.some((f) => f.coordinatorID === previous)) {
+          const timer = this.timers.get(previous);
+          if (timer) clearTimeout(timer);
+          this.timers.delete(previous);
+          this.retryDelays.delete(previous);
+        }
+        const pending = row.pending;
+        if (
+          pending.idle ||
+          pending.failed ||
+          pending.discontinuity ||
+          pending.requests.length
+        )
+          await this.deliver(coordinatorID);
+        else if (pending.progress) this.schedule(coordinatorID);
+        return {
+          previousCoordinatorID: previous,
+          reason:
+            owner === "gone"
+              ? "previous coordinator session no longer exists"
+              : "previous coordinator session is idle",
+        };
       }
       const target = await this.host.target(sessionID);
       if (target.sessionID !== sessionID)
@@ -855,6 +912,7 @@ export class NativeFollower {
       await this.save(next);
       if (follower.pending.requests.length || follower.pending.discontinuity)
         await this.deliver(coordinatorID);
+      return undefined;
     });
   }
   async stop(sessionID: string, coordinatorID: string): Promise<void> {

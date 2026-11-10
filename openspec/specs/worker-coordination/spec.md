@@ -23,8 +23,14 @@ The coordinator SHALL immediately follow an explicitly selected existing native 
 
 #### Scenario: Rejects competing ownership
 
-- **WHEN** another coordinator already follows the selected session
+- **WHEN** another coordinator that has an active run already follows the selected session
 - **THEN** adoption reports the conflict without taking over that follower.
+
+#### Scenario: Takes over from an idle or vanished coordinator
+
+- **WHEN** the coordinator following the selected session is idle or its session no longer exists
+- **THEN** following transfers to the adopting coordinator without messaging or interrupting the worker, and pending events carry over.
+- **AND** the adoption result names the previous coordinator and the reason for the takeover.
 
 #### Scenario: Rejects stale or denied task-free adoption
 

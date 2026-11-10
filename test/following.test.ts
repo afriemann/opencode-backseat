@@ -14,6 +14,7 @@ function fixture(initial?: unknown) {
   let update = emptyPending();
   let status: "admitted" | "uncertain" = "admitted";
   let proof: "admitted" | "unknown" = "unknown";
+  let owner: "gone" | "idle" | "active" | "unreadable" = "idle";
   const notifications: FollowNotification[] = [];
   const host: FollowHost = {
     storage: {
@@ -26,6 +27,10 @@ function fixture(initial?: unknown) {
     },
     async target(sessionID) {
       return { sessionID, location: `/project/${sessionID}` };
+    },
+    async ownerState() {
+      if (owner === "unreadable") throw new Error("Native read failed");
+      return owner;
     },
     async observe(_id, after) {
       return {
@@ -48,6 +53,9 @@ function fixture(initial?: unknown) {
     events(pending: Partial<FollowPending>, seq = afterSeq + 1) {
       update = { ...emptyPending(), ...pending };
       afterSeq = seq;
+    },
+    ownerIs(state: typeof owner) {
+      owner = state;
     },
     uncertain() {
       status = "uncertain";
@@ -246,6 +254,46 @@ describe("Background followed-session events", () => {
     expect(f.notifications[0]!.text).toContain('"failed":true');
     await core.ingest("worker", { idle: true });
     expect(f.notifications).toHaveLength(1);
+    await core.dispose();
+  });
+
+  it("Carries pending events to a taking-over coordinator", async () => {
+    const f = fixture();
+    const core = await NativeFollower.load(f.host);
+    await core.follow("worker", "A");
+    const clock = timers();
+    try {
+      f.events({ progress: 1 });
+      await core.ingest("worker", { progress: 1 });
+      expect(clock.pending).toHaveLength(1);
+      await expect(core.follow("worker", "B")).resolves.toEqual({
+        previousCoordinatorID: "A",
+        reason: "previous coordinator session is idle",
+      });
+      expect(core.snapshot().followers[0]).toMatchObject({
+        coordinatorID: "B",
+        pending: { progress: 2 },
+      });
+      expect(clock.pending).toHaveLength(2);
+      clock.pending[1]!.run();
+      await core.flush("B");
+      expect(f.notifications.at(-1)).toMatchObject({ coordinatorID: "B" });
+    } finally {
+      clock.restore();
+    }
+    await core.dispose();
+  });
+  it("Keeps ownership when the owner is active or unreadable", async () => {
+    const f = fixture();
+    const core = await NativeFollower.load(f.host);
+    await core.follow("worker", "A");
+    f.ownerIs("active");
+    await expect(core.follow("worker", "B")).rejects.toThrow("active");
+    f.ownerIs("unreadable");
+    await expect(core.follow("worker", "B")).rejects.toThrow(
+      "Native read failed",
+    );
+    expect(core.snapshot().followers[0]).toMatchObject({ coordinatorID: "A" });
     await core.dispose();
   });
 
