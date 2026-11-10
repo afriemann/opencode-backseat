@@ -583,7 +583,7 @@ export async function readNativeSessionDelivery(
   delivery: {
     id: string;
     sessionID: string;
-    agent: string;
+    agent?: string;
     location: string;
     operation?: string;
   },

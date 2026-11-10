@@ -633,7 +633,12 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           agent: stringSchema,
           ...definition.input.properties,
         },
-        ["sessionID", "location", "agent", ...definition.input.required],
+        [
+          "sessionID",
+          "location",
+          ...(operation === "update_session" ? [] : ["agent"]),
+          ...definition.input.required,
+        ],
       ),
       async run(v, context) {
         const { sessionID, location, agent, ...payload } = v;
@@ -642,7 +647,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
             operation,
             sessionID: text(sessionID),
             location: text(location),
-            agent: text(agent),
+            ...(agent === undefined ? {} : { agent: text(agent) }),
             payload,
           },
           context,

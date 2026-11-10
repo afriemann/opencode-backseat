@@ -20,6 +20,7 @@ function fixture() {
   const calls: string[] = [],
     notices: unknown[] = [];
   let uncertain = false;
+  const missing = new Set<string>();
   const sessions = new Map<string, SessionInfo>(
     ["coordinator", "worker"].map((id) => [
       id,
@@ -81,6 +82,10 @@ function fixture() {
       },
       async list() {
         return { data: [], cursor: { next: undefined } };
+      },
+      async update(input: { sessionID: string }) {
+        calls.push("update");
+        return sessions.get(input.sessionID)!;
       },
       async remove({ sessionID }: { sessionID: string }) {
         calls.push("remove");
@@ -174,6 +179,10 @@ function fixture() {
       },
     },
     async canonical(location) {
+      if (missing.has(location))
+        throw Object.assign(new Error(`ENOENT: ${location}`), {
+          code: "ENOENT",
+        });
       return location;
     },
   };
@@ -183,6 +192,7 @@ function fixture() {
     notices,
     client,
     sessions,
+    missing,
     deny() {
       denied = true;
     },
@@ -551,6 +561,105 @@ describe("Conversational manual assignment", () => {
     ).rejects.toThrow("retained deletion");
     expect(f.calls.filter((call) => call === "remove")).toHaveLength(1);
     await reloaded.dispose();
+  });
+  const orphans = [
+    ["location", true, false],
+    ["agent", false, true],
+    ["location and agent", true, true],
+  ] as const;
+  const orphaned = (noDirectory: boolean, noAgent: boolean) => {
+    const f = fixture();
+    f.sessions.get("coordinator")!.location = { directory: "/home" };
+    const worker = f.sessions.get("worker")!;
+    if (noAgent) delete (worker as { agent?: string }).agent;
+    if (noDirectory) f.missing.add("/project");
+    return f;
+  };
+  it("Deletes a session whose location or agent is gone", async () => {
+    for (const [, noDirectory, noAgent] of orphans) {
+      const f = orphaned(noDirectory, noAgent),
+        controller = await SessionController.load(f.host);
+      expect(await controller.deleteSession("worker", context)).toMatchObject({
+        sessionID: "worker",
+        status: "admitted",
+      });
+      expect(f.calls).toContain("remove");
+      await controller.dispose();
+    }
+  });
+  it("Updates a session whose location or agent is gone", async () => {
+    for (const [, noDirectory, noAgent] of orphans) {
+      const f = orphaned(noDirectory, noAgent),
+        controller = await SessionController.load(f.host);
+      const update = (location: string, agent?: string) =>
+        controller.sessionOperation(
+          {
+            operation: "update_session",
+            sessionID: "worker",
+            location,
+            ...(agent === undefined ? {} : { agent }),
+            payload: { archived: true },
+          },
+          context,
+        );
+      await update("/project", noAgent ? undefined : "engineer");
+      expect(f.calls).toEqual(["backseat.update_session", "update"]);
+      await expect(update("/project", "other")).rejects.toThrow("changed");
+      await expect(
+        update("/elsewhere", noAgent ? undefined : "engineer"),
+      ).rejects.toThrow("changed");
+      if (!noAgent) await expect(update("/project")).rejects.toThrow("changed");
+      expect(f.calls).toEqual(["backseat.update_session", "update"]);
+      await controller.dispose();
+    }
+  });
+  it("Rejects unavailable locations and agents outside update and delete", async () => {
+    const interrupt = {
+      operation: "interrupt_session",
+      sessionID: "worker",
+      location: "/project",
+      agent: "engineer",
+      payload: {},
+    } as const;
+    const missingDirectory = orphaned(true, false),
+      first = await SessionController.load(missingDirectory.host);
+    await expect(first.sessionOperation(interrupt, context)).rejects.toThrow(
+      "ENOENT",
+    );
+    await first.dispose();
+    const noAgent = orphaned(false, true),
+      second = await SessionController.load(noAgent.host);
+    await expect(second.sessionOperation(interrupt, context)).rejects.toThrow(
+      "unavailable or changed",
+    );
+    await second.dispose();
+  });
+  it("Rejects delete and update when the location cannot be verified", async () => {
+    const f = orphaned(false, false),
+      denied = f.host.canonical;
+    f.host.canonical = async (location) => {
+      if (location === "/project")
+        throw Object.assign(new Error("EACCES: /project"), { code: "EACCES" });
+      return denied(location);
+    };
+    const controller = await SessionController.load(f.host);
+    await expect(controller.deleteSession("worker", context)).rejects.toThrow(
+      "EACCES",
+    );
+    await expect(
+      controller.sessionOperation(
+        {
+          operation: "update_session",
+          sessionID: "worker",
+          location: "/project",
+          agent: "engineer",
+          payload: { archived: true },
+        },
+        context,
+      ),
+    ).rejects.toThrow("EACCES");
+    expect(f.calls).toEqual([]);
+    await controller.dispose();
   });
   it("Retains an uncertain manual send without resending", async () => {
     const f = fixture(),

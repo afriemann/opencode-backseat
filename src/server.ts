@@ -164,20 +164,34 @@ export class SessionController {
     });
     return controller;
   }
-  private async target(sessionID: string) {
+  private async target(sessionID: string, orphanTolerant = false) {
     const session = await this.host.native.read((client, signal) =>
       client.session.get({ sessionID }, { signal }),
     );
     if (
       !session ||
       session.id !== sessionID ||
-      !session.agent ||
+      (!session.agent && !orphanTolerant) ||
       session.time.archived !== undefined ||
-      (await this.host.canonical(session.location.directory)) !==
-        session.location.directory
+      !(await this.locationMatches(session.location.directory, orphanTolerant))
     )
       throw new Error("Selected native session unavailable or changed");
     return session;
+  }
+  private async locationMatches(
+    location: string,
+    missingAllowed: boolean,
+  ): Promise<boolean> {
+    try {
+      return (await this.host.canonical(location)) === location;
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" &&
+        missingAllowed
+      )
+        return true;
+      throw error;
+    }
   }
   private async permit(
     action: string,
@@ -232,8 +246,9 @@ export class SessionController {
   }
   private async unchanged(
     selected: Awaited<ReturnType<SessionController["target"]>>,
+    orphanTolerant = false,
   ): Promise<void> {
-    const current = await this.target(selected.id);
+    const current = await this.target(selected.id, orphanTolerant);
     const identity = (value: typeof selected) => [
       value.id,
       value.location,
@@ -389,7 +404,7 @@ export class SessionController {
         }
       };
       await protect();
-      const selected = await this.target(sessionID);
+      const selected = await this.target(sessionID, true);
       const collect = async () => {
         const members = new Set([sessionID]);
         const visit = async (parentID: string) => {
@@ -439,14 +454,14 @@ export class SessionController {
         context,
       );
       await protect();
-      await this.unchanged(selected);
+      await this.unchanged(selected, true);
       if (fingerprint(await collect()) !== fingerprint(members))
         throw new Error("Selected native deletion subtree changed");
       const record: SessionDelivery = {
         id: `del_${randomUUID().replaceAll("-", "")}`,
         sessionID,
         location: selected.location.directory,
-        agent: selected.agent!,
+        ...(selected.agent ? { agent: selected.agent } : {}),
         coordinatorID: context.sessionID,
         serviceID: this.serviceID(),
         operation: "delete",
@@ -500,6 +515,8 @@ export class SessionController {
     prepared: ReturnType<typeof prepareNativeOperation>,
     action: string = input.operation,
   ): Promise<unknown> {
+    const agent = input.agent;
+    if (agent === undefined) throw new Error("Worker agent required");
     await this.host.native.read(async (client, signal) => {
       const discovery = new NativeDiscovery(client, signal);
       const [projects, agents] = await Promise.all([
@@ -508,7 +525,7 @@ export class SessionController {
       ]);
       if (
         !projects.some((project) => project.location === input.location) ||
-        !agents.includes(input.agent)
+        !agents.includes(agent)
       )
         throw new Error("Selected worker location or agent unavailable");
     });
@@ -529,7 +546,7 @@ export class SessionController {
           try {
             const current = await this.target(input.sessionID);
             if (
-              current.agent === input.agent &&
+              current.agent === agent &&
               current.location.directory === input.location
             )
               previous.status = "admitted";
@@ -548,7 +565,7 @@ export class SessionController {
         {
           sessionID: input.sessionID,
           location: input.location,
-          agent: input.agent,
+          agent,
           payload: input.payload,
           subject,
         },
@@ -563,7 +580,7 @@ export class SessionController {
         id: input.sessionID,
         sessionID: input.sessionID,
         location: input.location,
-        agent: input.agent,
+        agent,
         coordinatorID: context.sessionID,
         serviceID: this.serviceID(),
         operation: input.operation === "import_session" ? "import" : "create",
@@ -578,7 +595,7 @@ export class SessionController {
         const created = object(await this.host.native.read(prepared.execute));
         if (
           created.id !== input.sessionID ||
-          created.agent !== input.agent ||
+          created.agent !== agent ||
           object(created.location).directory !== input.location
         )
           throw new Error("Created native session identity mismatch");
@@ -608,14 +625,15 @@ export class SessionController {
         throw new Error("Select a canonical project location");
       return this.createNativeOperation(input, context, prepared);
     }
-    const selected = await this.target(input.sessionID);
+    const orphanTolerant = input.operation === "update_session";
+    const selected = await this.target(input.sessionID, orphanTolerant);
     if (
       selected &&
       (selected.agent !== input.agent ||
         selected.location.directory !== input.location)
     )
       throw new Error("Selected native operation target changed");
-    if ((await this.host.canonical(input.location)) !== input.location)
+    if (!(await this.locationMatches(input.location, orphanTolerant)))
       throw new Error("Select a canonical project location");
     const subject = await this.host.native.read(prepared.subject);
     await this.permit(
@@ -629,7 +647,7 @@ export class SessionController {
       },
       context,
     );
-    if (selected) await this.unchanged(selected);
+    if (selected) await this.unchanged(selected, orphanTolerant);
     if (
       fingerprint(await this.host.native.read(prepared.subject)) !==
       fingerprint(subject)
