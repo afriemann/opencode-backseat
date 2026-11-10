@@ -646,7 +646,7 @@ export class SessionController {
         return { ...session, following: false };
       }
     }
-    return result;
+    return result === undefined ? { status: "completed" } : result;
   }
   async event(event: OpenCodeEvent): Promise<void> {
     const value = event as unknown as {

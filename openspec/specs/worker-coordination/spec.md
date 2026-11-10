@@ -386,7 +386,7 @@ The coordinator SHALL answer selected current native permission and form request
 #### Scenario: Replies to the selected native request
 
 - **WHEN** the coordinator chooses a permission decision or typed form answer for a current followed-session request
-- **THEN** the matching native reply API receives exactly that decision or answer without requiring a second human decision when configured policy allows it.
+- **THEN** the matching native reply API receives exactly that decision or answer without requiring a second human decision when configured policy allows it, and the operation returns `{ "status": "completed" }`.
 
 #### Scenario: Rejects a changed or unapproved reply
 
