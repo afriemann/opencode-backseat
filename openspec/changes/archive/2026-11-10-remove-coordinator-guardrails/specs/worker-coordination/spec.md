@@ -25,7 +25,7 @@ The coordinator SHALL retrieve bounded native session history and activity indep
 
 - **WHEN** a selected read serializes to more than eight megabytes, or the session grows while chunks are being read
 - **THEN** every chunk is served from one snapshot taken at the first read and the whole content can be read to its end.
-- **AND** a continuation stays valid for one hour after its last use.
+- **AND** a continuation stays valid for one hour after its last use and is consumed by the read that returns its successor.
 
 #### Scenario: Reports snapshot capacity exhaustion
 
