@@ -12,12 +12,14 @@ const effectFor = (action: string) =>
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Bundled conversational coordinator", () => {
-  it.each(["backseat.adopt", "backseat.create", "backseat.send"])(
-    "Allows Backseat operations by default: %s",
-    (action) => {
-      expect(effectFor(action)).toBe("allow");
-    },
-  );
+  it.each([
+    "backseat.adopt",
+    "backseat.delete",
+    "backseat.send_session",
+    "backseat.stop_following",
+  ])("Allows Backseat operations by default: %s", (action) => {
+    expect(effectFor(action)).toBe("allow");
+  });
 
   it("Denies unrelated actions", () => {
     expect(effectFor("shell")).toBe("deny");
