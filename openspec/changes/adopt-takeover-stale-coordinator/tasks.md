@@ -1,0 +1,4 @@
+- [x] 1. Test "Takes over from an idle or vanished coordinator" and updated "Rejects competing ownership" in `test/session-control.test.ts`
+- [x] 2. Add `FollowHost.ownerState` and takeover in `NativeFollower.follow` (`src/server.ts`)
+- [x] 3. Return the takeover from `adoptSession`
+- [x] 4. Update the stop/adopt line in `src/coordinator-agent.ts`

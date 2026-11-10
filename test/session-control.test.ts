@@ -34,8 +34,14 @@ function fixture() {
       } as SessionInfo,
     ]),
   );
+  const busy = new Set<string>();
   const client = {
     session: {
+      async active() {
+        return Object.fromEntries(
+          [...busy].map((id) => [id, { type: "running" }]),
+        );
+      },
       async get({ sessionID }: { sessionID: string }) {
         return sessions.get(sessionID)!;
       },
@@ -194,6 +200,7 @@ function fixture() {
     client,
     sessions,
     missing,
+    busy,
     deny() {
       denied = true;
     },
@@ -298,11 +305,43 @@ describe("Explicit adoption", () => {
     expect(f.notices).toHaveLength(0);
     await controller.dispose();
   });
+  it("Takes over from an idle or vanished coordinator", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    f.sessions.set("other", { ...f.sessions.get("coordinator")!, id: "other" });
+    await controller.adoptSession("worker", context);
+    const other = { ...context, sessionID: "other" };
+    expect(await controller.adoptSession("worker", other)).toMatchObject({
+      following: true,
+      takeover: {
+        previousCoordinatorID: "coordinator",
+        reason: "previous coordinator session is idle",
+      },
+    });
+    expect(await controller.listFollowedSessions(context)).toEqual({
+      sessions: [],
+    });
+    f.sessions.delete("other");
+    f.sessions.set("third", { ...f.sessions.get("coordinator")!, id: "third" });
+    expect(
+      await controller.adoptSession("worker", {
+        ...context,
+        sessionID: "third",
+      }),
+    ).toMatchObject({
+      takeover: {
+        previousCoordinatorID: "other",
+        reason: "previous coordinator session no longer exists",
+      },
+    });
+    await controller.dispose();
+  });
   it("Rejects competing ownership", async () => {
     const f = fixture(),
       controller = await SessionController.load(f.host);
     f.sessions.set("other", { ...f.sessions.get("coordinator")!, id: "other" });
     await controller.adoptSession("worker", context);
+    f.busy.add("coordinator");
     await expect(
       controller.adoptSession("worker", { ...context, sessionID: "other" }),
     ).rejects.toThrow("another coordinator");

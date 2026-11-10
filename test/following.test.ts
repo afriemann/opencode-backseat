@@ -14,6 +14,7 @@ function fixture(initial?: unknown) {
   let update = emptyPending();
   let status: "admitted" | "uncertain" = "admitted";
   let proof: "admitted" | "unknown" = "unknown";
+  const owner: "gone" | "idle" | "active" = "idle";
   const notifications: FollowNotification[] = [];
   const host: FollowHost = {
     storage: {
@@ -26,6 +27,9 @@ function fixture(initial?: unknown) {
     },
     async target(sessionID) {
       return { sessionID, location: `/project/${sessionID}` };
+    },
+    async ownerState() {
+      return owner;
     },
     async observe(_id, after) {
       return {
