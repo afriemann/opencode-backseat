@@ -1,0 +1,3 @@
+- [x] Add the "Coordinator preserves worker lifecycle" test (red)
+- [x] Add the worker-lifecycle rule to the coordinator system prompt
+- [x] Run `make check`
