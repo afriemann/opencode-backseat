@@ -1007,6 +1007,19 @@ describe("Session recap", () => {
     } as never);
     const session = f.client.session as unknown as Record<string, unknown>;
     session.active = async () => ({});
+    session.list = async (input: { parentID?: string }) => ({
+      data:
+        input.parentID === "child"
+          ? [
+              {
+                ...f.sessions.get("worker")!,
+                id: "grandchild",
+                parentID: "child",
+              },
+            ]
+          : [],
+      cursor: {},
+    });
     session.generate = async (input: { sessionID: string }) =>
       `recap of ${input.sessionID}`;
     const result = await controller.sessionOperation(
@@ -1022,8 +1035,33 @@ describe("Session recap", () => {
     expect(result).toMatchObject({
       sessionID: "child",
       recap: "recap of child",
-      children: [],
+      children: [{ id: "grandchild" }],
+      childrenComplete: true,
     });
+    await controller.dispose();
+  });
+  it("Reports an incomplete child listing without losing the recap", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    const session = f.client.session as unknown as Record<string, unknown>;
+    session.active = async () => ({});
+    session.generate = async () => "the recap";
+    session.list = async () => ({
+      data: [],
+      cursor: { next: "loop" },
+    });
+    expect(
+      await controller.sessionOperation(
+        {
+          operation: "recap_session",
+          sessionID: "worker",
+          location: "/project",
+          agent: "engineer",
+          payload: {},
+        },
+        context,
+      ),
+    ).toMatchObject({ recap: "the recap", childrenComplete: false });
     await controller.dispose();
   });
 });

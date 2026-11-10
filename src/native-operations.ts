@@ -913,7 +913,7 @@ export function prepareNativeOperation(
             parentID: sessionID,
             includeArchived: true,
           });
-          if (!page.available) {
+          if (!page.available || page.deferred?.length) {
             complete = false;
             break;
           }
@@ -927,7 +927,7 @@ export function prepareNativeOperation(
               archived: row.archived,
             });
           cursor = page.cursor;
-          if (cursor && cursors.has(cursor)) {
+          if (cursor && (cursors.has(cursor) || cursors.size >= 50)) {
             complete = false;
             break;
           }
