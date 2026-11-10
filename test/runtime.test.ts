@@ -12,6 +12,7 @@ describe("Restricted conversational coordination", () => {
   it.each([
     "Preserves cross-project control under inherited policy",
     "Rejects disallowed coordinator tool execution",
+    "Allows configured coordination tools and session-local tracking",
     "Bootstraps without disclosing task state",
     "Rejects unauthorised shared-state reads",
   ])("%s", async (scenario) => {
@@ -116,7 +117,15 @@ describe("Restricted conversational coordination", () => {
       agent: {
         list: async () => ({
           location: { directory: home },
-          data: [structuredClone(coordinatorAgent)],
+          data: [
+            {
+              ...structuredClone(coordinatorAgent),
+              permissions: [
+                ...coordinatorAgent.permissions,
+                { action: "*", resource: "*", effect: "allow" },
+              ],
+            },
+          ],
         }),
         transform: async () => registration,
       },
@@ -166,18 +175,73 @@ describe("Restricted conversational coordination", () => {
         return;
       }
       if (scenario === "Rejects disallowed coordinator tool execution") {
+        const denied = [
+          "shell",
+          "bash",
+          "edit",
+          "write",
+          "patch",
+          "read",
+          "glob",
+          "grep",
+          "webfetch",
+          "subagent",
+          "skill",
+          "lsp_find_symbol",
+          "use_workdir",
+        ];
         const catalog = {
           ...identity,
-          tools: { shell: {}, execute: {}, backseat_stop_following: {} },
+          tools: Object.fromEntries(
+            [...denied, "execute", "backseat_stop_following"].map((name) => [
+              name,
+              {},
+            ]),
+          ),
         };
         await hooks.get("context")!(catalog);
         expect(Object.keys(catalog.tools)).toEqual([
           "execute",
           "backseat_stop_following",
         ]);
-        await expect(
-          hooks.get("execute.before")!({ ...identity, tool: "shell" }),
-        ).rejects.toThrow("not permitted");
+        for (const tool of denied) {
+          await expect(
+            hooks.get("execute.before")!({ ...identity, tool }),
+          ).rejects.toThrow("not permitted");
+        }
+        return;
+      }
+      if (
+        scenario ===
+        "Allows configured coordination tools and session-local tracking"
+      ) {
+        const eligible = [
+          "execute",
+          "question",
+          "todowrite",
+          "todoread",
+          "tickets_lookup",
+          "recall_search",
+          "custom_coordination",
+          "websearch",
+        ];
+        const catalog = {
+          ...identity,
+          tools: Object.fromEntries(eligible.map((name) => [name, {}])),
+        };
+        await hooks.get("context")!(catalog);
+        expect(Object.keys(catalog.tools)).toEqual(eligible);
+        for (const tool of eligible)
+          await hooks.get("execute.before")!({ ...identity, tool });
+        const other = {
+          ...identity,
+          sessionID: "worker",
+          agent: "engineer",
+          tools: { shell: {} },
+        };
+        await hooks.get("context")!(other);
+        expect(other.tools).toEqual({ shell: {} });
+        await hooks.get("execute.before")!({ ...other, tool: "shell" });
         return;
       }
       await tools

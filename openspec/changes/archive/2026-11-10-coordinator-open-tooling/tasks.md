@@ -1,0 +1,3 @@
+- [x] Implement D1 and D3 against “Allows configured coordination tools and session-local tracking” and “Rejects disallowed coordinator tool execution”.
+- [x] Implement D2 and D4 against “Asks for unmatched coordination tool actions”, preserving inherited native controls.
+- [x] Author the coordinator prompt against proposal.md and update user/contributor guidance for D2.

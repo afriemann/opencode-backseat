@@ -34,7 +34,7 @@ import {
 } from "./state.ts";
 import {
   createCoordinationTools,
-  COORDINATOR_TOOL_IDS,
+  isCoordinatorToolPermitted,
   COORDINATION_TOOLS,
 } from "./tools.ts";
 import {
@@ -1504,7 +1504,7 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
               if (!(await matchesExecutionRole(event.sessionID, event.agent)))
                 return;
               for (const name of Object.keys(event.tools))
-                if (!COORDINATOR_TOOL_IDS.has(name)) delete event.tools[name];
+                if (!isCoordinatorToolPermitted(name)) delete event.tools[name];
             } catch {
               event.tools = {};
               diagnosticContext(diagnostics, "tool").emit(
@@ -1530,7 +1530,7 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
                 "Coordinator tool identity is unavailable or changed",
               );
             }
-            if (matches && !COORDINATOR_TOOL_IDS.has(event.tool))
+            if (matches && !isCoordinatorToolPermitted(event.tool))
               throw new Error("Coordinator tool is not permitted");
           },
         );
