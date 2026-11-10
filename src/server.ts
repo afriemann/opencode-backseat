@@ -430,23 +430,50 @@ export class SessionController {
       const collect = async () => {
         const members = new Set([sessionID]);
         const visit = async (parentID: string) => {
-          const page = await this.host.native.read((client, signal) =>
-            client.session.list(
-              { parentID, limit: FOLLOW_BOUNDS.followers },
-              { signal },
-            ),
-          );
-          if (
-            page.cursor.next ||
-            page.data.some((child) => child.parentID !== parentID)
-          )
-            throw new Error("Incomplete native subtree inventory");
-          for (const child of page.data) {
+          const children: { id: string }[] = [];
+          const cursors = new Set<string>();
+          let cursor: string | undefined;
+          // The host sets cursor.next on every non-empty page, so only an
+          // empty page proves the listing is complete.
+          for (;;) {
+            const page = await this.host.native.read((client, signal) =>
+              client.session.list(
+                {
+                  parentID,
+                  limit: FOLLOW_BOUNDS.followers,
+                  ...(cursor ? { cursor } : {}),
+                },
+                { signal },
+              ),
+            );
+            const stray = page.data.find((row) => row.parentID !== parentID);
+            if (stray)
+              throw new Error(
+                `Incomplete native subtree inventory: child ${stray.id} of ${parentID} reports parent ${stray.parentID ?? "none"}`,
+              );
+            if (page.data.length === 0) break;
+            children.push(...page.data);
+            if (children.length + members.size > FOLLOW_BOUNDS.followers)
+              throw new Error(
+                `Incomplete native subtree inventory: more than ${FOLLOW_BOUNDS.followers} descendants under ${parentID}`,
+              );
+            const next = page.cursor.next;
+            if (!next) break;
+            if (cursors.has(next))
+              throw new Error(
+                `Incomplete native subtree inventory: repeated continuation after ${children.length} children of ${parentID}`,
+              );
+            cursors.add(next);
+            cursor = next;
+          }
+          for (const child of children) {
             if (
               members.has(child.id) ||
               members.size >= FOLLOW_BOUNDS.followers
             )
-              throw new Error("Incomplete or cyclic native subtree");
+              throw new Error(
+                `Incomplete or cyclic native subtree at ${child.id}`,
+              );
             members.add(child.id);
             await visit(child.id);
           }
