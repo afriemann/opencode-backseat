@@ -421,7 +421,7 @@ describe("Explicit native request replies", () => {
     await controller.adoptSession("worker", context);
     const permission = { requestID: "permission-one", decision: "once" };
     const form = { formID: "form-one", answer: { choice: "continue" } };
-    await controller.sessionOperation(
+    const permissionResult = await controller.sessionOperation(
       {
         operation: "reply_permission",
         sessionID: "worker",
@@ -431,7 +431,7 @@ describe("Explicit native request replies", () => {
       },
       context,
     );
-    await controller.sessionOperation(
+    const formResult = await controller.sessionOperation(
       {
         operation: "reply_form",
         sessionID: "worker",
@@ -441,6 +441,8 @@ describe("Explicit native request replies", () => {
       },
       context,
     );
+    expect(permissionResult).toEqual({ status: "completed" });
+    expect(formResult).toEqual({ status: "completed" });
     expect(
       f.calls.filter(
         (call) => call.startsWith("permission:") || call.startsWith("form:"),
