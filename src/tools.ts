@@ -25,6 +25,7 @@ import {
   refreshNativeSessions,
   type NativeInventory,
 } from "./native-sessions.ts";
+import { NativeConnectionError } from "./native-connection.ts";
 import { exact, integer, list, object, text, fingerprint } from "./state.ts";
 
 const CORE_COORDINATION_TOOLS = [
@@ -79,11 +80,52 @@ export interface CoordinationToolPort {
   authorize(context: ToolContext): Promise<void>;
   signal: AbortSignal;
   now?: () => number;
+  hydrationBudget?: () => AbortSignal;
 }
 const PAGE_TTL = 5 * 60_000,
   PAGE_CAPACITY = 128;
 const SESSION_STATUSES = ["running", "waiting", "inactive", "unknown"] as const;
+const HYDRATION_BUDGET_MS = 5_000;
+const TIME_FILTERS = [
+  "updatedBefore",
+  "updatedAfter",
+  "createdBefore",
+  "createdAfter",
+] as const;
+function timeBound(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const result =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" &&
+          /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2}))?$/.test(
+            value,
+          )
+        ? Date.parse(value)
+        : Number.NaN;
+  if (!Number.isSafeInteger(result) || result < 0)
+    throw new Error(
+      "Invalid time bound; use ISO-8601 with a Z or offset, or Unix milliseconds",
+    );
+  return result;
+}
+function subpathText(value: unknown): string | undefined {
+  const result = optionalText(value);
+  if (
+    result !== undefined &&
+    result.split("/").some((part) => ["", ".", ".."].includes(part))
+  )
+    throw new Error("Invalid subpath; use a relative path inside the location");
+  return result;
+}
 const stringSchema = { type: "string", minLength: 1 } as const;
+const timeSchema = {
+  anyOf: [
+    { type: "integer", minimum: 0 },
+    { ...stringSchema, description: "ISO-8601 timestamp" },
+  ],
+  description: "ISO-8601 string with Z or offset, or Unix milliseconds.",
+} as const;
 type Row = NativeInventory["sessions"][number];
 interface Continuation {
   caller: string;
@@ -91,6 +133,7 @@ interface Continuation {
   expires: number;
   nativeCursor?: string;
   rows: Row[];
+  deferred: Row[];
   degraded: boolean;
 }
 function selection(value: unknown, allowed?: readonly string[]): string[] {
@@ -157,7 +200,13 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         diagnostics,
       )) as T;
     } catch (error) {
-      pages.clear();
+      // Timeouts and cancellations leave the buffered continuation valid.
+      if (!(
+        error instanceof NativeConnectionError &&
+        (error.classification === "timeout" ||
+          error.classification === "cancelled")
+      ))
+        pages.clear();
       throw error;
     }
   };
@@ -181,6 +230,9 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       "location",
       "agent",
       "search",
+      "subpath",
+      "hydrate",
+      ...TIME_FILTERS,
       "parentID",
       "includeSubagents",
       "includeArchived",
@@ -192,6 +244,17 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       v.statuses === undefined
         ? ["inactive", "running", "waiting"]
         : selection(v.statuses, SESSION_STATUSES);
+    if (v.hydrate !== undefined && typeof v.hydrate !== "boolean")
+      throw new Error("Invalid hydrate selection");
+    const hydrate = v.hydrate !== false;
+    if (!hydrate && v.statuses !== undefined)
+      throw new Error("hydrate false cannot filter by statuses");
+    const bounds = Object.fromEntries(
+      TIME_FILTERS.map((name) => [name, timeBound(v[name])]),
+    ) as Record<(typeof TIME_FILTERS)[number], number | undefined>;
+    const subpath = subpathText(v.subpath);
+    if (subpath !== undefined && optionalText(v.projectID) === undefined)
+      throw new Error("subpath requires projectID");
     const location =
       v.location === undefined ? undefined : await canonical(v.location);
     const projectID = optionalText(v.projectID),
@@ -224,6 +287,9 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         location,
         agent,
         search,
+        subpath,
+        hydrate,
+        bounds,
         parentID,
         includeSubagents,
         includeArchived,
@@ -249,14 +315,32 @@ export function createCoordinationTools(port: CoordinationToolPort): {
       (!location || row.location === location) &&
       (!agent || row.agent === agent) &&
       (parentID === undefined || row.parentID === parentID) &&
-      (includeArchived || !row.archived);
-    const buffered = previous?.rows ?? [];
+      (includeArchived || !row.archived) &&
+      (bounds.updatedAfter === undefined ||
+        row.updatedAt >= bounds.updatedAfter) &&
+      (bounds.updatedBefore === undefined ||
+        row.updatedAt < bounds.updatedBefore) &&
+      (bounds.createdAfter === undefined ||
+        row.createdAt >= bounds.createdAfter) &&
+      (bounds.createdBefore === undefined ||
+        row.createdAt < bounds.createdBefore);
+    // Native order is by update time, so a row outside the bound ends the scan.
+    const stop = (row: Row) =>
+      order === "desc"
+        ? bounds.updatedAfter !== undefined &&
+          row.updatedAt < bounds.updatedAfter
+        : bounds.updatedBefore !== undefined &&
+          row.updatedAt >= bounds.updatedBefore;
+    const budget = () =>
+      port.hydrationBudget?.() ?? AbortSignal.timeout(HYDRATION_BUDGET_MS);
+    const countUnknown = (found: readonly Row[]) =>
+      hydrate ? found.filter((row) => row.status === "unknown").length : 0;
+    const buffered = [...(previous?.rows ?? []), ...(previous?.deferred ?? [])];
+    let deferred: Row[] = [];
     let rows = buffered,
       next = previous?.nativeCursor,
       degraded = previous?.degraded ?? false;
-    let unknownCount = buffered.filter(
-      (row) => row.status === "unknown",
-    ).length;
+    let unknownCount = countUnknown(buffered);
     if (!buffered.length && (!previous || next)) {
       const page = await native<NativeInventory>(
         context,
@@ -269,6 +353,10 @@ export function createCoordinationTools(port: CoordinationToolPort): {
               ...(projectID ? { projectID } : {}),
               ...(location ? { location } : {}),
               ...(search ? { search } : {}),
+              ...(subpath ? { subpath } : {}),
+              hydrate,
+              budget,
+              stop,
               ...(parentID !== undefined ? { parentID } : {}),
               includeArchived,
               order,
@@ -287,46 +375,53 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           sessions: [],
           unknownCount: 0,
         };
-      unknownCount = page.sessions.filter(
-        (row) => row.status === "unknown",
-      ).length;
+      unknownCount = countUnknown(page.sessions);
       degraded = degraded || unknownCount > 0;
+      deferred = page.deferred ? [...page.deferred] : [];
       next = page.cursor;
       if (previous?.nativeCursor && next === previous.nativeCursor)
         throw new Error("Continuation did not advance; restart listing");
       rows = page.sessions;
     } else if (previous) {
-      rows = await native<Row[]>(
-        context,
-        (client, signal) =>
-          refreshNativeSessions(
-            client,
-            buffered.filter(matchesMetadata),
-            signal,
-            diagnostics,
-          ),
-        diagnostics,
-      );
-      unknownCount = rows.filter((row) => row.status === "unknown").length;
+      const candidates = buffered.filter(matchesMetadata);
+      if (hydrate) {
+        rows = await native<Row[]>(
+          context,
+          (client, signal) =>
+            refreshNativeSessions(
+              client,
+              candidates,
+              signal,
+              diagnostics,
+              budget,
+            ),
+          diagnostics,
+        );
+        deferred = candidates.slice(rows.length);
+      } else rows = candidates;
+      unknownCount = countUnknown(rows);
       degraded = degraded || unknownCount > 0;
     }
     rows = rows.filter(
       (row) =>
-        statuses.includes(
-          row.status === "waiting-for-input" ? "waiting" : row.status,
-        ) && matchesMetadata(row),
+        (!hydrate ||
+          statuses.includes(
+            row.status === "waiting-for-input" ? "waiting" : row.status,
+          )) &&
+        matchesMetadata(row),
     );
     const result = rows.slice(0, limit),
       remaining = rows.slice(limit);
     alive(context);
     const cursor =
-      remaining.length || next
+      remaining.length || deferred.length || next
         ? remember({
             caller,
             query,
             expires,
             ...(next ? { nativeCursor: next } : {}),
             rows: remaining,
+            deferred,
             degraded,
           })
         : undefined;
@@ -359,7 +454,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   const specs: Record<string, ToolSpec> = {
     list_sessions: {
       description:
-        "List native session metadata and hierarchy across projects without TUI attachment. Statuses are OR-ed; different filters are AND-ed. Defaults: running/waiting/inactive, root sessions only, no archived sessions, limit 50, order desc. includeSubagents includes all levels unless parentID selects roots or direct children. Each call scans at most 200 rows. Continue with the opaque cursor and unchanged filters even after an empty page. partial or unknownCount is not proof of no matches or completion.",
+        "List native session metadata and hierarchy across projects without TUI attachment. Statuses are OR-ed; different filters are AND-ed. Defaults: running/waiting/inactive, root sessions only, no archived sessions, limit 50, order desc. includeSubagents includes all levels unless parentID selects roots or direct children. Updated/created Before bounds are exclusive and After bounds inclusive; with the matching order the scan stops early. subpath is the exact path relative to the project root and requires projectID. hydrate:false skips status reads (status unknown) and cannot combine with statuses. Status reads run under a time budget; unhydrated rows are deferred to the cursor and the result is partial. Each call scans at most 200 rows. Continue with the opaque cursor and unchanged filters even after an empty page. partial or unknownCount is not proof of no matches or completion.",
       input: inputSchema({
         statuses: {
           type: "array",
@@ -370,6 +465,16 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         location: stringSchema,
         agent: stringSchema,
         search: stringSchema,
+        subpath: {
+          ...stringSchema,
+          description:
+            "Exact path relative to the project root; requires projectID.",
+        },
+        hydrate: { type: "boolean", default: true },
+        updatedBefore: timeSchema,
+        updatedAfter: timeSchema,
+        createdBefore: timeSchema,
+        createdAfter: timeSchema,
         parentID: { anyOf: [stringSchema, { type: "null" }] },
         includeSubagents: { type: "boolean", default: false },
         includeArchived: { type: "boolean" },

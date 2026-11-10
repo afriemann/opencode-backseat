@@ -328,9 +328,23 @@ function requestDiagnostics(diagnostics: DiagnosticContext) {
 }
 const hasUnsafeOtherWrite = (mode: number): boolean =>
   (mode & 0o002) !== 0 && (mode & 0o1000) === 0;
-class NativeConnectionError extends Error {}
-const unavailable = (reason: string): Error =>
-  new NativeConnectionError(`Native service ${reason}`);
+export type NativeFailureClass =
+  "timeout" | "cancelled" | "disposed" | "unavailable" | "validation";
+export class NativeConnectionError extends Error {
+  readonly classification: NativeFailureClass;
+  constructor(
+    message: string,
+    classification: NativeFailureClass = "validation",
+  ) {
+    super(message);
+    this.classification = classification;
+  }
+}
+const unavailable = (
+  reason: string,
+  classification?: NativeFailureClass,
+): Error =>
+  new NativeConnectionError(`Native service ${reason}`, classification);
 
 // Read the registered native endpoint without invoking the SDK's credentialed probe.
 export async function readNativeRegistration(
@@ -653,11 +667,16 @@ export function createNativeConnection(options: {
         });
         // Native errors may embed URLs, headers or registration contents.
         if (error instanceof NativeConnectionError) throw error;
-        throw unavailable(
-          lifetime.signal.aborted
-            ? "connection disposed"
-            : "connection unavailable or unsupported",
-        );
+        throw lifetime.signal.aborted
+          ? unavailable("connection disposed", "disposed")
+          : deadline?.aborted
+            ? unavailable("read timed out", "timeout")
+            : callerSignal?.aborted
+              ? unavailable("read cancelled", "cancelled")
+              : unavailable(
+                  "connection unavailable or unsupported",
+                  "unavailable",
+                );
       } finally {
         deadline?.removeEventListener("abort", onDeadline);
         requests.close();

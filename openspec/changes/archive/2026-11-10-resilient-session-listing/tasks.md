@@ -1,0 +1,8 @@
+- [x] 1. Red tests for each scenario in the delta spec, named after its title
+- [x] 2. Parse and validate time bounds, subpath and hydrate; add them to the query fingerprint and allow-list
+- [x] 3. Apply time filters before hydration with early stop (design: Time filters)
+- [x] 4. Hydration budget with deferred rows and injected signal factory (design: Hydration budget)
+- [x] 5. Metadata-only listing for hydrate false (design: hydrate)
+- [x] 6. Safe failure labels and class-based continuation retention (design: Continuation retention, Failure classification)
+- [x] 7. Update the coordinator prompt and README for new filters, hydrate and partial handling
+- [x] 8. make check

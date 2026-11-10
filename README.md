@@ -20,6 +20,8 @@ Backseat targets **OpenCode 2.2.5 (V2)** on Linux, with **Bun 1.4.4** and `/usr/
 
 The coordinator can discover native sessions across projects, including sessions Backseat did not create. It does not change your default agent or model. All coordination happens in the conversation; there is no separate terminal UI.
 
+Session listing can filter by status, project, location and subpath, agent, title and update or creation time (for example, sessions not updated in five days). Status checks are skipped when only metadata is needed, and slow status reads are deferred to a continuation, so large inventories list reliably on a busy host.
+
 It can also use your configured ticket, recall and tracking tools, including session-local todos when available. Other tool actions default to `ask`; your configured native permissions still apply. MCP calls request native permission automatically, while custom plugin tools are responsible for their own permission checks. Built-in implementation tools remain unavailable to the coordinator.
 
 ## Follow an existing session

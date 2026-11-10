@@ -246,6 +246,34 @@ The coordinator SHALL list hierarchical native session metadata with bounded fil
 - **WHEN** sessions share a location
 - **THEN** one location-wide pending-form read serves that refresh and subsequent calls obtain fresh state.
 
+#### Scenario: Filters by update and creation time
+
+- **WHEN** updatedBefore, updatedAfter, createdBefore or createdAfter is given as ISO-8601 with a Z or offset, or Unix milliseconds
+- **THEN** only sessions inside every bound are returned, Before bounds being exclusive and After bounds inclusive, and mismatched sessions are not status-hydrated.
+- **AND** any other value fails explicitly.
+
+#### Scenario: Stops scanning once no later session can match
+
+- **WHEN** order is descending with updatedAfter, or ascending with updatedBefore, and a scanned session already falls outside the bound
+- **THEN** scanning stops and no continuation is offered for the remainder.
+
+#### Scenario: Filters by project subpath
+
+- **WHEN** subpath is given with projectID
+- **THEN** only sessions at that exact path relative to the project root are returned and the subpath binds continuations.
+- **AND** subpath without projectID fails explicitly.
+
+#### Scenario: Lists metadata without status hydration
+
+- **WHEN** hydrate is false
+- **THEN** rows carry metadata with status unknown and no status reads occur.
+- **AND** combining hydrate false with statuses fails explicitly, and a continuation cannot be reused with a different hydrate value.
+
+#### Scenario: Defers rows when the hydration budget is spent
+
+- **WHEN** status hydration exceeds its time budget
+- **THEN** at least one batch is hydrated, the remaining rows stay in the continuation, and the result is partial rather than failing or reporting unhydrated rows as unknown.
+
 ### Requirement: Conversational manual assignment
 
 The coordinator SHALL send requested input directly to selected sessions without task, observer, resume or automation prerequisites.
@@ -492,3 +520,23 @@ The plugin SHALL provide a coordinator tool that lists the enabled native models
 
 - **WHEN** the native model list reports a different location than requested or exceeds the catalog bound
 - **THEN** the tool fails instead of returning a partial or mismatched list.
+
+### Requirement: Retryable native failures
+
+The coordinator SHALL report a native read failure with a fixed safe cause and SHALL keep stored continuations usable after a timeout or cancellation.
+
+#### Scenario: Reports a timeout distinctly
+
+- **WHEN** a native read exceeds its deadline
+- **THEN** the error states the read timed out, and never includes URLs, headers or registration contents.
+
+#### Scenario: Retries a continuation after a timeout
+
+- **GIVEN** a continuation and a native read that timed out or was cancelled
+- **WHEN** the same continuation is requested again before it expires
+- **THEN** the listing resumes from it without a restart and its expiry is unchanged.
+
+#### Scenario: Discards continuations after disposal or identity failure
+
+- **WHEN** the plugin is disposed, or registration or identity validation fails
+- **THEN** stored continuations are discarded and later use fails with a restart-listing message.
