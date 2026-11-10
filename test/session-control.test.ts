@@ -321,6 +321,9 @@ describe("Explicit adoption", () => {
     expect(await controller.listFollowedSessions(context)).toEqual({
       sessions: [],
     });
+    expect(await controller.listFollowedSessions(other)).toMatchObject({
+      sessions: [{ sessionID: "worker" }],
+    });
     f.sessions.delete("other");
     f.sessions.set("third", { ...f.sessions.get("coordinator")!, id: "third" });
     expect(

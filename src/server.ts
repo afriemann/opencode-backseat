@@ -124,10 +124,16 @@ export class SessionController {
       },
       async ownerState(coordinatorID) {
         return host.native.read(async (client, signal) => {
-          const owner = await client.session.get(
-            { sessionID: coordinatorID },
-            { signal },
-          );
+          const owner = await client.session
+            .get({ sessionID: coordinatorID }, { signal })
+            .catch((error: unknown) => {
+              if (
+                (error as { _tag?: string } | null)?._tag ===
+                "SessionNotFoundError"
+              )
+                return undefined;
+              throw error;
+            });
           if (!owner || owner.id !== coordinatorID) return "gone";
           const active = await client.session.active({ signal });
           return active[coordinatorID] ? "active" : "idle";
@@ -863,9 +869,17 @@ export class NativeFollower {
           const timer = this.timers.get(previous);
           if (timer) clearTimeout(timer);
           this.timers.delete(previous);
+          this.retryDelays.delete(previous);
         }
-        if (row.pending.requests.length || row.pending.discontinuity)
+        const pending = row.pending;
+        if (
+          pending.idle ||
+          pending.failed ||
+          pending.discontinuity ||
+          pending.requests.length
+        )
           await this.deliver(coordinatorID);
+        else if (pending.progress) this.schedule(coordinatorID);
         return {
           previousCoordinatorID: previous,
           reason:
