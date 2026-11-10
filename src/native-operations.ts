@@ -552,7 +552,7 @@ export interface SessionOperation {
   operation: NativeOperationName;
   sessionID: string;
   location: string;
-  agent: string;
+  agent?: string;
   payload: Record<string, unknown>;
 }
 type Work = (client: OpenCodeClient, signal: AbortSignal) => Promise<unknown>;

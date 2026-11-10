@@ -46,7 +46,7 @@ export interface SessionDelivery {
   id: string;
   sessionID: string;
   location: string;
-  agent: string;
+  agent?: string;
   parentID?: string;
   coordinatorID: string;
   serviceID: string;
@@ -190,7 +190,7 @@ function parseSessionDelivery(value: unknown): SessionDelivery {
     id,
     sessionID: text(v.sessionID),
     location: text(v.location),
-    agent: text(v.agent),
+    ...(v.agent === undefined ? {} : { agent: text(v.agent) }),
     ...(v.parentID === undefined ? {} : { parentID: text(v.parentID) }),
     coordinatorID: text(v.coordinatorID),
     serviceID: text(v.serviceID),
