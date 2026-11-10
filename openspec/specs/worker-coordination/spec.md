@@ -76,6 +76,11 @@ The plugin SHALL provide a selectable primary coordinator agent wherever it is e
 - **AND** a definition with the same identifier, exact coordinator instructions, visible primary mode and exact ordered coordinator permission prefix receives the same restricted coordinator behavior, regardless of inherited suffix rules; recognition does not authenticate authorship.
 - **AND** a different definition stays user-controlled and unavailable as the coordinator rather than being overwritten or repurposed.
 
+#### Scenario: Allows Backseat operations by default
+
+- **WHEN** the coordinator invokes a Backseat native operation and no inherited rule matches its `backseat.` permission action
+- **THEN** the operation is allowed, while an inherited ask or deny rule appended to the coordinator's permission prefix still applies.
+
 ### Requirement: Restricted conversational coordination
 
 The plugin SHALL restrict matching coordinator roles to Backseat tools through Code Mode and user questions, subject to configured OpenCode permissions.
