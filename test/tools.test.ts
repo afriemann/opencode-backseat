@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
+import { NativeConnectionError } from "../src/native-connection.ts";
 import {
   createCoordinationTools,
   type CoordinationToolPort,
@@ -717,6 +718,295 @@ describe("Fine-grained Code Mode queries", () => {
         includeSubagents: true,
         cursor: continued.cursor,
       }),
+    ).rejects.toThrow("Continuation");
+  });
+
+  it("Filters by update and creation time", async () => {
+    const f = fixture();
+    f.rows.splice(0);
+    for (const [id, created, updated] of [
+      ["old", 1_000, 2_000],
+      ["mid", 3_000, 4_000],
+      ["new", 5_000, 6_000],
+    ] as const)
+      f.rows.push({
+        id,
+        title: id,
+        projectID: "project",
+        agent: "engineer",
+        location: { directory: "/projects/one" },
+        time: { created, updated },
+      } as SessionInfo);
+    const hydrated: string[] = [];
+    const get = f.client.session.get;
+    f.client.session.get = async (input) => {
+      hydrated.push(input.sessionID);
+      return get(input);
+    };
+    const ids = async (input: Record<string, unknown>) =>
+      ((await f.call("list_sessions", input)).sessions as { id: string }[]).map(
+        (row) => row.id,
+      );
+    expect(await ids({ updatedAfter: 4_000 })).toEqual(["mid", "new"]);
+    expect(await ids({ updatedBefore: 4_000 })).toEqual(["old"]);
+    expect(await ids({ createdAfter: 3_000, createdBefore: 5_000 })).toEqual([
+      "mid",
+    ]);
+    hydrated.length = 0;
+    expect(await ids({ updatedAfter: new Date(4_000).toISOString() })).toEqual([
+      "mid",
+      "new",
+    ]);
+    expect(hydrated.sort()).toEqual(["mid", "new"]);
+    expect(await ids({ updatedAfter: "1970-01-01T01:00:04+01:00" })).toEqual([
+      "mid",
+      "new",
+    ]);
+    expect(await ids({ updatedAfter: "1970-01-01" })).toEqual([
+      "old",
+      "mid",
+      "new",
+    ]);
+    for (const bad of ["yesterday", "1970-01-01T00:00:04", -1, 1.5, true])
+      await expect(ids({ updatedBefore: bad })).rejects.toThrow("time");
+  });
+
+  it("Stops scanning once no later session can match", async () => {
+    const stopping = [
+      { order: "desc", bound: { updatedAfter: 4_000 } },
+      { order: "asc", bound: { updatedBefore: 4_000 } },
+    ] as const;
+    for (const { order, bound } of stopping) {
+      const f = fixture();
+      f.rows.splice(0);
+      for (const [id, updated] of [
+        ["a", order === "desc" ? 5_000 : 1_000],
+        ["b", order === "desc" ? 3_000 : 5_000],
+      ] as const)
+        f.rows.push({
+          id,
+          title: id,
+          projectID: "project",
+          agent: "engineer",
+          location: { directory: "/projects/one" },
+          time: { created: 1, updated },
+        } as SessionInfo);
+      f.cursor("more-native-pages");
+      const result = await f.call("list_sessions", { order, ...bound });
+      expect(result.cursor).toBeUndefined();
+      expect(result.partial).toBe(false);
+    }
+    const f = fixture();
+    f.cursor("more-native-pages");
+    expect((await f.call("list_sessions", { updatedAfter: 0 })).cursor).toEqual(
+      expect.any(String),
+    );
+  });
+
+  it("Filters by project subpath", async () => {
+    const f = fixture();
+    f.cursor("more");
+    const first = await f.call("list_sessions", {
+      projectID: "project",
+      subpath: "packages/app",
+      limit: 1,
+    });
+    const cursor = first.cursor;
+    expect(f.queries[0]).toMatchObject({
+      project: "project",
+      subpath: "packages/app",
+    });
+    await expect(
+      f.call("list_sessions", {
+        projectID: "project",
+        subpath: "packages/web",
+        limit: 1,
+        cursor,
+      }),
+    ).rejects.toThrow("Continuation");
+    await expect(
+      f.call("list_sessions", { subpath: "packages/app" }),
+    ).rejects.toThrow("projectID");
+    for (const bad of ["/abs", "../up", "", "a/", "./a", "a//b"])
+      await expect(
+        f.call("list_sessions", { projectID: "project", subpath: bad }),
+      ).rejects.toThrow();
+  });
+
+  it("Lists metadata without status hydration", async () => {
+    const f = fixture();
+    let reads = 0;
+    f.client.session.get = async () => {
+      reads++;
+      throw new Error("must not hydrate");
+    };
+    f.client.session.active = async () => {
+      reads++;
+      return {};
+    };
+    f.cursor("more");
+    const first = await f.call("list_sessions", { hydrate: false, limit: 2 });
+    const cursor = first.cursor;
+    expect(reads).toBe(0);
+    expect(first).toMatchObject({
+      sessions: [
+        { id: "running", status: "unknown" },
+        { id: "inactive", status: "unknown" },
+      ],
+      unknownCount: 0,
+      cursor: expect.any(String),
+    });
+    await expect(
+      f.call("list_sessions", { hydrate: false, statuses: ["running"] }),
+    ).rejects.toThrow("hydrate");
+    await expect(f.call("list_sessions", { limit: 2, cursor })).rejects.toThrow(
+      "Continuation",
+    );
+    expect(
+      await f.call("list_sessions", { hydrate: false, limit: 2, cursor }),
+    ).toMatchObject({
+      sessions: [{ id: "unknown", status: "unknown" }],
+      unknownCount: 0,
+    });
+    expect(reads).toBe(0);
+  });
+
+  it("Defers rows when the hydration budget is spent", async () => {
+    const manyRows = (f: ReturnType<typeof fixture>) => {
+      f.rows.splice(0);
+      for (let index = 0; index < 20; index++)
+        f.rows.push({
+          id: `r${index}`,
+          title: `r${index}`,
+          projectID: "project",
+          agent: "engineer",
+          location: { directory: "/projects/one" },
+          time: { created: 1, updated: 1 },
+        } as SessionInfo);
+    };
+    const spent = new AbortController();
+    spent.abort();
+    const setBudget = (
+      f: ReturnType<typeof fixture>,
+      budget: () => AbortSignal,
+    ) => {
+      (f.port as { hydrationBudget?: () => AbortSignal }).hydrationBudget =
+        budget;
+    };
+    const f = fixture();
+    manyRows(f);
+    setBudget(f, () => spent.signal);
+    const first = await f.call("list_sessions", {});
+    const cursor = first.cursor;
+    expect(first).toMatchObject({
+      partial: true,
+      unknownCount: 0,
+      cursor: expect.any(String),
+    });
+    const firstIds = (first.sessions as { id: string; status: string }[]).map(
+      (row) => row.id,
+    );
+    expect(firstIds.length).toBeGreaterThanOrEqual(1);
+    expect(firstIds.length).toBeLessThan(20);
+    expect(
+      (first.sessions as { status: string }[]).every(
+        (row) => row.status === "inactive",
+      ),
+    ).toBe(true);
+    setBudget(f, () => new AbortController().signal);
+    const second = await f.call("list_sessions", { cursor });
+    expect(second.cursor).toBeUndefined();
+    expect([
+      ...firstIds,
+      ...(second.sessions as { id: string }[]).map((r) => r.id),
+    ]).toEqual(f.rows.map((row) => row.id));
+
+    const filtered = fixture();
+    manyRows(filtered);
+    filtered.client.session.active = async () =>
+      ({ r19: { type: "running" } }) as never;
+    setBudget(filtered, () => spent.signal);
+    const page1 = await filtered.call("list_sessions", {
+      statuses: ["running"],
+    });
+    const cursor1 = page1.cursor;
+    const page2 = await filtered.call("list_sessions", {
+      statuses: ["running"],
+      cursor: cursor1,
+    });
+    const cursor2 = page2.cursor;
+    expect(page1.sessions).toEqual([]);
+    expect(page2.sessions).toEqual([]);
+    expect(cursor2).toEqual(expect.any(String));
+    setBudget(filtered, () => new AbortController().signal);
+    const page3 = await filtered.call("list_sessions", {
+      statuses: ["running"],
+      cursor: cursor2,
+    });
+    expect(page3).toMatchObject({
+      sessions: [{ id: "r19", status: "running" }],
+    });
+    expect(page3.cursor).toBeUndefined();
+
+    const overrun = fixture();
+    manyRows(overrun);
+    const during = new AbortController();
+    setBudget(overrun, () => during.signal);
+    const get = overrun.client.session.get;
+    overrun.client.session.get = async (input) => {
+      if (input.sessionID === "r8") during.abort();
+      return get(input);
+    };
+    const page = await overrun.call("list_sessions", {});
+    expect((page.sessions as { id: string }[]).map((row) => row.id)).toEqual(
+      Array.from({ length: 8 }, (_, index) => `r${index}`),
+    );
+    expect(page.cursor).toEqual(expect.any(String));
+  });
+
+  it("Retries a continuation after a timeout", async () => {
+    for (const classification of ["timeout", "cancelled"] as const) {
+      const f = fixture();
+      const read = f.port.native.read;
+      const first = await f.call("list_sessions", { limit: 1 });
+      const cursor = first.cursor;
+      expect(cursor).toEqual(expect.any(String));
+      f.port.native.read = async () => {
+        throw new NativeConnectionError(
+          "Native service failed",
+          classification,
+        );
+      };
+      f.advance(200_000);
+      await expect(
+        f.call("list_sessions", { limit: 1, cursor }),
+      ).rejects.toThrow("failed");
+      f.port.native.read = read;
+      expect(await f.call("list_sessions", { limit: 1, cursor })).toMatchObject(
+        { sessions: [{ id: "inactive" }] },
+      );
+      f.advance(100_001);
+      await expect(
+        f.call("list_sessions", { limit: 1, cursor }),
+      ).rejects.toThrow("Continuation");
+    }
+  });
+
+  it("Discards continuations after disposal or identity failure", async () => {
+    const f = fixture();
+    const read = f.port.native.read;
+    const first = await f.call("list_sessions", { limit: 1 });
+    f.port.native.read = async () => {
+      throw new NativeConnectionError(
+        "Native service registration unavailable",
+      );
+    };
+    await expect(
+      f.call("list_sessions", { limit: 1, cursor: first.cursor }),
+    ).rejects.toThrow("registration");
+    f.port.native.read = read;
+    await expect(
+      f.call("list_sessions", { limit: 1, cursor: first.cursor }),
     ).rejects.toThrow("Continuation");
   });
 

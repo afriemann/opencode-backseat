@@ -179,9 +179,7 @@ describe("Automatic same-service native connection", () => {
               ),
             );
           }),
-        ).rejects.toThrow(
-          "Native service connection unavailable or unsupported",
-        );
+        ).rejects.toThrow("Native service read timed out");
         expect(
           records.find(({ event }) => event === "native.requests.deadline")
             ?.fields,
@@ -212,6 +210,26 @@ describe("Automatic same-service native connection", () => {
       const count = records.length;
       deadline.abort();
       expect(records).toHaveLength(count);
+    } finally {
+      timeout.mockRestore();
+      f.connection.dispose();
+    }
+  });
+
+  it("Reports a timeout distinctly", async () => {
+    const f = fixture();
+    const deadline = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(
+      deadline.signal,
+    );
+    try {
+      const error = await f.connection
+        .read(async () => {
+          deadline.abort();
+          throw new Error("PRIVATE_NATIVE_SENTINEL http://127.0.0.1");
+        })
+        .catch((caught: unknown) => caught as Error);
+      expect(error.message).toBe("Native service read timed out");
     } finally {
       timeout.mockRestore();
       f.connection.dispose();
@@ -269,7 +287,9 @@ describe("Automatic same-service native connection", () => {
         if (kind === "success") expect(await result).toBe("unchanged result");
         else
           await expect(result).rejects.toThrow(
-            "Native service connection unavailable or unsupported",
+            kind === "deadline"
+              ? "Native service read timed out"
+              : "Native service connection unavailable or unsupported",
           );
         const count = throwing.calls.length;
         deadline.abort();
@@ -401,7 +421,11 @@ describe("Automatic same-service native connection", () => {
             ? "Native service connection disposed"
             : kind === "validation"
               ? "Native service registration unavailable"
-              : "Native service connection unavailable or unsupported",
+              : kind === "timeout"
+                ? "Native service read timed out"
+                : kind === "cancelled"
+                  ? "Native service read cancelled"
+                  : "Native service connection unavailable or unsupported",
         );
         expect(failures).toHaveLength(1);
         expect(failures[0]).toMatchObject({

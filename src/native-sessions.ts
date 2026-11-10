@@ -313,6 +313,7 @@ export interface NativeInventory {
   partial: boolean;
   reason?: string;
   cursor?: string;
+  deferred?: NativeInventory["sessions"];
   sessions: {
     id: string;
     title: string;
@@ -335,11 +336,15 @@ export async function readNativeInventory(
     projectID?: string;
     location?: string;
     search?: string;
+    subpath?: string;
     parentID?: string | null;
     includeArchived?: boolean;
     order?: "asc" | "desc";
     limit?: number;
     select?: (row: NativeInventory["sessions"][number]) => boolean;
+    stop?: (row: NativeInventory["sessions"][number]) => boolean;
+    hydrate?: boolean;
+    budget?: () => AbortSignal;
   } = {},
   diagnostics?: DiagnosticContext,
 ): Promise<NativeInventory> {
@@ -356,6 +361,7 @@ export async function readNativeInventory(
         ...(query.projectID !== undefined ? { project: query.projectID } : {}),
         ...(query.location !== undefined ? { directory: query.location } : {}),
         ...(query.search !== undefined ? { search: query.search } : {}),
+        ...(query.subpath !== undefined ? { subpath: query.subpath } : {}),
         ...(query.parentID !== undefined ? { parentID: query.parentID } : {}),
         ...(query.order !== undefined ? { order: query.order } : {}),
         ...(cursor ? { cursor } : {}),
@@ -367,16 +373,24 @@ export async function readNativeInventory(
       new Set(page.data.map((w) => w.id)).size !== page.data.length
     )
       throw new Error("Incomplete native inventory");
-    phase = "refresh";
-    const sessions = await refreshNativeSessions(
-      client,
-      page.data
-        .map(sessionMetadata)
-        .filter((row) => !query.select || query.select(row)),
-      signal,
-      diagnostics,
+    const metadata = page.data.map(sessionMetadata);
+    const candidates = metadata.filter(
+      (row) => !query.select || query.select(row),
     );
-    const next = page.cursor.next ?? undefined;
+    phase = "refresh";
+    const sessions =
+      query.hydrate === false
+        ? candidates
+        : await refreshNativeSessions(
+            client,
+            candidates,
+            signal,
+            diagnostics,
+            query.budget,
+          );
+    const deferred = candidates.slice(sessions.length);
+    const exhausted = Boolean(query.stop && metadata.some(query.stop));
+    const next = exhausted ? undefined : (page.cursor.next ?? undefined);
     diagnostics?.emit("debug", "inventory.completed", {
       phase,
       count: sessions.length,
@@ -384,15 +398,21 @@ export async function readNativeInventory(
     });
     return {
       available: true,
-      partial: Boolean(next) || sessions.some((s) => s.status === "unknown"),
+      partial:
+        Boolean(next) ||
+        deferred.length > 0 ||
+        (query.hydrate !== false &&
+          sessions.some((s) => s.status === "unknown")),
       ...(next ? { cursor: next } : {}),
+      ...(deferred.length ? { deferred } : {}),
       sessions,
     };
-  } catch {
+  } catch (error) {
     signal?.throwIfAborted();
     diagnostics?.emit("warn", "inventory.degraded", {
       phase,
       classification: "unavailable",
+      errorClass: error instanceof Error ? error.name : typeof error,
       continuation: Boolean(cursor),
     });
     return {
@@ -427,6 +447,7 @@ export async function refreshNativeSessions(
   rows: readonly NativeInventory["sessions"][number][],
   signal?: AbortSignal,
   diagnostics?: DiagnosticContext,
+  budget?: () => AbortSignal,
 ): Promise<NativeInventory["sessions"]> {
   if (rows.length > NATIVE_BOUNDS.catalogRows)
     throw new Error("Native inventory exceeds its bound");
@@ -447,22 +468,24 @@ export async function refreshNativeSessions(
   const forms = new Map<string, Promise<LocationForms>>();
   const read = async (
     worker: NativeInventory["sessions"][number],
+    readSignal: AbortSignal | undefined,
   ): Promise<NativeInventory["sessions"][number]> => {
     let status: NativeInventory["sessions"][number]["status"] = "unknown";
     let metadata = worker;
     try {
       if (!active) throw new Error("Native activity unavailable");
       const location = worker.location;
+      const locationRequest = readSignal ? { signal: readSignal } : undefined;
       if (!permissions.has(location))
         permissions.set(
           location,
           client.permission.request.list(
             { location: { directory: location } },
-            request,
+            locationRequest,
           ),
         );
       if (!forms.has(location))
-        forms.set(location, readLocationForms(client, location, signal));
+        forms.set(location, readLocationForms(client, location, readSignal));
       const state = await readNativeLiveState(
         client,
         {
@@ -470,7 +493,7 @@ export async function refreshNativeSessions(
           location: worker.location,
           ...(worker.agent ? { agent: worker.agent } : {}),
         },
-        signal,
+        readSignal,
         {
           active,
           permissions: permissions.get(location)!,
@@ -496,16 +519,27 @@ export async function refreshNativeSessions(
       status,
     };
   };
+  const budgetSignal = budget?.();
   for (
     let offset = 0;
     offset < rows.length;
     offset += NATIVE_BOUNDS.concurrentReads
   ) {
-    sessions.push(
-      ...(await Promise.all(
-        rows.slice(offset, offset + NATIVE_BOUNDS.concurrentReads).map(read),
-      )),
+    // The first batch always completes so that every call makes progress.
+    const bounded = offset > 0 && budgetSignal !== undefined;
+    if (bounded && budgetSignal.aborted) break;
+    const batchSignal = bounded
+      ? signal
+        ? AbortSignal.any([signal, budgetSignal])
+        : budgetSignal
+      : signal;
+    const batch = await Promise.all(
+      rows
+        .slice(offset, offset + NATIVE_BOUNDS.concurrentReads)
+        .map((row) => read(row, batchSignal)),
     );
+    if (bounded && budgetSignal.aborted) break;
+    sessions.push(...batch);
   }
   const after = await client.session.active(request).catch(() => undefined);
   for (const session of sessions)
