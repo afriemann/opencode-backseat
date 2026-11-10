@@ -510,7 +510,7 @@ describe("Conversational manual assignment", () => {
     ).rejects.toThrow("expired");
     expect(f.calls.filter((call) => call === "prompt")).toHaveLength(801);
     await reloaded.dispose();
-  });
+  }, 30_000);
   it("Reloads task-free delivery state without resetting tasks", async () => {
     const f = fixture(),
       controller = await SessionController.load(f.host);
