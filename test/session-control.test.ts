@@ -22,6 +22,9 @@ function fixture() {
     notices: unknown[] = [];
   let uncertain = false;
   const missing = new Set<string>();
+  const children = new Map<string, SessionInfo[]>();
+  let pageSize = 1000;
+  let fixedCursor = false;
   const sessions = new Map<string, SessionInfo>(
     ["coordinator", "worker"].map((id) => [
       id,
@@ -87,8 +90,21 @@ function fixture() {
         calls.push("interrupt");
         return true;
       },
-      async list() {
-        return { data: [], cursor: { next: undefined } };
+      async list(input: { parentID?: string; cursor?: string }) {
+        const rows = children.get(input.parentID ?? "") ?? [];
+        const start = input.cursor && !fixedCursor ? Number(input.cursor) : 0;
+        const data = rows.slice(start, start + pageSize);
+        return {
+          data,
+          cursor: {
+            next:
+              data.length > 0
+                ? fixedCursor
+                  ? "same"
+                  : String(start + data.length)
+                : undefined,
+          },
+        };
       },
       async update(input: { sessionID: string }) {
         calls.push("update");
@@ -201,6 +217,13 @@ function fixture() {
     sessions,
     missing,
     busy,
+    children,
+    paging(size: number) {
+      pageSize = size;
+    },
+    repeatCursor() {
+      fixedCursor = true;
+    },
     deny() {
       denied = true;
     },
@@ -585,6 +608,72 @@ describe("Conversational manual assignment", () => {
       sessions: [],
     });
     expect(f.calls.filter((call) => call === "remove")).toHaveLength(1);
+    await controller.dispose();
+  });
+  const child = (f: ReturnType<typeof fixture>, id: string, parentID: string) =>
+    ({ ...f.sessions.get("worker")!, id, parentID }) as SessionInfo;
+  it("Inventories a multi-level subtree across pages", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    f.children.set(
+      "worker",
+      ["a", "b", "c"].map((id) => child(f, id, "worker")),
+    );
+    f.children.set("b", [child(f, "d", "b")]);
+    f.paging(2);
+    expect(await controller.deleteSession("worker", context)).toMatchObject({
+      members: ["a", "b", "c", "d", "worker"],
+      status: "admitted",
+    });
+    await controller.dispose();
+  });
+  it("Names the child that reports a different parent", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    f.children.set("worker", [child(f, "x", "other")]);
+    await expect(controller.deleteSession("worker", context)).rejects.toThrow(
+      "child x of worker",
+    );
+    expect(f.calls).not.toContain("remove");
+    await controller.dispose();
+  });
+  it("Rejects a repeated continuation and an oversized subtree", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    f.children.set("worker", [child(f, "a", "worker")]);
+    f.paging(1);
+    f.repeatCursor();
+    await expect(controller.deleteSession("worker", context)).rejects.toThrow(
+      "repeated continuation",
+    );
+    const g = fixture(),
+      second = await SessionController.load(g.host);
+    g.children.set(
+      "worker",
+      Array.from({ length: 1025 }, (_, i) => child(g, `c${i}`, "worker")),
+    );
+    g.paging(100);
+    await expect(second.deleteSession("worker", context)).rejects.toThrow(
+      "more than 1024 descendants",
+    );
+    expect(f.calls.concat(g.calls)).not.toContain("remove");
+    await controller.dispose();
+    await second.dispose();
+  });
+  it("Rejects a subtree that changes before deletion", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    let reads = 0;
+    const list = f.client.session.list.bind(f.client.session);
+    f.client.session.list = (async (input: never) => {
+      const page = await list(input);
+      if (++reads === 1) f.children.set("worker", [child(f, "late", "worker")]);
+      return page;
+    }) as typeof list;
+    await expect(controller.deleteSession("worker", context)).rejects.toThrow(
+      "subtree changed",
+    );
+    expect(f.calls).not.toContain("remove");
     await controller.dispose();
   });
   it("Rejects unsafe deletion and retains uncertain outcomes", async () => {
