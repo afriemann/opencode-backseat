@@ -951,3 +951,79 @@ describe("Full native session controls", () => {
     await controller.dispose();
   });
 });
+
+describe("Session recap", () => {
+  it("Recaps a session with its subagents listed", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    const prompts: unknown[] = [];
+    const session = f.client.session as unknown as Record<string, unknown>;
+    session.generate = async (input: { sessionID: string; prompt: string }) => {
+      prompts.push(input);
+      return `recap of ${input.sessionID}`;
+    };
+    session.active = async () => ({});
+    session.list = async (input: { parentID?: string }) => ({
+      data:
+        input.parentID === "worker"
+          ? [
+              {
+                ...f.sessions.get("worker")!,
+                id: "child",
+                title: "Child task",
+                parentID: "worker",
+              },
+            ]
+          : [],
+      cursor: {},
+    });
+    const result = await controller.sessionOperation(
+      {
+        operation: "recap_session",
+        sessionID: "worker",
+        location: "/project",
+        agent: "engineer",
+        payload: { focus: "failing tests" },
+      },
+      context,
+    );
+    expect(result).toMatchObject({
+      sessionID: "worker",
+      recap: "recap of worker",
+      children: [{ id: "child", title: "Child task", agent: "engineer" }],
+    });
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts[0])).toContain("failing tests");
+    expect(f.calls).toContain("backseat.recap_session");
+    await controller.dispose();
+  });
+  it("Recaps a subagent on demand", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    f.sessions.set("child", {
+      ...f.sessions.get("worker")!,
+      id: "child",
+      parentID: "worker",
+    } as never);
+    const session = f.client.session as unknown as Record<string, unknown>;
+    session.active = async () => ({});
+    session.generate = async (input: { sessionID: string }) =>
+      `recap of ${input.sessionID}`;
+    const result = await controller.sessionOperation(
+      {
+        operation: "recap_session",
+        sessionID: "child",
+        location: "/project",
+        agent: "engineer",
+        payload: {},
+      },
+      context,
+    );
+    expect(result).toMatchObject({
+      sessionID: "child",
+      recap: "recap of child",
+      children: [],
+    });
+    await controller.dispose();
+  });
+});

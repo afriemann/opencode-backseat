@@ -13,6 +13,7 @@ import type {
 import { PAYLOAD_BYTES, bulkText, exact, text, list, object } from "./state.ts";
 import { Form, Session, SessionMessage } from "@opencode/client/effect";
 import { Schema } from "effect";
+import { readNativeInventory } from "./native-sessions.ts";
 
 const string = { type: "string", minLength: 1 } as const;
 const strings = { type: "array", items: string } as const;
@@ -455,6 +456,11 @@ export const NATIVE_OPERATIONS = {
       "Generate text against the selected native session with prompt, without inserting a user message. This invokes the configured model and returns generated text.",
     input: schema({ prompt: string }, ["prompt"]),
   },
+  recap_session: {
+    description:
+      "Recap the selected native session: its own model summarizes goal, work done, current state, open problems and next steps without inserting a message. Optional focus guides the recap. The result lists the session's direct child sessions (id, title, agent, status); recap one by calling this tool again with its id and location. Sends the transcript to that session's model.",
+    input: schema({ focus: string }, []),
+  },
   stage_session_revert: {
     description:
       "Stage a native revert at messageID, optionally including files. Inspect the returned native revert before committing it.",
@@ -554,6 +560,8 @@ export interface SessionOperation {
   payload: Record<string, unknown>;
 }
 type Work = (client: OpenCodeClient, signal: AbortSignal) => Promise<unknown>;
+const RECAP_PROMPT =
+  "Recap this session for a coordinator who has not read it: the goal, what was done, the current state, open problems or failures, pending decisions, and next steps. Be concise and factual; mention subagent work only briefly.";
 const simple = (execute: Work): PreparedOperation => ({
   subject: async () => null,
   execute,
@@ -883,6 +891,50 @@ export function prepareNativeOperation(
       return simple((client, signal) =>
         client.session.generate({ sessionID, prompt }, { signal }),
       );
+    }
+    case "recap_session": {
+      const focus =
+        value.focus === undefined ? undefined : bulkText(value.focus);
+      const prompt = [
+        RECAP_PROMPT,
+        ...(focus === undefined ? [] : [`Focus especially on: ${focus}`]),
+      ].join("\n");
+      return simple(async (client, signal) => {
+        const recap = await client.session.generate(
+          { sessionID, prompt },
+          { signal },
+        );
+        const children: unknown[] = [];
+        const cursors = new Set<string>();
+        let cursor: string | undefined,
+          complete = true;
+        do {
+          const page = await readNativeInventory(client, cursor, signal, {
+            parentID: sessionID,
+            includeArchived: true,
+          });
+          if (!page.available) {
+            complete = false;
+            break;
+          }
+          for (const row of page.sessions)
+            children.push({
+              id: row.id,
+              title: row.title,
+              ...(row.agent ? { agent: row.agent } : {}),
+              status: row.status,
+              location: row.location,
+              archived: row.archived,
+            });
+          cursor = page.cursor;
+          if (cursor && cursors.has(cursor)) {
+            complete = false;
+            break;
+          }
+          if (cursor) cursors.add(cursor);
+        } while (cursor);
+        return { sessionID, recap, children, childrenComplete: complete };
+      });
     }
     case "stage_session_revert": {
       const messageID = text(value.messageID),
