@@ -26,6 +26,21 @@ describe("Bundled conversational coordinator", () => {
 });
 
 // spec: openspec/specs/worker-coordination/spec.md
+describe("Conversational manual assignment", () => {
+  it("Coordinator preserves worker lifecycle", () => {
+    expect(coordinatorAgent.system).toContain(
+      "Workers run their own configured instructions and lifecycle.",
+    );
+    expect(coordinatorAgent.system).toContain(
+      "never prescribe, shorten, waive or override how the worker does its work",
+    );
+    expect(coordinatorAgent.system).toContain(
+      "relay it to the user instead of answering on their behalf, unless the user delegated that decision",
+    );
+  });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
 describe("Restricted conversational coordination", () => {
   it("Asks for unmatched coordination tool actions", () => {
     for (const action of [
