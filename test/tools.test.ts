@@ -81,6 +81,38 @@ function fixture() {
         };
       },
     },
+    model: {
+      async list(input: { location: { directory: string } }) {
+        return {
+          location: {
+            directory:
+              input.location.directory === "/projects/one"
+                ? "/projects/one"
+                : "/elsewhere",
+          },
+          data: [
+            {
+              id: "anthropic/sonnet",
+              modelID: "sonnet",
+              providerID: "anthropic",
+              name: "Sonnet",
+              status: "active",
+              enabled: true,
+              variants: [{ id: "high" }],
+            },
+            {
+              id: "anthropic/off",
+              modelID: "off",
+              providerID: "anthropic",
+              name: "Off",
+              status: "active",
+              enabled: false,
+              variants: [],
+            },
+          ],
+        };
+      },
+    },
   } as unknown as OpenCodeClient;
   const port = {
     native: {
@@ -686,6 +718,43 @@ describe("Fine-grained Code Mode queries", () => {
         cursor: continued.cursor,
       }),
     ).rejects.toThrow("Continuation");
+  });
+
+  it("Lists enabled models with variants", async () => {
+    const f = fixture();
+    expect(
+      await f.call("list_models", { location: "/projects/one" }),
+    ).toMatchObject({
+      location: "/projects/one",
+      models: [
+        {
+          providerID: "anthropic",
+          id: "sonnet",
+          name: "Sonnet",
+          status: "active",
+          variants: ["high"],
+        },
+      ],
+    });
+  });
+
+  it("Rejects a mismatched location", async () => {
+    const f = fixture();
+    await expect(
+      f.call("list_models", { location: "/projects/two" }),
+    ).rejects.toThrow("does not match");
+    const oversized = fixture();
+    const list = oversized.client.model.list;
+    oversized.client.model.list = async (input) => {
+      const result = await list(input);
+      return {
+        ...result,
+        data: Array.from({ length: 201 }, () => result.data[0]!),
+      };
+    };
+    await expect(
+      oversized.call("list_models", { location: "/projects/one" }),
+    ).rejects.toThrow("does not match");
   });
 
   it("Creates an assignment through separate catalog and mutation calls", async () => {

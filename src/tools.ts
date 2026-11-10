@@ -31,6 +31,7 @@ const CORE_COORDINATION_TOOLS = [
   "list_sessions",
   "list_projects",
   "list_agents",
+  "list_models",
   "list_followed_sessions",
   "create_session",
   "adopt_session",
@@ -398,6 +399,24 @@ export function createCoordinationTools(port: CoordinationToolPort): {
             context,
             (client, signal) =>
               new NativeDiscovery(client, signal).agents(location),
+            diagnostics,
+          ),
+        };
+      },
+    },
+    list_models: {
+      description:
+        "List enabled native models at an absolute canonical location from list_projects. Pass a returned providerID, id and optional variant unchanged to switch_session_model.",
+      input: inputSchema({ location: stringSchema }, ["location"]),
+      async run(v, context, diagnostics) {
+        exact(v, ["location"]);
+        const location = await canonical(v.location);
+        return {
+          location,
+          models: await native(
+            context,
+            (client, signal) =>
+              new NativeDiscovery(client, signal).models(location),
             diagnostics,
           ),
         };

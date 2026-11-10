@@ -1,0 +1,4 @@
+- [x] Add NativeDiscovery.models in src/native-sessions.ts
+- [x] Add list_models tool in src/tools.ts
+- [x] Allow backseat_list_models and document it in src/coordinator-agent.ts
+- [x] Add tests named after the "Native model discovery" scenarios in test/tools.test.ts

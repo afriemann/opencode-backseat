@@ -21,6 +21,7 @@ export const NATIVE_BOUNDS = Object.freeze({
 export interface NativeCatalogClient {
   project: Pick<NativeClient["project"], "list">;
   agent: Pick<NativeClient["agent"], "list">;
+  model: Pick<NativeClient["model"], "list">;
   session: Pick<NativeClient["session"], "list">;
 }
 export interface NativeAskClient {
@@ -144,6 +145,13 @@ export async function readNativeAsks(
   return asks;
 }
 
+export interface ModelChoice {
+  providerID: string;
+  id: string;
+  name: string;
+  status: string;
+  variants: readonly string[];
+}
 export class NativeDiscovery {
   constructor(
     private readonly client: NativeCatalogClient,
@@ -194,6 +202,26 @@ export class NativeDiscovery {
           !isCoordinatorAgent(agent),
       )
       .map((agent) => agent.id);
+  }
+  async models(location: string): Promise<readonly ModelChoice[]> {
+    const result = await this.client.model.list(
+      { location: { directory: location } },
+      this.signal ? { signal: this.signal } : undefined,
+    );
+    if (
+      result.location.directory !== location ||
+      result.data.length > NATIVE_BOUNDS.catalogRows
+    )
+      throw new Error("Model discovery does not match the selected location");
+    return result.data
+      .filter((model) => model.enabled)
+      .map((model) => ({
+        providerID: model.providerID,
+        id: model.modelID,
+        name: model.name,
+        status: model.status,
+        variants: model.variants.map((variant) => variant.id),
+      }));
   }
   async workers(
     location: string,
