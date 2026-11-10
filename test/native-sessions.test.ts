@@ -3,6 +3,7 @@ import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import {
   readNativeAsks,
   readNativeInventory,
+  readNativeSessionDelivery,
   type NativeSessionClient,
 } from "../src/native-sessions.ts";
 import { diagnosticContext } from "../src/native-connection.ts";
@@ -341,7 +342,6 @@ describe("Native session inventory", () => {
   it.each([
     "unavailable",
     "location",
-    "overflow",
     "duplicate",
     "identity",
     "owner",
@@ -367,20 +367,15 @@ describe("Native session inventory", () => {
           directory: kind === "location" ? "/wrong" : "/projects/one",
         },
         data:
-          kind === "overflow"
-            ? Array.from({ length: 201 }, (_, id) => ({
-                ...form,
-                id: String(id),
-              }))
-            : kind === "duplicate"
-              ? [form, form]
-              : kind === "identity"
-                ? [{ ...form, id: "" }]
-                : kind === "owner"
-                  ? [{ ...form, sessionID: "" }]
-                  : kind === "shape"
-                    ? undefined
-                    : [form],
+          kind === "duplicate"
+            ? [form, form]
+            : kind === "identity"
+              ? [{ ...form, id: "" }]
+              : kind === "owner"
+                ? [{ ...form, sessionID: "" }]
+                : kind === "shape"
+                  ? undefined
+                  : [form],
       } as unknown as Awaited<ReturnType<typeof list>>;
     };
     const result = await readNativeInventory(f.client);
@@ -390,5 +385,94 @@ describe("Native session inventory", () => {
     expect(result.partial).toBe(true);
     expect(failedReads).toBe(1);
     expect(JSON.stringify(result)).not.toContain("PRIVATE_FORM_SENTINEL");
+  });
+});
+
+describe("Full native session controls", () => {
+  it("Reconciles a send beyond the first two hundred messages", async () => {
+    const page = (start: number, count: number, next?: string) => ({
+      data: Array.from({ length: count }, (_, i) => ({
+        id: `m${start + i}`,
+        type: "user",
+      })),
+      cursor: next ? { next } : {},
+    });
+    const client = {
+      session: {
+        get: async () => ({
+          id: "w",
+          agent: "engineer",
+          location: { directory: "/p" },
+        }),
+        inbox: { list: async () => [] },
+      },
+      message: {
+        list: async (input: { cursor?: string }) =>
+          input.cursor === "c2"
+            ? page(400, 200)
+            : input.cursor === "c1"
+              ? page(200, 200, "c2")
+              : page(0, 200, "c1"),
+      },
+    } as unknown as Parameters<typeof readNativeSessionDelivery>[0];
+    const delivery = {
+      id: "m450",
+      sessionID: "w",
+      agent: "engineer",
+      location: "/p",
+    };
+    expect(
+      await readNativeSessionDelivery(
+        client,
+        delivery,
+        new AbortController().signal,
+      ),
+    ).toBe("admitted");
+  });
+  it("Stops reconciling at the match and ends on a repeated cursor", async () => {
+    const pages: string[] = [];
+    const make = (next: (cursor?: string) => string | undefined) =>
+      ({
+        session: {
+          get: async () => ({
+            id: "w",
+            agent: "engineer",
+            location: { directory: "/p" },
+          }),
+          inbox: { list: async () => [] },
+        },
+        message: {
+          list: async (input: { cursor?: string }) => {
+            pages.push(input.cursor ?? "first");
+            const following = next(input.cursor);
+            return {
+              data: [{ id: input.cursor ? "x" : "m1", type: "user" }],
+              cursor: following ? { next: following } : {},
+            };
+          },
+        },
+      }) as unknown as Parameters<typeof readNativeSessionDelivery>[0];
+    const delivery = (id: string) => ({
+      id,
+      sessionID: "w",
+      agent: "engineer",
+      location: "/p",
+    });
+    const signal = new AbortController().signal;
+    expect(
+      await readNativeSessionDelivery(
+        make(() => "more"),
+        delivery("m1"),
+        signal,
+      ),
+    ).toBe("admitted");
+    expect(pages).toEqual(["first"]);
+    expect(
+      await readNativeSessionDelivery(
+        make(() => "loop"),
+        delivery("missing"),
+        signal,
+      ),
+    ).toBe("unknown");
   });
 });

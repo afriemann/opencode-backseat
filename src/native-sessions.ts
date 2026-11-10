@@ -49,11 +49,7 @@ async function readLocationForms(
     { location: { directory: location } },
     signal ? { signal } : undefined,
   );
-  if (
-    forms.location.directory !== location ||
-    !Array.isArray(forms.data) ||
-    forms.data.length > NATIVE_BOUNDS.catalogRows
-  )
+  if (forms.location.directory !== location || !Array.isArray(forms.data))
     throw new Error("Pending-form inventory is incomplete or mismatched");
   const ids = new Set<string>();
   const bySession = new Map<string, typeof forms.data>();
@@ -118,8 +114,6 @@ export async function readNativeAsks(
   ]);
   if (
     permissions.location.directory !== binding.location ||
-    permissions.data.length > NATIVE_BOUNDS.catalogRows ||
-    forms.length > NATIVE_BOUNDS.catalogRows ||
     forms.some((f) => f.sessionID !== binding.workerID)
   )
     throw new Error("Pending-input inventory is incomplete or mismatched");
@@ -177,10 +171,7 @@ export class NativeDiscovery {
         location,
       })),
     );
-    if (
-      choices.length > NATIVE_BOUNDS.catalogRows ||
-      choices.some((c) => !c.location.startsWith("/"))
-    )
+    if (choices.some((c) => !c.location.startsWith("/")))
       throw new Error("Project discovery is incomplete or unsupported");
     return choices;
   }
@@ -189,29 +180,27 @@ export class NativeDiscovery {
       { location: { directory: location } },
       this.signal ? { signal: this.signal } : undefined,
     );
-    if (
-      result.location.directory !== location ||
-      result.data.length > NATIVE_BOUNDS.catalogRows
-    )
+    if (result.location.directory !== location)
       throw new Error("Agent discovery does not match the selected location");
     return result.data
-      .filter(
-        (agent) =>
-          !agent.hidden &&
-          agent.mode !== "subagent" &&
-          !isCoordinatorAgent(agent),
-      )
+      .filter((agent) => !isCoordinatorAgent(agent))
       .map((agent) => agent.id);
+  }
+  async isCoordinator(location: string, agentID: string): Promise<boolean> {
+    const result = await this.client.agent.list(
+      { location: { directory: location } },
+      this.signal ? { signal: this.signal } : undefined,
+    );
+    return result.data.some(
+      (agent) => agent.id === agentID && isCoordinatorAgent(agent),
+    );
   }
   async models(location: string): Promise<readonly ModelChoice[]> {
     const result = await this.client.model.list(
       { location: { directory: location } },
       this.signal ? { signal: this.signal } : undefined,
     );
-    if (
-      result.location.directory !== location ||
-      result.data.length > NATIVE_BOUNDS.catalogRows
-    )
+    if (result.location.directory !== location)
       throw new Error("Model discovery does not match the selected location");
     return result.data
       .filter((model) => model.enabled)
@@ -229,16 +218,12 @@ export class NativeDiscovery {
   ): Promise<readonly WorkerChoice[]> {
     const workers: WorkerChoice[] = [],
       cursors = new Set<string>();
-    let cursor: string | undefined,
-      seen = 0;
+    let cursor: string | undefined;
     do {
       const page = await this.client.session.list(
         { directory: location, archived: false, ...(cursor ? { cursor } : {}) },
         this.signal ? { signal: this.signal } : undefined,
       );
-      seen += page.data.length;
-      if (seen > NATIVE_BOUNDS.catalogRows)
-        throw new Error("Worker discovery exceeds its bound");
       for (const w of page.data)
         if (
           w.location.directory === location &&
@@ -301,8 +286,6 @@ export async function readNativeLiveState(
     worker.id !== binding.workerID ||
     worker.location.directory !== binding.location ||
     worker.agent !== binding.agent ||
-    worker.time.archived !== undefined ||
-    inbox.length > NATIVE_BOUNDS.catalogRows ||
     inbox.some((i) => i.sessionID !== binding.workerID)
   )
     throw new Error("Unreadable or mismatched worker inventory");
@@ -607,19 +590,14 @@ export async function readNativeSessionDelivery(
     if (
       worker.id !== delivery.sessionID ||
       worker.agent !== delivery.agent ||
-      worker.location.directory !== delivery.location ||
-      worker.time.archived
+      worker.location.directory !== delivery.location
     )
       return "unknown";
     const inbox = await client.session.inbox.list(
       { sessionID: delivery.sessionID },
       request,
     );
-    if (
-      inbox.length > NATIVE_BOUNDS.catalogRows ||
-      inbox.some((i) => i.sessionID !== delivery.sessionID)
-    )
-      return "unknown";
+    if (inbox.some((i) => i.sessionID !== delivery.sessionID)) return "unknown";
     const queued = inbox.filter((i) => i.id === delivery.id);
     if (queued.length)
       return queued.length === 1 &&
@@ -627,8 +605,7 @@ export async function readNativeSessionDelivery(
         !signal.aborted
         ? "admitted"
         : "unknown";
-    const seen = new Set<string>(),
-      cursors = new Set<string>();
+    const cursors = new Set<string>();
     let cursor: string | undefined,
       delivered = false;
     do {
@@ -641,15 +618,13 @@ export async function readNativeSessionDelivery(
         request,
       );
       for (const message of page.data) {
-        if (seen.has(message.id) || seen.size >= NATIVE_BOUNDS.catalogRows)
-          return "unknown";
-        seen.add(message.id);
         if (message.id === delivery.id) {
           if (message.type !== expectedType) return "unknown";
           delivered = true;
+          break;
         }
       }
-      cursor = page.cursor.next ?? undefined;
+      cursor = delivered ? undefined : (page.cursor.next ?? undefined);
       if (cursor && cursors.has(cursor)) return "unknown";
       if (cursor) cursors.add(cursor);
     } while (cursor);

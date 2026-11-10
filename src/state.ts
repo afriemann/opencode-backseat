@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const FOLLOW_BOUNDS = {
-  followers: 128,
+  followers: 1024,
   requests: 400,
   notificationRequests: 128,
   notificationBytes: 16 * 1024,
@@ -92,11 +92,15 @@ export function object(value: unknown): Record<string, unknown> {
     throw new Error("Invalid object");
   return value as Record<string, unknown>;
 }
-export function text(value: unknown): string {
-  if (typeof value !== "string" || !value.trim() || value.length > 32_000)
+export const PAYLOAD_BYTES = 32 * 1024 * 1024;
+function boundedText(value: unknown, maximum: number): string {
+  if (typeof value !== "string" || !value.trim() || value.length > maximum)
     throw new Error("Invalid bounded text");
   return value;
 }
+export const text = (value: unknown): string => boundedText(value, 32_000);
+export const bulkText = (value: unknown): string =>
+  boundedText(value, PAYLOAD_BYTES);
 export function integer(value: unknown, minimum = 0): number {
   if (
     typeof value !== "number" ||

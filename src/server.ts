@@ -172,7 +172,6 @@ export class SessionController {
       !session ||
       session.id !== sessionID ||
       (!session.agent && !orphanTolerant) ||
-      session.time.archived !== undefined ||
       !(await this.locationMatches(session.location.directory, orphanTolerant))
     )
       throw new Error("Selected native session unavailable or changed");
@@ -635,6 +634,17 @@ export class SessionController {
       throw new Error("Selected native operation target changed");
     if (!(await this.locationMatches(input.location, orphanTolerant)))
       throw new Error("Select a canonical project location");
+    if (input.operation === "switch_session_agent") {
+      const newAgent = text(object(input.payload).newAgent);
+      const coordinator = await this.host.native.read((client, signal) =>
+        new NativeDiscovery(client, signal).isCoordinator(
+          input.location,
+          newAgent,
+        ),
+      );
+      if (coordinator)
+        throw new Error("A coordinator agent cannot be a worker agent");
+    }
     const subject = await this.host.native.read(prepared.subject);
     await this.permit(
       input.operation,

@@ -10,12 +10,12 @@ import type {
   SessionCreateInput,
   ExperimentalSessionImportInput,
 } from "@opencode/client";
-import { exact, list, object, text } from "./state.ts";
+import { PAYLOAD_BYTES, bulkText, exact, text, list, object } from "./state.ts";
 import { Form, Session, SessionMessage } from "@opencode/client/effect";
 import { Schema } from "effect";
 
-const string = { type: "string", minLength: 1, maxLength: 12_000 } as const;
-const strings = { type: "array", items: string, maxItems: 200 } as const;
+const string = { type: "string", minLength: 1 } as const;
+const strings = { type: "array", items: string } as const;
 const boolean = { type: "boolean" } as const;
 const schema = (properties: Record<string, unknown>, required: string[]) => ({
   type: "object",
@@ -44,7 +44,6 @@ const mentionSchema = schema(
 const attachmentProperties = {
   files: {
     type: "array",
-    maxItems: 200,
     items: schema(
       {
         uri: string,
@@ -63,12 +62,10 @@ const attachmentProperties = {
   },
   agents: {
     type: "array",
-    maxItems: 200,
     items: schema({ name: string, mention: mentionSchema }, ["name"]),
   },
   skills: {
     type: "array",
-    maxItems: 200,
     items: schema({ id: string, mention: mentionSchema }, ["id"]),
   },
 };
@@ -123,8 +120,10 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
   const kind = input.kind ?? "prompt";
   if (!NATIVE_SEND_KINDS.includes(kind))
     throw new Error("Unsupported native send operation");
+  if (Buffer.byteLength(input.text) > PAYLOAD_BYTES)
+    throw new Error("Oversized native send text");
   const value = object(input.options ?? {});
-  if (Buffer.byteLength(JSON.stringify(value)) > 64_000)
+  if (Buffer.byteLength(JSON.stringify(value)) > PAYLOAD_BYTES)
     throw new Error("Oversized native send options");
   const keys =
     kind === "prompt"
@@ -166,7 +165,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
     return {
       start: row.start as number,
       end: row.end as number,
-      text: text(row.text),
+      text: bulkText(row.text),
     };
   };
   const files: SessionPromptInput["files"] =
@@ -194,7 +193,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
             ...(row.name === undefined ? {} : { name: text(row.name) }),
             ...(row.description === undefined
               ? {}
-              : { description: text(row.description) }),
+              : { description: bulkText(row.description) }),
             ...(row.mention === undefined
               ? {}
               : { mention: mention(row.mention) }),
@@ -236,7 +235,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
     ...(resume === undefined ? {} : { resume }),
   };
   const description =
-    value.description === undefined ? undefined : text(value.description);
+    value.description === undefined ? undefined : bulkText(value.description);
   switch (kind) {
     case "prompt":
       return (client, signal) =>
@@ -359,7 +358,6 @@ export const NATIVE_OPERATIONS = {
         fields: {
           type: "array",
           minItems: 1,
-          maxItems: 200,
           items: { type: "object" },
         },
         metadata: { type: "object" },
@@ -604,10 +602,7 @@ export function prepareNativeOperation(
   const value = object(input.payload);
   const definition = NATIVE_OPERATIONS[operation];
   if (!definition) throw new Error("Unsupported native session operation");
-  if (
-    Buffer.byteLength(JSON.stringify(value)) >
-    (operation === "import_session" ? 8_000_000 : 64_000)
-  )
+  if (Buffer.byteLength(JSON.stringify(value)) > PAYLOAD_BYTES)
     throw new Error("Oversized native operation payload");
   exact(value, Object.keys(definition.input.properties));
   const selectedSession = async (
@@ -642,7 +637,7 @@ export function prepareNativeOperation(
         id: sessionID,
         agent: input.agent,
         location: { directory: input.location },
-        ...(value.title === undefined ? {} : { title: text(value.title) }),
+        ...(value.title === undefined ? {} : { title: bulkText(value.title) }),
         ...(parentID === undefined ? {} : { parentID }),
         ...(model === undefined ? {} : { model }),
         ...(permissions === undefined ? {} : { permissions }),
@@ -710,7 +705,6 @@ export function prepareNativeOperation(
         // Native schema errors include field contents; expose only the validation category.
         throw new Error("Invalid native form field definitions");
       }
-      if (fields.length > 200) throw new Error("Too many native form fields");
       const metadata =
         value.metadata === undefined
           ? undefined
@@ -833,7 +827,7 @@ export function prepareNativeOperation(
       const permissions = nativePermissions(value.permissions);
       const payload: SessionUpdateInput = {
         sessionID,
-        ...(value.title === undefined ? {} : { title: text(value.title) }),
+        ...(value.title === undefined ? {} : { title: bulkText(value.title) }),
         ...(metadata === undefined ? {} : { metadata }),
         ...(permissions === undefined ? {} : { permissions }),
         ...(value.archived === undefined
@@ -885,7 +879,7 @@ export function prepareNativeOperation(
         client.experimental.session.wait({ sessionID }, { signal }),
       );
     case "generate_session": {
-      const prompt = text(value.prompt);
+      const prompt = bulkText(value.prompt);
       return simple((client, signal) =>
         client.session.generate({ sessionID, prompt }, { signal }),
       );
@@ -961,7 +955,7 @@ export function prepareNativeOperation(
         decision,
         ...(value.message === undefined
           ? {}
-          : { message: text(value.message) }),
+          : { message: bulkText(value.message) }),
       };
       return {
         async subject(client, signal) {

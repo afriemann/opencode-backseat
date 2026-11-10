@@ -31,6 +31,11 @@ The coordinator SHALL immediately follow an explicitly selected existing native 
 - **WHEN** configured permissions deny adoption or the selected native session is unavailable
 - **THEN** no follower is created and no substitute target or initial message is used.
 
+#### Scenario: Adopts an archived session
+
+- **WHEN** a coordinator adopts an archived session selected by exact identity
+- **THEN** following binds that session under configured permissions.
+
 ### Requirement: Exclusive coordinator authority
 
 The coordinator SHALL serialize mutations through one local authority for its selected durable store.
@@ -395,6 +400,23 @@ The coordinator SHALL retrieve bounded native session history and activity indep
 - **WHEN** the target is missing, a native read fails, or a continuation is expired, evicted, from another caller/service/target or combined with changed query arguments
 - **THEN** the tool reports the concrete unavailable or invalid continuation without silently restarting or broadening the read, returning unrelated content, or changing durable state.
 
+#### Scenario: Exports unredacted content by default
+
+- **WHEN** a coordinator exports a session without specifying sanitize, or with sanitize false
+- **THEN** the native export is requested unsanitized and user text, reasoning and tool output are returned without placeholders.
+- **AND** sanitize true requests redaction explicitly.
+
+#### Scenario: Reads content larger than eight megabytes in consistent chunks
+
+- **WHEN** a selected read serializes to more than eight megabytes, or the session grows while chunks are being read
+- **THEN** every chunk is served from one snapshot taken at the first read and the whole content can be read to its end.
+- **AND** a continuation stays valid for one hour after its last use and is consumed by the read that returns its successor.
+
+#### Scenario: Reports snapshot capacity exhaustion
+
+- **WHEN** a new snapshot does not fit the memory budget
+- **THEN** the least recently used snapshots are evicted first, and the read fails with a capacity error naming the budget only if the snapshot alone exceeds it.
+
 ### Requirement: Since-send response tracking
 
 The coordinator SHALL return a send reference usable for bounded incremental observation of subsequent activity, distinguishing correlation from uncertain attribution.
@@ -431,6 +453,28 @@ The coordinator SHALL expose dedicated typed native controls governed by configu
 - **WHEN** a coordinator updates a session whose recorded location directory no longer exists, or which has no agent, selecting its recorded location and, if it has one, its agent
 - **THEN** the update executes under configured policy against that exact session.
 - **AND** a location that differs from the recorded one, or an agent that differs from the recorded agent, is rejected.
+
+#### Scenario: Controls an archived session
+
+- **WHEN** a coordinator updates, unarchives, reads or deletes an archived session selected by exact identity
+- **THEN** the operation executes under configured policy against that session.
+
+#### Scenario: Accepts long sends and payloads
+
+- **WHEN** a coordinator sends text or an operation payload with strings longer than 12,000 characters within the payload byte bound
+- **THEN** it is delivered unchanged; a payload over the bound is rejected before any native call.
+
+#### Scenario: Reconciles a send beyond the first two hundred messages
+
+- **WHEN** an uncertain send's message lies beyond the first 200 messages of a session
+- **THEN** reconciliation pages through the history, stops at the match and reports it admitted.
+- **AND** a repeated cursor ends the scan as unknown.
+
+#### Scenario: Uses any non-coordinator native agent
+
+- **WHEN** a coordinator creates a session, switches an agent or imports a session with a subagent-mode or hidden native agent
+- **THEN** the operation proceeds under configured policy.
+- **AND** a coordinator agent is rejected for all three.
 
 ### Requirement: Explicit native request replies
 
@@ -527,9 +571,14 @@ The plugin SHALL provide a coordinator tool that lists the enabled native models
 - **WHEN** the coordinator lists models at a location returned by list_projects
 - **THEN** each enabled model is returned with providerID, id, name, status and variants, and disabled models are omitted.
 
+#### Scenario: Lists catalogs beyond two hundred rows
+
+- **WHEN** the native model, agent, project, pending-form or inbox list holds more than 200 rows
+- **THEN** all rows are returned instead of failing as unsupported.
+
 #### Scenario: Rejects a mismatched location
 
-- **WHEN** the native model list reports a different location than requested or exceeds the catalog bound
+- **WHEN** the native model list reports a different location than requested
 - **THEN** the tool fails instead of returning a partial or mismatched list.
 
 ### Requirement: Retryable native failures
