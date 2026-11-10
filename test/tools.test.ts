@@ -1042,9 +1042,22 @@ describe("Fine-grained Code Mode queries", () => {
         data: Array.from({ length: 201 }, () => result.data[0]!),
       };
     };
-    await expect(
-      oversized.call("list_models", { location: "/projects/one" }),
-    ).rejects.toThrow("does not match");
+  });
+
+  it("Lists catalogs beyond two hundred rows", async () => {
+    const oversized = fixture();
+    const list = oversized.client.model.list;
+    oversized.client.model.list = async (input) => {
+      const result = await list(input);
+      return {
+        ...result,
+        data: Array.from({ length: 201 }, () => result.data[0]!),
+      };
+    };
+    const result = (await oversized.call("list_models", {
+      location: "/projects/one",
+    })) as { models: unknown[] };
+    expect(result.models).toHaveLength(201);
   });
 
   it("Creates an assignment through separate catalog and mutation calls", async () => {

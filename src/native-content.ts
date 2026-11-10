@@ -48,9 +48,9 @@ export async function observeFollowedSession(
       event.metadata?.["backseat.notification"] === true
     )
       continue;
-    if (bytes <= CONTENT_BOUNDS.nativeBytes)
+    if (bytes <= CONTENT_BOUNDS.trackingBytes)
       bytes += Buffer.byteLength(JSON.stringify(event));
-    if (bytes > CONTENT_BOUNDS.nativeBytes) {
+    if (bytes > CONTENT_BOUNDS.trackingBytes) {
       pending.discontinuity = true;
       continue;
     }
@@ -94,9 +94,10 @@ export async function observeFollowedSession(
 export const CONTENT_BOUNDS = {
   pageItems: 100,
   pageBytes: 64_000,
-  nativeBytes: 8_000_000,
-  handles: 128,
-  ttlMs: 5 * 60_000,
+  trackingBytes: 8_000_000,
+  snapshotBytes: 256 * 1024 * 1024,
+  handles: 1024,
+  ttlMs: 60 * 60_000,
 } as const;
 export const MESSAGE_TYPES = [
   "agent-switched",
@@ -132,7 +133,7 @@ function reader(
 ) {
   return {
     kind,
-    description: `${description} Select exact sessionID and canonical location from list_sessions; agent optionally confirms the current agent. No task binding or terminal attachment is required. Returns bounded data or json-text chunks with offsetChars and an opaque cursor. Continue with the same arguments and cursor; concatenate chunks for one native page. Handles expire after five minutes and bind the caller, service, target and query. Changed chunk content requires restarting the read. Defaults: 20 messages, 24000 response bytes.`,
+    description: `${description} Select exact sessionID and canonical location from list_sessions; agent optionally confirms the current agent. No task binding or terminal attachment is required. Returns bounded data or json-text chunks with offsetChars and an opaque cursor. Continue with the same arguments and cursor; concatenate chunks for one native page. Handles expire one hour after last use and bind the caller, service, target and query. Chunks of one page come from a single snapshot, so concatenation is consistent. Defaults: 20 messages, 24000 response bytes.`,
     input: {
       type: "object",
       properties: { ...commonProperties, ...properties },
@@ -210,7 +211,7 @@ export const CONTENT_READERS = {
   ),
   export_session: reader(
     "export",
-    "Export native session transfer data in bounded chunks. sanitize defaults to true; set false explicitly only when unsanitized native transfer content is required.",
+    "Export native session transfer data in bounded chunks. Content is returned unredacted by default; set sanitize true to request redaction.",
     { sanitize: { type: "boolean" } },
   ),
   follow_session: {
@@ -379,7 +380,12 @@ interface Continuation {
   expires: number;
   nativeCursor?: string;
   offset: number;
-  pageFingerprint?: string;
+  snapshot?: Snapshot;
+}
+interface Snapshot {
+  text: string;
+  bytes: number;
+  next?: string;
 }
 interface TrackingState {
   caller: string;
@@ -413,7 +419,10 @@ function nativeID(value: unknown): string {
   if (id.length > 200) throw new Error("Native identity exceeds its bound");
   return id;
 }
-export function createNativeContent(now: () => number = Date.now) {
+export function createNativeContent(
+  now: () => number = Date.now,
+  snapshotBudget: number = CONTENT_BOUNDS.snapshotBytes,
+) {
   const handles = new Map<string, Continuation>();
   const trackers = new Map<string, TrackingState>();
   let disposed = false;
@@ -422,6 +431,21 @@ export function createNativeContent(now: () => number = Date.now) {
       if (value.expires <= now()) handles.delete(key);
     while (handles.size >= CONTENT_BOUNDS.handles)
       handles.delete(handles.keys().next().value!);
+    while (handle.snapshot && handles.size) {
+      const used = new Set(
+        [...handles.values()].flatMap((h) =>
+          h.snapshot && h.snapshot !== handle.snapshot ? [h.snapshot] : [],
+        ),
+      );
+      let total = handle.snapshot.bytes;
+      for (const s of used) total += s.bytes;
+      if (total <= snapshotBudget) break;
+      handles.delete(handles.keys().next().value!);
+    }
+    if (handle.snapshot && handle.snapshot.bytes > snapshotBudget)
+      throw new Error(
+        `snapshot_capacity: native content exceeds the ${snapshotBudget} byte snapshot budget`,
+      );
     const key = randomUUID();
     handles.set(key, handle);
     return key;
@@ -482,7 +506,14 @@ export function createNativeContent(now: () => number = Date.now) {
       if (input.context !== undefined) integer(input.context, 0);
       const query = fingerprint([
         kind,
-        { ...input, cursor: undefined, limit, maxBytes, order },
+        {
+          ...input,
+          cursor: undefined,
+          limit,
+          maxBytes,
+          order,
+          sanitize: input.sanitize ?? false,
+        },
       ]);
       const cursor =
         input.cursor === undefined ? undefined : text(input.cursor);
@@ -519,153 +550,152 @@ export function createNativeContent(now: () => number = Date.now) {
         throw new Error("Selected content target or history changed");
       let data: unknown, next: string | undefined;
       const options = { signal };
-      switch (kind) {
-        case "messages": {
-          const nativeQuery: MessageListInput = {
-            sessionID,
-            limit,
-            ...(previous?.nativeCursor
-              ? { cursor: previous.nativeCursor }
-              : { order }),
-            ...(input.type === undefined
-              ? {}
-              : { type: input.type as MessageListInput["type"] }),
-          };
-          const page = await client.message.list(nativeQuery, options);
-          if (
-            page.data.length > limit ||
-            (previous?.nativeCursor &&
-              page.cursor.next === previous.nativeCursor)
-          )
-            throw new Error(
-              "Native message continuation did not advance within bounds",
-            );
-          data = page.data;
-          next = page.cursor.next ?? undefined;
-          break;
-        }
-        case "message":
-          data = await client.session.message.get(
-            { sessionID, messageID: text(input.messageID) },
-            options,
-          );
-          break;
-        case "context":
-          data = await client.session.context({ sessionID }, options);
-          break;
-        case "diff":
-          data = await client.session.diff(
-            {
-              sessionID,
-              ...(input.from === undefined ? {} : { from: text(input.from) }),
-              ...(input.to === undefined ? {} : { to: text(input.to) }),
-              ...(input.context === undefined
-                ? {}
-                : { context: input.context }),
-            },
-            options,
-          );
-          break;
-        case "inbox":
-          data = await client.session.inbox.list({ sessionID }, options);
-          break;
-        case "permissions":
-          data = await client.permission.list({ sessionID }, options);
-          break;
-        case "permission": {
-          const requestID = text(input.requestID);
-          const request = await client.permission.get(
-            { sessionID, requestID },
-            options,
-          );
-          if (request.sessionID !== sessionID || request.id !== requestID)
-            throw new Error("Native permission target changed");
-          data = request;
-          break;
-        }
-        case "saved_permissions":
-          data = await client.permission.saved.list(
-            { projectID: session.projectID },
-            options,
-          );
-          break;
-        case "forms":
-          data = await client.session.form.list({ sessionID }, options);
-          break;
-        case "form": {
-          const formID = text(input.formID);
-          const form = await client.session.form.get(
-            { sessionID, formID },
-            options,
-          );
-          if (form.sessionID !== sessionID || form.id !== formID)
-            throw new Error("Native form target changed");
-          data = form;
-          break;
-        }
-        case "instructions":
-          data = await client.experimental.session.instructions.entry.list(
-            { sessionID },
-            options,
-          );
-          break;
-        case "stats":
-          data = await client.experimental.session.stats(
-            {
-              project: session.projectID,
-              ...(input.statsFrom === undefined
-                ? {}
-                : { from: integer(input.statsFrom, 0) }),
-              ...(input.statsTo === undefined
-                ? {}
-                : { to: integer(input.statsTo, 0) }),
-              ...(input.timezone === undefined
-                ? {}
-                : { timezone: text(input.timezone) }),
-              tools: input.toolsLevel ?? "none",
-            },
-            options,
-          );
-          break;
-        case "export":
-          data = await client.experimental.session.export(
-            { sessionID, sanitize: input.sanitize ?? true },
-            options,
-          );
-          break;
-        default:
-          throw new Error("Unsupported native content read");
+      const snapshot = previous?.snapshot;
+      if (previous && cursor) {
+        previous.expires = now() + CONTENT_BOUNDS.ttlMs;
+        handles.delete(cursor);
+        handles.set(cursor, previous);
       }
+      if (!snapshot)
+        switch (kind) {
+          case "messages": {
+            const nativeQuery: MessageListInput = {
+              sessionID,
+              limit,
+              ...(previous?.nativeCursor
+                ? { cursor: previous.nativeCursor }
+                : { order }),
+              ...(input.type === undefined
+                ? {}
+                : { type: input.type as MessageListInput["type"] }),
+            };
+            const page = await client.message.list(nativeQuery, options);
+            if (
+              page.data.length > limit ||
+              (previous?.nativeCursor &&
+                page.cursor.next === previous.nativeCursor)
+            )
+              throw new Error(
+                "Native message continuation did not advance within bounds",
+              );
+            data = page.data;
+            next = page.cursor.next ?? undefined;
+            break;
+          }
+          case "message":
+            data = await client.session.message.get(
+              { sessionID, messageID: text(input.messageID) },
+              options,
+            );
+            break;
+          case "context":
+            data = await client.session.context({ sessionID }, options);
+            break;
+          case "diff":
+            data = await client.session.diff(
+              {
+                sessionID,
+                ...(input.from === undefined ? {} : { from: text(input.from) }),
+                ...(input.to === undefined ? {} : { to: text(input.to) }),
+                ...(input.context === undefined
+                  ? {}
+                  : { context: input.context }),
+              },
+              options,
+            );
+            break;
+          case "inbox":
+            data = await client.session.inbox.list({ sessionID }, options);
+            break;
+          case "permissions":
+            data = await client.permission.list({ sessionID }, options);
+            break;
+          case "permission": {
+            const requestID = text(input.requestID);
+            const request = await client.permission.get(
+              { sessionID, requestID },
+              options,
+            );
+            if (request.sessionID !== sessionID || request.id !== requestID)
+              throw new Error("Native permission target changed");
+            data = request;
+            break;
+          }
+          case "saved_permissions":
+            data = await client.permission.saved.list(
+              { projectID: session.projectID },
+              options,
+            );
+            break;
+          case "forms":
+            data = await client.session.form.list({ sessionID }, options);
+            break;
+          case "form": {
+            const formID = text(input.formID);
+            const form = await client.session.form.get(
+              { sessionID, formID },
+              options,
+            );
+            if (form.sessionID !== sessionID || form.id !== formID)
+              throw new Error("Native form target changed");
+            data = form;
+            break;
+          }
+          case "instructions":
+            data = await client.experimental.session.instructions.entry.list(
+              { sessionID },
+              options,
+            );
+            break;
+          case "stats":
+            data = await client.experimental.session.stats(
+              {
+                project: session.projectID,
+                ...(input.statsFrom === undefined
+                  ? {}
+                  : { from: integer(input.statsFrom, 0) }),
+                ...(input.statsTo === undefined
+                  ? {}
+                  : { to: integer(input.statsTo, 0) }),
+                ...(input.timezone === undefined
+                  ? {}
+                  : { timezone: text(input.timezone) }),
+                tools: input.toolsLevel ?? "none",
+              },
+              options,
+            );
+            break;
+          case "export":
+            data = await client.experimental.session.export(
+              { sessionID, sanitize: input.sanitize ?? false },
+              options,
+            );
+            break;
+          default:
+            throw new Error("Unsupported native content read");
+        }
       signal.throwIfAborted();
       if (disposed) throw new Error("Native content reader is disposed");
-      const after = await client.session.get({ sessionID }, options);
-      if (
-        fingerprint([
-          after.id,
-          after.projectID,
-          after.agent,
-          after.location,
-          after.parentID,
-          after.revert,
-        ]) !== target
-      )
-        throw new Error(
-          "Selected content target or history changed during read",
-        );
-      const serialized = JSON.stringify(data);
-      if (
-        serialized === undefined ||
-        Buffer.byteLength(serialized) > CONTENT_BOUNDS.nativeBytes
-      )
-        throw new Error(
-          "Native content unavailable within response bounds; narrow the read",
-        );
-      const pageFingerprint = fingerprint(data),
-        offset = previous?.offset ?? 0;
-      if (offset > 0 && previous?.pageFingerprint !== pageFingerprint)
-        throw new Error(
-          "Native content changed during chunk continuation; restart this read",
-        );
+      if (!snapshot) {
+        const after = await client.session.get({ sessionID }, options);
+        if (
+          fingerprint([
+            after.id,
+            after.projectID,
+            after.agent,
+            after.location,
+            after.parentID,
+            after.revert,
+          ]) !== target
+        )
+          throw new Error(
+            "Selected content target or history changed during read",
+          );
+      } else next = snapshot.next;
+      const serialized = snapshot?.text ?? JSON.stringify(data);
+      if (serialized === undefined)
+        throw new Error("Native content unavailable");
+      const offset = previous?.offset ?? 0;
       const base = {
         caller,
         incarnation,
@@ -688,6 +718,11 @@ export function createNativeContent(now: () => number = Date.now) {
           Math.floor((maxBytes - 512) / 2),
         );
         const following = offset + chunk.length;
+        const held: Snapshot = snapshot ?? {
+          text: serialized,
+          bytes: Buffer.byteLength(serialized),
+          ...(next ? { next } : {}),
+        };
         result = {
           available: true,
           encoding: "json-text",
@@ -701,7 +736,7 @@ export function createNativeContent(now: () => number = Date.now) {
                     ? { nativeCursor: previous.nativeCursor }
                     : {}),
                   offset: following,
-                  pageFingerprint,
+                  snapshot: held,
                 }),
               }
             : next
@@ -967,7 +1002,7 @@ export function createNativeContent(now: () => number = Date.now) {
           if (message.id !== reference.id)
             return discontinuity("Tracked native message target changed");
           const serialized = JSON.stringify(message);
-          if (Buffer.byteLength(serialized) > CONTENT_BOUNDS.nativeBytes)
+          if (Buffer.byteLength(serialized) > CONTENT_BOUNDS.trackingBytes)
             return discontinuity(
               "Tracked message exceeds its read bound; inspect it separately",
             );

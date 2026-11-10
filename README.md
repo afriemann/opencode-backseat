@@ -22,6 +22,8 @@ The coordinator can discover native sessions across projects, including sessions
 
 Session listing can filter by status, project, location and subpath, agent, title and update or creation time (for example, sessions not updated in five days). Status checks are skipped when only metadata is needed, and slow status reads are deferred to a continuation, so large inventories list reliably on a busy host.
 
+The coordinator reads whole sessions, including archived ones, and exports are unredacted by default, so user text, reasoning and tool output reach the coordinator model and its transcript; ask for a redacted export explicitly if you do not want that. Large reads are served in consistent chunks from a snapshot that stays valid for one hour after its last use.
+
 It can also use your configured ticket, recall and tracking tools, including session-local todos when available. Other tool actions default to `ask`; your configured native permissions still apply. MCP calls request native permission automatically, while custom plugin tools are responsible for their own permission checks. Built-in implementation tools remain unavailable to the coordinator.
 
 ## Follow an existing session

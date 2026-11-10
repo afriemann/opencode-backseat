@@ -7,7 +7,7 @@ import type {
 } from "@opencode/client";
 import { createNativeContent } from "../src/native-content.ts";
 
-function fixture() {
+function fixture(budget?: number) {
   const session: SessionInfo = {
     id: "worker",
     projectID: "project",
@@ -56,7 +56,7 @@ function fixture() {
     session,
     client,
     calls,
-    content: createNativeContent(() => time),
+    content: createNativeContent(() => time, budget),
     query: {
       sessionID: "worker",
       location: "/projects/worker",
@@ -70,7 +70,7 @@ function fixture() {
       data = value;
     },
     advance() {
-      time = 10 * 60_000;
+      time = 2 * 60 * 60_000;
     },
   };
 }
@@ -208,11 +208,54 @@ describe("Native session content pagination", () => {
                 tools: "summary",
               }
             : kind === "export"
-              ? { sessionID: "worker", sanitize: true }
+              ? { sessionID: "worker", sanitize: false }
               : { sessionID: "worker", ...extra };
       expect(received).toEqual([expected]);
       selected.content.dispose();
     }
+  });
+  it("Reads content larger than eight megabytes in consistent chunks", async () => {
+    const f = fixture();
+    const original = [{ text: "x".repeat(9_000_000) }];
+    f.setData(original);
+    const query = { ...f.query, maxBytes: 64_000 };
+    let page = await f.content.read(
+      "context",
+      query,
+      "caller",
+      "service",
+      f.client,
+      f.signal,
+    );
+    let joined = "";
+    for (let i = 0; page.chunk !== undefined; i++) {
+      joined += page.chunk;
+      if (i === 0) f.setData([{ text: "changed" }]);
+      if (!page.cursor) break;
+      page = await f.content.read(
+        "context",
+        { ...query, cursor: page.cursor },
+        "caller",
+        "service",
+        f.client,
+        f.signal,
+      );
+    }
+    expect(joined).toBe(JSON.stringify(original));
+  });
+  it("Reports snapshot capacity exhaustion", async () => {
+    const f = fixture(1000);
+    f.setData([{ text: "large".repeat(1000) }]);
+    await expect(
+      f.content.read(
+        "context",
+        f.query,
+        "caller",
+        "service",
+        f.client,
+        f.signal,
+      ),
+    ).rejects.toThrow("snapshot_capacity");
   });
   it("Rejects invalid or unavailable content continuation", async () => {
     for (const change of [
@@ -252,28 +295,6 @@ describe("Native session content pagination", () => {
       ).rejects.toThrow();
       f.content.dispose();
     }
-    const f = fixture();
-    f.setData([{ text: "large".repeat(1000) }]);
-    const first = await f.content.read(
-      "context",
-      f.query,
-      "caller",
-      "service",
-      f.client,
-      f.signal,
-    );
-    f.setData([{ text: "changed".repeat(1000) }]);
-    await expect(
-      f.content.read(
-        "context",
-        { ...f.query, cursor: first.cursor },
-        "caller",
-        "service",
-        f.client,
-        f.signal,
-      ),
-    ).rejects.toThrow("changed");
-    f.content.dispose();
     for (const kind of ["permission", "form"] as const) {
       for (const changed of ["id", "sessionID"] as const) {
         const selected = fixture();

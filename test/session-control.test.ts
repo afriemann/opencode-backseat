@@ -8,6 +8,7 @@ import {
   SessionController,
   type SessionControllerHost,
 } from "../src/server.ts";
+import { coordinatorAgent } from "../src/coordinator-agent.ts";
 
 const context = {
   sessionID: "coordinator",
@@ -786,6 +787,116 @@ describe("Conversational manual assignment", () => {
       ),
     ).toMatchObject({ following: true, agent: "engineer" });
     expect(f.calls).toEqual(["backseat.create", "create"]);
+    await controller.dispose();
+  });
+});
+
+describe("Full native session controls", () => {
+  it("Controls an archived session", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    f.sessions.get("worker")!.time.archived = 2;
+    const target = { sessionID: "worker", location: "/project" };
+    await controller.sessionOperation(
+      {
+        operation: "interrupt_session",
+        ...target,
+        agent: "engineer",
+        payload: {},
+      },
+      context,
+    );
+    await controller.sessionOperation(
+      {
+        operation: "update_session",
+        ...target,
+        agent: "engineer",
+        payload: { archived: false },
+      },
+      context,
+    );
+    await controller.adoptSession("worker", context);
+    await controller.deleteSession("worker", context);
+    expect(f.calls).toContain("interrupt");
+    expect(f.calls).toContain("update");
+    expect(f.calls).toContain("remove");
+    await controller.dispose();
+  });
+  it("Uses any non-coordinator native agent", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    const agents = [
+      { id: "engineer", hidden: false, mode: "all" },
+      { id: "helper", hidden: true, mode: "subagent" },
+      coordinatorAgent,
+    ];
+    (f.client.agent as unknown as { list: unknown }).list = async () => ({
+      location: { directory: "/project" },
+      data: agents,
+    });
+    (f.client.session as unknown as { switchAgent: unknown }).switchAgent =
+      async () => {
+        f.calls.push("switch");
+      };
+    const create = (agent: string, id: string) =>
+      controller.sessionOperation(
+        {
+          operation: "create_native_session",
+          sessionID: id,
+          location: "/project",
+          agent,
+          payload: {},
+        },
+        context,
+      );
+    expect(await create("helper", "made")).toMatchObject({
+      sessionID: "made",
+    });
+    await expect(
+      create(coordinatorAgent.id, "second-coordinator"),
+    ).rejects.toThrow("unavailable");
+    const switchTo = (newAgent: string) =>
+      controller.sessionOperation(
+        {
+          operation: "switch_session_agent",
+          sessionID: "worker",
+          location: "/project",
+          agent: "engineer",
+          payload: { newAgent },
+        },
+        context,
+      );
+    await switchTo("helper");
+    expect(f.calls).toContain("switch");
+    await expect(switchTo(coordinatorAgent.id)).rejects.toThrow("coordinator");
+    await controller.dispose();
+  });
+  it("Accepts long sends and payloads", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    const target = {
+      sessionID: "worker",
+      location: "/project",
+      agent: "engineer",
+    };
+    await controller.sendSession(
+      { ...target, text: "x".repeat(200_000) },
+      { ...context, messageID: "msg_long" },
+    );
+    expect(f.calls).toContain("prompt");
+    const update = (title: string) =>
+      controller.sessionOperation(
+        {
+          operation: "update_session",
+          ...target,
+          payload: { title },
+        },
+        context,
+      );
+    await update("t".repeat(100_000));
+    await expect(update("t".repeat(33 * 1024 * 1024))).rejects.toThrow(
+      "Oversized",
+    );
     await controller.dispose();
   });
 });

@@ -490,7 +490,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     list_projects: {
       description:
-        "List native project IDs, titles and canonical or sandbox locations. Takes {}. Catalogs larger than 200 report unavailable rather than a truncated complete result.",
+        "List native project IDs, titles and canonical or sandbox locations. Takes {}.",
       input: inputSchema({}),
       async run(v, context, diagnostics) {
         exact(v, []);
@@ -593,7 +593,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           sessionID: stringSchema,
           location: stringSchema,
           agent: stringSchema,
-          text: { ...stringSchema, maxLength: 12_000 },
+          text: stringSchema,
           options: NATIVE_SEND_OPTIONS.prompt,
         },
         ["sessionID", "location", "agent", "text"],
