@@ -83,7 +83,7 @@ The plugin SHALL provide a selectable primary coordinator agent wherever it is e
 
 ### Requirement: Restricted conversational coordination
 
-The plugin SHALL restrict matching coordinator roles to Backseat tools through Code Mode and user questions, subject to configured OpenCode permissions.
+The plugin SHALL restrict matching coordinator roles from built-in implementation tools while leaving other configured tools eligible under native OpenCode permissions.
 
 #### Scenario: Preserves native approval for conversational control
 
@@ -99,13 +99,27 @@ The plugin SHALL restrict matching coordinator roles to Backseat tools through C
 
 #### Scenario: Rejects disallowed coordinator tool execution
 
-- **WHEN** a matching coordinator requests a tool outside its permitted set
-- **THEN** execution is rejected independently of context filtering and configured denials remain final.
+- **WHEN** a matching coordinator requests `shell`, `bash`, `edit`, `write`, `patch`, `read`, `glob`, `grep`, `webfetch`, `subagent`, `skill`, or a tool in the `lsp_` or `use_` families
+- **THEN** it is absent from the prompt-facing tool catalog and execution is rejected independently of context filtering, including nested Code Mode calls and inherited allow rules.
+- **AND** configured denials remain final.
 
 #### Scenario: Preserves cross-project control under inherited policy
 
 - **WHEN** a coordinator controls a selected session in another project
 - **THEN** the operation uses the selected native location without requiring terminal attachment or a coordinator in the storage directory.
+
+#### Scenario: Allows configured coordination tools and session-local tracking
+
+- **WHEN** a matching coordinator uses an available configured tool outside the built-in implementation denials, including session-local todo tools
+- **THEN** Backseat neither removes it from the prompt-facing catalog nor rejects its execution.
+- **AND** tools for unrelated agents remain unaffected.
+
+#### Scenario: Asks for unmatched coordination tool actions
+
+- **WHEN** a tool checks a permission action with no specific matching coordinator rule or inherited override
+- **THEN** the bundled permission fallback is ask, while `execute`, `question`, available `todowrite` and `todoread`, and Backseat actions retain allow defaults.
+- **AND** inherited allow, ask or deny rules still override those defaults without changing coordinator recognition.
+- **AND** Backseat does not add a universal permission assertion to custom plugin tools that do not check their own permissions.
 
 ### Requirement: Shared durable coordination store
 
