@@ -45,11 +45,23 @@ export const COORDINATION_TOOLS = [
   ...CONTENT_READER_NAMES,
   ...Object.keys(NATIVE_SEND_DESCRIPTIONS).map((kind) => `${kind}_session`),
 ] as const;
-export const COORDINATOR_TOOL_IDS = new Set([
-  "execute",
-  "question",
-  ...COORDINATION_TOOLS.map((name) => `backseat_${name}`),
+const COORDINATOR_DENIED_TOOL_IDS = new Set([
+  "shell",
+  "bash",
+  "edit",
+  "write",
+  "patch",
+  "read",
+  "glob",
+  "grep",
+  "webfetch",
+  "subagent",
+  "skill",
 ]);
+export const isCoordinatorToolPermitted = (id: string): boolean =>
+  !COORDINATOR_DENIED_TOOL_IDS.has(id) &&
+  !id.startsWith("lsp_") &&
+  !id.startsWith("use_");
 export interface CoordinationToolPort {
   diagnostics?: DiagnosticEmitter;
   native: NativeConnection;
