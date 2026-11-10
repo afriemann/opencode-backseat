@@ -72,6 +72,9 @@ function fixture(budget?: number) {
     advance() {
       time = 2 * 60 * 60_000;
     },
+    setTime(value: number) {
+      time = value;
+    },
   };
 }
 
@@ -213,6 +216,110 @@ describe("Native session content pagination", () => {
       expect(received).toEqual([expected]);
       selected.content.dispose();
     }
+  });
+  it("Exports unredacted content by default", async () => {
+    const f = fixture();
+    const received: unknown[] = [];
+    (f.client as unknown as { experimental: unknown }).experimental = {
+      session: {
+        export: async (input: unknown) => {
+          received.push(input);
+          return { messages: ["m".repeat(5000)] };
+        },
+      },
+    };
+    const read = (extra: object) =>
+      f.content.read(
+        "export",
+        { ...f.query, ...extra },
+        "caller",
+        "service",
+        f.client,
+        f.signal,
+      );
+    const first = await read({});
+    await read({ sanitize: true });
+    expect(received).toEqual([
+      { sessionID: "worker", sanitize: false },
+      { sessionID: "worker", sanitize: true },
+    ]);
+    const next = await read({ cursor: first.cursor, sanitize: false });
+    expect(next.chunk).toBeDefined();
+  });
+  it("Keeps a continuation valid for one hour after its last use", async () => {
+    const f = fixture();
+    f.setData([{ text: "large".repeat(2000) }]);
+    const query = { ...f.query, maxBytes: 2048 };
+    const read = (cursor?: string) =>
+      f.content.read(
+        "context",
+        { ...query, ...(cursor ? { cursor } : {}) },
+        "caller",
+        "service",
+        f.client,
+        f.signal,
+      );
+    let page = await read();
+    const hour = 60 * 60_000;
+    f.setTime(0.9 * hour);
+    page = await read(page.cursor);
+    f.setTime(1.8 * hour);
+    page = await read(page.cursor);
+    expect(page.chunk).toBeDefined();
+    const stale = page.cursor!;
+    f.setTime(3 * hour);
+    await expect(read(stale)).rejects.toThrow("expired");
+    const consumed = fixture();
+    consumed.setData([{ text: "large".repeat(2000) }]);
+    const first = await consumed.content.read(
+      "context",
+      { ...query },
+      "caller",
+      "service",
+      consumed.client,
+      consumed.signal,
+    );
+    await consumed.content.read(
+      "context",
+      { ...query, cursor: first.cursor },
+      "caller",
+      "service",
+      consumed.client,
+      consumed.signal,
+    );
+    await expect(
+      consumed.content.read(
+        "context",
+        { ...query, cursor: first.cursor },
+        "caller",
+        "service",
+        consumed.client,
+        consumed.signal,
+      ),
+    ).rejects.toThrow("unavailable");
+  });
+  it("Evicts least recently used snapshots and keeps others on overflow", async () => {
+    const f = fixture(30_000);
+    const read = (text: string, cursor?: string) => {
+      f.setData([{ text }]);
+      return f.content.read(
+        "context",
+        { ...f.query, maxBytes: 2048, ...(cursor ? { cursor } : {}) },
+        "caller",
+        "service",
+        f.client,
+        f.signal,
+      );
+    };
+    const a = await read("a".repeat(12_000));
+    const b = await read("b".repeat(12_000));
+    const c = await read("c".repeat(12_000));
+    await expect(read("", a.cursor)).rejects.toThrow("unavailable");
+    const nextB = await read("", b.cursor);
+    expect(nextB.chunk).toBeDefined();
+    expect((await read("", c.cursor)).chunk).toBeDefined();
+    await expect(read("z".repeat(40_000))).rejects.toThrow("snapshot_capacity");
+    expect((await read("", nextB.cursor)).chunk).toBeDefined();
   });
   it("Reads content larger than eight megabytes in consistent chunks", async () => {
     const f = fixture();

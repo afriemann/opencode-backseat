@@ -791,6 +791,18 @@ describe("Conversational manual assignment", () => {
   });
 });
 
+describe("Explicit adoption of archived sessions", () => {
+  it("Adopts an archived session", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    f.sessions.get("worker")!.time.archived = 2;
+    expect(await controller.adoptSession("worker", context)).toMatchObject({
+      sessionID: "worker",
+      following: true,
+    });
+    await controller.dispose();
+  });
+});
 describe("Full native session controls", () => {
   it("Controls an archived session", async () => {
     const f = fixture(),
@@ -815,7 +827,6 @@ describe("Full native session controls", () => {
       },
       context,
     );
-    await controller.adoptSession("worker", context);
     await controller.deleteSession("worker", context);
     expect(f.calls).toContain("interrupt");
     expect(f.calls).toContain("update");
@@ -866,6 +877,36 @@ describe("Full native session controls", () => {
         },
         context,
       );
+    await expect(
+      controller.sessionOperation(
+        {
+          operation: "import_session",
+          sessionID: "ses_0000000000000000000000000a",
+          location: "/project",
+          agent: coordinatorAgent.id,
+          payload: {
+            transfer: {
+              info: {
+                id: "ses_0000000000000000000000000a",
+                projectID: "prj_0000000000000000000000000a",
+                agent: coordinatorAgent.id,
+                location: { directory: "/project" },
+                cost: 0,
+                tokens: {
+                  input: 0,
+                  output: 0,
+                  reasoning: 0,
+                  cache: { read: 0, write: 0 },
+                },
+                time: { created: 1, updated: 1 },
+              },
+              messages: [],
+            },
+          },
+        },
+        context,
+      ),
+    ).rejects.toThrow("unavailable");
     await switchTo("helper");
     expect(f.calls).toContain("switch");
     await expect(switchTo(coordinatorAgent.id)).rejects.toThrow("coordinator");

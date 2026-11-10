@@ -93,15 +93,14 @@ export function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 export const PAYLOAD_BYTES = 32 * 1024 * 1024;
-export function text(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    !value.trim() ||
-    value.length > PAYLOAD_BYTES
-  )
+function boundedText(value: unknown, maximum: number): string {
+  if (typeof value !== "string" || !value.trim() || value.length > maximum)
     throw new Error("Invalid bounded text");
   return value;
 }
+export const text = (value: unknown): string => boundedText(value, 32_000);
+export const bulkText = (value: unknown): string =>
+  boundedText(value, PAYLOAD_BYTES);
 export function integer(value: unknown, minimum = 0): number {
   if (
     typeof value !== "number" ||

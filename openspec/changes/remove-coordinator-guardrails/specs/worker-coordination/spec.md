@@ -63,6 +63,12 @@ The coordinator SHALL expose dedicated typed native controls governed by configu
 - **WHEN** a coordinator sends text or an operation payload with strings longer than 12,000 characters within the payload byte bound
 - **THEN** it is delivered unchanged; a payload over the bound is rejected before any native call.
 
+#### Scenario: Reconciles a send beyond the first two hundred messages
+
+- **WHEN** an uncertain send's message lies beyond the first 200 messages of a session
+- **THEN** reconciliation pages through the history, stops at the match and reports it admitted.
+- **AND** a repeated cursor ends the scan as unknown.
+
 #### Scenario: Uses any non-coordinator native agent
 
 - **WHEN** a coordinator creates a session, switches an agent or imports a session with a subagent-mode or hidden native agent

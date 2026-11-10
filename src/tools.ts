@@ -26,7 +26,15 @@ import {
   type NativeInventory,
 } from "./native-sessions.ts";
 import { NativeConnectionError } from "./native-connection.ts";
-import { exact, integer, list, object, text, fingerprint } from "./state.ts";
+import {
+  bulkText,
+  exact,
+  integer,
+  list,
+  object,
+  text,
+  fingerprint,
+} from "./state.ts";
 
 const CORE_COORDINATION_TOOLS = [
   "list_sessions",
@@ -605,7 +613,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
             sessionID: text(v.sessionID),
             location: text(v.location),
             agent: text(v.agent),
-            text: text(v.text),
+            text: bulkText(v.text),
             ...(v.options === undefined ? {} : { options: object(v.options) }),
           },
           context,
@@ -684,7 +692,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
             text:
               v.text === undefined && (kind === "compact" || kind === "skill")
                 ? kind
-                : text(v.text),
+                : bulkText(v.text),
             kind: kind as NativeSendKind,
             ...(v.options === undefined ? {} : { options: object(v.options) }),
           },

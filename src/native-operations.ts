@@ -10,7 +10,13 @@ import type {
   SessionCreateInput,
   ExperimentalSessionImportInput,
 } from "@opencode/client";
-import { PAYLOAD_BYTES, exact, list, object, text } from "./state.ts";
+import {
+  PAYLOAD_BYTES,
+  bulkText as text,
+  exact,
+  list,
+  object,
+} from "./state.ts";
 import { Form, Session, SessionMessage } from "@opencode/client/effect";
 import { Schema } from "effect";
 
@@ -120,6 +126,8 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
   const kind = input.kind ?? "prompt";
   if (!NATIVE_SEND_KINDS.includes(kind))
     throw new Error("Unsupported native send operation");
+  if (Buffer.byteLength(input.text) > PAYLOAD_BYTES)
+    throw new Error("Oversized native send text");
   const value = object(input.options ?? {});
   if (Buffer.byteLength(JSON.stringify(value)) > PAYLOAD_BYTES)
     throw new Error("Oversized native send options");

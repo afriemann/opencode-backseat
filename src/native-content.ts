@@ -431,6 +431,11 @@ export function createNativeContent(
       if (value.expires <= now()) handles.delete(key);
     while (handles.size >= CONTENT_BOUNDS.handles)
       handles.delete(handles.keys().next().value!);
+    // Budget counts UTF-8 bytes of retained snapshots, not V8 heap, which can be larger.
+    if (handle.snapshot && handle.snapshot.bytes > snapshotBudget)
+      throw new Error(
+        `snapshot_capacity: native content exceeds the ${snapshotBudget} byte snapshot budget`,
+      );
     while (handle.snapshot && handles.size) {
       const used = new Set(
         [...handles.values()].flatMap((h) =>
@@ -442,10 +447,6 @@ export function createNativeContent(
       if (total <= snapshotBudget) break;
       handles.delete(handles.keys().next().value!);
     }
-    if (handle.snapshot && handle.snapshot.bytes > snapshotBudget)
-      throw new Error(
-        `snapshot_capacity: native content exceeds the ${snapshotBudget} byte snapshot budget`,
-      );
     const key = randomUUID();
     handles.set(key, handle);
     return key;
@@ -461,6 +462,8 @@ export function createNativeContent(
     ): Promise<ContentPage> {
       signal.throwIfAborted();
       if (disposed) throw new Error("Native content reader is disposed");
+      for (const [key, value] of handles)
+        if (value.expires <= now()) handles.delete(key);
       exact({ ...input }, [
         "sessionID",
         "location",
@@ -746,6 +749,7 @@ export function createNativeContent(
       }
       if (Buffer.byteLength(JSON.stringify(result)) > maxBytes)
         throw new Error("Native content result exceeds its byte bound");
+      if (snapshot && cursor) handles.delete(cursor);
       return result;
     },
     async follow(

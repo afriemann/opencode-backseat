@@ -389,7 +389,7 @@ describe("Native session inventory", () => {
 });
 
 describe("Full native session controls", () => {
-  it("Reconciles a delivery beyond the first two hundred messages", async () => {
+  it("Reconciles a send beyond the first two hundred messages", async () => {
     const page = (start: number, count: number, next?: string) => ({
       data: Array.from({ length: count }, (_, i) => ({
         id: `m${start + i}`,
@@ -428,5 +428,51 @@ describe("Full native session controls", () => {
         new AbortController().signal,
       ),
     ).toBe("admitted");
+  });
+  it("Stops reconciling at the match and ends on a repeated cursor", async () => {
+    const pages: string[] = [];
+    const make = (next: (cursor?: string) => string | undefined) =>
+      ({
+        session: {
+          get: async () => ({
+            id: "w",
+            agent: "engineer",
+            location: { directory: "/p" },
+          }),
+          inbox: { list: async () => [] },
+        },
+        message: {
+          list: async (input: { cursor?: string }) => {
+            pages.push(input.cursor ?? "first");
+            const following = next(input.cursor);
+            return {
+              data: [{ id: input.cursor ? "x" : "m1", type: "user" }],
+              cursor: following ? { next: following } : {},
+            };
+          },
+        },
+      }) as unknown as Parameters<typeof readNativeSessionDelivery>[0];
+    const delivery = (id: string) => ({
+      id,
+      sessionID: "w",
+      agent: "engineer",
+      location: "/p",
+    });
+    const signal = new AbortController().signal;
+    expect(
+      await readNativeSessionDelivery(
+        make(() => "more"),
+        delivery("m1"),
+        signal,
+      ),
+    ).toBe("admitted");
+    expect(pages).toEqual(["first"]);
+    expect(
+      await readNativeSessionDelivery(
+        make(() => "loop"),
+        delivery("missing"),
+        signal,
+      ),
+    ).toBe("unknown");
   });
 });
