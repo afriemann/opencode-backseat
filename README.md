@@ -24,6 +24,8 @@ Session listing can filter by status, project, location and subpath, agent, titl
 
 The coordinator reads whole sessions, including archived ones, and exports are unredacted by default, so user text, reasoning and tool output reach the coordinator model and its transcript; ask for a redacted export explicitly if you do not want that. Large reads are served in consistent chunks from a snapshot that stays valid for one hour after its last use.
 
+The coordinator can recap a session (goal, work done, current state, open problems, next steps) using that session's own model, which sends its transcript to that model. The recap lists subagent sessions so any of them can be recapped in turn.
+
 It can also use your configured ticket, recall and tracking tools, including session-local todos when available. Other tool actions default to `ask`; your configured native permissions still apply. MCP calls request native permission automatically, while custom plugin tools are responsible for their own permission checks. Built-in implementation tools remain unavailable to the coordinator.
 
 ## Follow an existing session
