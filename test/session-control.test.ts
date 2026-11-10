@@ -935,6 +935,16 @@ describe("Full native session controls", () => {
         context,
       );
     await update("t".repeat(100_000));
+    await expect(
+      controller.sessionOperation(
+        {
+          operation: "cancel_session_form",
+          ...target,
+          payload: { formID: "f".repeat(40_000) },
+        },
+        context,
+      ),
+    ).rejects.toThrow("Invalid bounded text");
     await expect(update("t".repeat(33 * 1024 * 1024))).rejects.toThrow(
       "Oversized",
     );

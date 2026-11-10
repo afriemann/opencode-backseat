@@ -10,13 +10,7 @@ import type {
   SessionCreateInput,
   ExperimentalSessionImportInput,
 } from "@opencode/client";
-import {
-  PAYLOAD_BYTES,
-  bulkText as text,
-  exact,
-  list,
-  object,
-} from "./state.ts";
+import { PAYLOAD_BYTES, bulkText, exact, text, list, object } from "./state.ts";
 import { Form, Session, SessionMessage } from "@opencode/client/effect";
 import { Schema } from "effect";
 
@@ -171,7 +165,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
     return {
       start: row.start as number,
       end: row.end as number,
-      text: text(row.text),
+      text: bulkText(row.text),
     };
   };
   const files: SessionPromptInput["files"] =
@@ -199,7 +193,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
             ...(row.name === undefined ? {} : { name: text(row.name) }),
             ...(row.description === undefined
               ? {}
-              : { description: text(row.description) }),
+              : { description: bulkText(row.description) }),
             ...(row.mention === undefined
               ? {}
               : { mention: mention(row.mention) }),
@@ -241,7 +235,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
     ...(resume === undefined ? {} : { resume }),
   };
   const description =
-    value.description === undefined ? undefined : text(value.description);
+    value.description === undefined ? undefined : bulkText(value.description);
   switch (kind) {
     case "prompt":
       return (client, signal) =>
@@ -643,7 +637,7 @@ export function prepareNativeOperation(
         id: sessionID,
         agent: input.agent,
         location: { directory: input.location },
-        ...(value.title === undefined ? {} : { title: text(value.title) }),
+        ...(value.title === undefined ? {} : { title: bulkText(value.title) }),
         ...(parentID === undefined ? {} : { parentID }),
         ...(model === undefined ? {} : { model }),
         ...(permissions === undefined ? {} : { permissions }),
@@ -833,7 +827,7 @@ export function prepareNativeOperation(
       const permissions = nativePermissions(value.permissions);
       const payload: SessionUpdateInput = {
         sessionID,
-        ...(value.title === undefined ? {} : { title: text(value.title) }),
+        ...(value.title === undefined ? {} : { title: bulkText(value.title) }),
         ...(metadata === undefined ? {} : { metadata }),
         ...(permissions === undefined ? {} : { permissions }),
         ...(value.archived === undefined
@@ -885,7 +879,7 @@ export function prepareNativeOperation(
         client.experimental.session.wait({ sessionID }, { signal }),
       );
     case "generate_session": {
-      const prompt = text(value.prompt);
+      const prompt = bulkText(value.prompt);
       return simple((client, signal) =>
         client.session.generate({ sessionID, prompt }, { signal }),
       );
@@ -961,7 +955,7 @@ export function prepareNativeOperation(
         decision,
         ...(value.message === undefined
           ? {}
-          : { message: text(value.message) }),
+          : { message: bulkText(value.message) }),
       };
       return {
         async subject(client, signal) {
