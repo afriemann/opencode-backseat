@@ -161,6 +161,7 @@ export const coordinatorAgent: CoordinatorAgentDefinition = {
     { action: "backseat_compact_session", resource: "*", effect: "allow" },
     { action: "backseat_command_session", resource: "*", effect: "allow" },
     { action: "backseat_skill_session", resource: "*", effect: "allow" },
+    { action: "backseat.*", resource: "*", effect: "allow" },
   ],
 };
 
