@@ -579,6 +579,7 @@ The plugin SHALL wake a session's following coordinator when native progress, id
 
 - **WHEN** a saved native boundary is unavailable or history changes
 - **THEN** the coordinator receives explicit discontinuity rather than fabricated continuous progress.
+- **BUT** when an observation read merely times out, is cancelled or the native service is unreachable, the saved boundary is kept and observation is retried with backoff from it; discontinuity is reported only if the failure persists beyond a bounded number of retries.
 
 ### Requirement: Explicit following lifecycle
 

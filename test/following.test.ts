@@ -6,6 +6,7 @@ import {
   type FollowPending,
 } from "../src/state.ts";
 import { observeFollowedSession } from "../src/native-content.ts";
+import { NativeConnectionError } from "../src/native-connection.ts";
 import type { OpenCodeClient, SessionLogItem } from "@opencode/client";
 
 function fixture(initial?: unknown) {
@@ -15,6 +16,7 @@ function fixture(initial?: unknown) {
   let status: "admitted" | "uncertain" = "admitted";
   let proof: "admitted" | "unknown" = "unknown";
   let owner: "gone" | "idle" | "active" | "unreadable" = "idle";
+  let observeError: Error | undefined;
   const notifications: FollowNotification[] = [];
   const host: FollowHost = {
     storage: {
@@ -33,6 +35,7 @@ function fixture(initial?: unknown) {
       return owner;
     },
     async observe(_id, after) {
+      if (observeError) throw observeError;
       return {
         afterSeq,
         pending: after === undefined ? emptyPending() : structuredClone(update),
@@ -53,6 +56,9 @@ function fixture(initial?: unknown) {
     events(pending: Partial<FollowPending>, seq = afterSeq + 1) {
       update = { ...emptyPending(), ...pending };
       afterSeq = seq;
+    },
+    observeFails(error: Error | undefined) {
+      observeError = error;
     },
     ownerIs(state: typeof owner) {
       owner = state;
@@ -231,6 +237,86 @@ describe("Background followed-session events", () => {
       afterSeq: 15,
       pending: { discontinuity: true },
     });
+    await core.dispose();
+  });
+  it.each(["timeout", "cancelled", "unavailable"] as const)(
+    "Retries a transient observation failure (%s)",
+    async (classification) => {
+      const f = fixture();
+      const core = await NativeFollower.load(f.host);
+      await core.follow("worker", "coordinator");
+      f.observeFails(new NativeConnectionError("read failed", classification));
+      await core.ingest("worker");
+      expect(f.notifications).toHaveLength(0);
+      expect(core.snapshot().followers[0]).toMatchObject({
+        afterSeq: 10,
+        pending: { discontinuity: false },
+      });
+      await core.ingest("worker", {
+        requests: [{ kind: "permission", id: "permission-1" }],
+      });
+      expect(f.notifications[0]!.text).toContain("permission-1");
+      expect(f.notifications[0]!.text).not.toContain('"discontinuity":true');
+      f.observeFails(undefined);
+      f.events({ progress: 2 }, 12);
+      await core.ingest("worker");
+      expect(core.snapshot().followers[0]).toMatchObject({ afterSeq: 12 });
+      await core.dispose();
+    },
+  );
+  it("Re-observes after a transient failure and reports persistent failure", async () => {
+    const f = fixture();
+    const core = await NativeFollower.load(f.host);
+    await core.follow("worker", "coordinator");
+    const clock = timers();
+    try {
+      f.observeFails(new NativeConnectionError("read failed", "timeout"));
+      await core.ingest("worker");
+      expect(clock.pending).toHaveLength(1);
+      f.observeFails(undefined);
+      f.events({ idle: true }, 12);
+      clock.pending.shift()!.run();
+      await core.transaction(async () => undefined);
+      expect(core.snapshot().followers[0]).toMatchObject({ afterSeq: 12 });
+      expect(f.notifications).toHaveLength(1);
+      expect(clock.pending).toHaveLength(0);
+      f.notifications.length = 0;
+      f.observeFails(new NativeConnectionError("read failed", "timeout"));
+      for (let i = 0; i < 20; i++) await core.ingest("worker");
+      expect(f.notifications).toHaveLength(0);
+      for (let i = 0; i < 4; i++) {
+        clock.pending.pop()!.run();
+        await core.transaction(async () => undefined);
+        expect(f.notifications).toHaveLength(0);
+      }
+      clock.pending.pop()!.run();
+      await core.transaction(async () => undefined);
+      expect(f.notifications[0]!.text).toContain('"discontinuity":true');
+    } finally {
+      clock.restore();
+    }
+    await core.dispose();
+  });
+  it("Delivers a hook idle during a transient failure without suppressing the next", async () => {
+    const f = fixture();
+    const core = await NativeFollower.load(f.host);
+    await core.follow("worker", "coordinator");
+    f.observeFails(new NativeConnectionError("read failed", "timeout"));
+    await core.ingest("worker", { idle: true });
+    expect(f.notifications).toHaveLength(1);
+    f.observeFails(undefined);
+    await core.ingest("worker", { idle: true });
+    expect(f.notifications).toHaveLength(2);
+    await core.dispose();
+  });
+  it("Reports discontinuity for a non-transient observation failure", async () => {
+    const f = fixture();
+    const core = await NativeFollower.load(f.host);
+    await core.follow("worker", "coordinator");
+    f.observeFails(new NativeConnectionError("target changed", "validation"));
+    await core.ingest("worker");
+    expect(f.notifications).toHaveLength(1);
+    expect(f.notifications[0]!.text).toContain('"discontinuity":true');
     await core.dispose();
   });
   it("Delivers actionable events without an initial send", async () => {
