@@ -595,7 +595,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
     },
     send_session: {
       description:
-        "Send text to the exact native session/location/current agent. options accepts native attachments, metadata, delivery and resume. Configured native permissions apply. Returns sessionID, sendID and admitted or uncertain status; inspect uncertain identities rather than resend.",
+        "Send text to the native session sessionID. location and agent are optional assertions: when given, the call fails if the live session differs. options accepts native attachments, metadata, delivery and resume. Configured native permissions apply. Returns sessionID, sendID and admitted or uncertain status; inspect uncertain identities rather than resend.",
       input: inputSchema(
         {
           sessionID: stringSchema,
@@ -604,15 +604,15 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           text: stringSchema,
           options: NATIVE_SEND_OPTIONS.prompt,
         },
-        ["sessionID", "location", "agent", "text"],
+        ["sessionID", "text"],
       ),
       async run(v, context) {
         exact(v, ["sessionID", "location", "agent", "text", "options"]);
         return port.backend.sendSession(
           {
             sessionID: text(v.sessionID),
-            location: text(v.location),
-            agent: text(v.agent),
+            ...(v.location === undefined ? {} : { location: text(v.location) }),
+            ...(v.agent === undefined ? {} : { agent: text(v.agent) }),
             text: bulkText(v.text),
             ...(v.options === undefined ? {} : { options: object(v.options) }),
           },
@@ -633,7 +633,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   for (const operation of NATIVE_OPERATION_NAMES) {
     const definition = NATIVE_OPERATIONS[operation];
     specs[operation] = {
-      description: `${definition.description} Select exact sessionID, canonical location and current agent. Configured native permissions apply. Created or imported sessions are followed automatically.`,
+      description: `${definition.description} Existing-session operations need only sessionID; optional canonical location and agent assert the expected target and fail if the live session differs. Create and import require location and agent. Configured native permissions apply. Created or imported sessions are followed automatically.`,
       input: inputSchema(
         {
           sessionID: stringSchema,
@@ -643,8 +643,10 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         },
         [
           "sessionID",
-          "location",
-          ...(operation === "update_session" ? [] : ["agent"]),
+          ...(operation === "create_native_session" ||
+          operation === "import_session"
+            ? ["location", "agent"]
+            : []),
           ...definition.input.required,
         ],
       ),
@@ -654,7 +656,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           {
             operation,
             sessionID: text(sessionID),
-            location: text(location),
+            ...(location === undefined ? {} : { location: text(location) }),
             ...(agent === undefined ? {} : { agent: text(agent) }),
             payload,
           },
@@ -665,7 +667,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   }
   for (const [kind, description] of Object.entries(NATIVE_SEND_DESCRIPTIONS)) {
     specs[`${kind}_session`] = {
-      description: `${description} Select exact sessionID, location and current agent. Configured native permissions apply. Returns sendID and admitted or uncertain; inspect an uncertain identity, never resend it.`,
+      description: `${description} Only sessionID is required; optional location and agent assert the expected target and fail if the live session differs. Configured native permissions apply. Returns sendID and admitted or uncertain; inspect an uncertain identity, never resend it.`,
       input: inputSchema(
         {
           sessionID: stringSchema,
@@ -676,8 +678,6 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         },
         [
           "sessionID",
-          "location",
-          "agent",
           ...(kind === "compact" || kind === "skill" ? [] : ["text"]),
           ...(kind === "command" || kind === "skill" ? ["options"] : []),
         ],
@@ -687,8 +687,8 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         return port.backend.sendSession(
           {
             sessionID: text(v.sessionID),
-            location: text(v.location),
-            agent: text(v.agent),
+            ...(v.location === undefined ? {} : { location: text(v.location) }),
+            ...(v.agent === undefined ? {} : { agent: text(v.agent) }),
             text:
               v.text === undefined && (kind === "compact" || kind === "skill")
                 ? kind

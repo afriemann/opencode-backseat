@@ -555,7 +555,7 @@ export const NATIVE_OPERATION_NAMES = Object.keys(
 export interface SessionOperation {
   operation: NativeOperationName;
   sessionID: string;
-  location: string;
+  location?: string;
   agent?: string;
   payload: Record<string, unknown>;
 }
@@ -613,6 +613,11 @@ export function prepareNativeOperation(
   if (Buffer.byteLength(JSON.stringify(value)) > PAYLOAD_BYTES)
     throw new Error("Oversized native operation payload");
   exact(value, Object.keys(definition.input.properties));
+  const creationLocation = () => {
+    if (input.location === undefined)
+      throw new Error("Worker location required");
+    return input.location;
+  };
   const selectedSession = async (
     client: OpenCodeClient,
     signal: AbortSignal,
@@ -620,8 +625,9 @@ export function prepareNativeOperation(
     const session = await client.session.get({ sessionID }, { signal });
     if (
       session.id !== sessionID ||
-      session.location.directory !== input.location ||
-      session.agent !== input.agent
+      (input.location !== undefined &&
+        session.location.directory !== input.location) ||
+      (input.agent !== undefined && session.agent !== input.agent)
     )
       throw new Error("Selected native operation target changed");
     return session;
@@ -644,7 +650,7 @@ export function prepareNativeOperation(
       const payload: SessionCreateInput = {
         id: sessionID,
         agent: input.agent,
-        location: { directory: input.location },
+        location: { directory: creationLocation() },
         ...(value.title === undefined ? {} : { title: bulkText(value.title) }),
         ...(parentID === undefined ? {} : { parentID }),
         ...(model === undefined ? {} : { model }),
@@ -671,6 +677,7 @@ export function prepareNativeOperation(
     case "import_session": {
       const transfer = object(value.transfer);
       exact(transfer, ["info", "messages"]);
+      const directory = creationLocation();
       let payload: ExperimentalSessionImportInput;
       try {
         const info = Schema.decodeUnknownSync(Session.Info, {
@@ -686,7 +693,7 @@ export function prepareNativeOperation(
             messages: Schema.encodeUnknownSync(
               Schema.Array(SessionMessage.Info),
             )(messages),
-            location: { directory: input.location },
+            location: { directory },
           }),
         ) as ExperimentalSessionImportInput;
       } catch {

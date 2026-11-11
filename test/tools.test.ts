@@ -1086,6 +1086,30 @@ describe("Fine-grained Code Mode queries", () => {
       send,
       expect.objectContaining({ sessionID: "coordinator" }),
     ]);
+    await f.call("send_session", { sessionID: "worker", text: "By ID" });
+    expect(f.controls.at(-1)).toMatchObject([
+      "send_session",
+      { sessionID: "worker", text: "By ID" },
+      expect.anything(),
+    ]);
+    expect((f.controls.at(-1) as unknown[])[1]).not.toHaveProperty("location");
+    const required = (name: string) =>
+      (
+        f.registry.tools.find((tool) => tool.name === name)!.input as {
+          required: string[];
+        }
+      ).required;
+    for (const name of [
+      "send_session",
+      "shell_session",
+      "interrupt_session",
+      "update_session",
+    ])
+      expect(required(name)).not.toEqual(expect.arrayContaining(["location"]));
+    for (const name of ["create_native_session", "import_session"])
+      expect(required(name)).toEqual(
+        expect.arrayContaining(["location", "agent"]),
+      );
     for (const [kind, options] of [
       ["synthetic", { resume: false }],
       ["shell", {}],
