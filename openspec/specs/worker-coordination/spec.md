@@ -476,7 +476,7 @@ The coordinator SHALL expose dedicated typed native controls governed by configu
 
 #### Scenario: Updates a session whose location or agent is gone
 
-- **WHEN** a coordinator updates a session whose recorded location directory no longer exists, or which has no agent, selecting its recorded location and, if it has one, its agent
+- **WHEN** a coordinator updates a session whose recorded location directory no longer exists, or which has no agent, selecting it by sessionID alone or with its recorded location and, if it has one, its agent
 - **THEN** the update executes under configured policy against that exact session.
 - **AND** a location that differs from the recorded one, or an agent that differs from the recorded agent, is rejected.
 
@@ -501,6 +501,12 @@ The coordinator SHALL expose dedicated typed native controls governed by configu
 - **WHEN** a coordinator creates a session, switches an agent or imports a session with a subagent-mode or hidden native agent
 - **THEN** the operation proceeds under configured policy.
 - **AND** a coordinator agent is rejected for all three.
+
+#### Scenario: Addresses an existing session by ID alone
+
+- **WHEN** a coordinator sends input to or controls an existing session, other than creating or importing one, giving only its sessionID
+- **THEN** the operation targets that session at its live location and agent under configured policy, including when its agent no longer exists.
+- **AND** a supplied location or agent that differs from the live session is rejected without acting.
 
 ### Requirement: Explicit native request replies
 
