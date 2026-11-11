@@ -7,17 +7,22 @@ import {
   opendir,
   rename,
   statfs,
+  unlink,
   type FileHandle,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 const maximumEnvelopeBytes = 32 * 1024 * 1024;
+const interruptedPublication = /^\.publish-[a-zA-Z0-9-]+$/;
 const localFilesystems = new Set([
   0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630,
 ]);
+export class UnsafeStorageError extends Error {}
 const unsafeStorage = () =>
-  new Error("Shared storage is unsafe or incomplete; coordination held");
+  new UnsafeStorageError(
+    "Shared storage is unsafe or incomplete; coordination held",
+  );
 const missing = (error: unknown) =>
   error instanceof Error && "code" in error && error.code === "ENOENT";
 
@@ -351,6 +356,7 @@ export async function openSharedStorage(
         constants.O_NOFOLLOW,
       0o600,
     );
+    let renamed = false;
     try {
       await anchor.validateFile(file, temporary);
       await file.writeFile(bytes);
@@ -358,15 +364,42 @@ export async function openSharedStorage(
       await anchor.validateFile(file, temporary);
       if (!initialize) await read("state.json");
       await rename(`${anchor.path}/${temporary}`, `${anchor.path}/state.json`);
+      renamed = true;
       await anchor.sync();
       await anchor.validate();
       await read("state.json");
     } finally {
-      await file.close();
+      try {
+        await file.close();
+      } finally {
+        if (!renamed)
+          // The publish error is the one that matters; a failed cleanup is retried by the next writable open.
+          await unlink(`${anchor.path}/${temporary}`).catch(() => undefined);
+      }
+    }
+  };
+  const removeInterruptedPublications = async () => {
+    await anchor.validate();
+    const uid = process.getuid?.();
+    for await (const entry of await opendir(anchor.path)) {
+      if (!interruptedPublication.test(entry.name)) continue;
+      const path = `${anchor.path}/${entry.name}`,
+        status = await lstat(path).catch((error: unknown) => {
+          if (missing(error)) return undefined;
+          throw error;
+        });
+      if (
+        status?.isFile() &&
+        status.uid === uid &&
+        status.nlink === 1 &&
+        (status.mode & 0o777) === 0o600
+      )
+        await unlink(path);
     }
   };
   try {
     let initialized = true;
+    if (!readOnly) await removeInterruptedPublications();
     try {
       await lstat(`${anchor.path}/initialized`);
     } catch (error) {

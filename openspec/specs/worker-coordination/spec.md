@@ -151,6 +151,21 @@ The plugin SHALL persist followers and native delivery identities independently 
 - **WHEN** state is unsafe, corrupt, unreadable or incompatible with the session-centric format
 - **THEN** mutations fail explicitly without overwriting existing state, resetting it or migrating task records.
 
+#### Scenario: Recovers from an interrupted publication
+
+- **WHEN** a writable store contains a leftover temporary publication file that is a private regular single-link file owned by the user
+- **THEN** the file is removed and the existing state is loaded unchanged.
+
+#### Scenario: Holds on an unexpected store entry
+
+- **WHEN** a store contains an entry that is not a store file or a safe leftover publication file
+- **THEN** storage is held and the entry is not removed.
+
+#### Scenario: Recovers a held coordinator once storage is safe
+
+- **WHEN** a coordination tool is called after startup held the coordinator and the store has since become safe and unowned
+- **THEN** the call acquires authority, starts following and succeeds without restarting the service.
+
 #### Scenario: Preserves populated stores across manual assignments
 
 - **WHEN** a session-centric store is reloaded after session control

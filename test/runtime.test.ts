@@ -355,3 +355,117 @@ describe("Restricted conversational coordination", () => {
     }
   });
 });
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Shared durable coordination store", () => {
+  it("Recovers a held coordinator once storage is safe", async () => {
+    const root = resolve(".opencode/backseat");
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const home = await mkdtemp(`${root}/recover-`);
+    await mkdir(`${home}/data`);
+    await chmod(`${home}/data`, 0o777);
+    const registration = { dispose: async () => {} };
+    const tools = new Map<
+      string,
+      { execute(input: unknown, context: unknown): Promise<unknown> }
+    >();
+    let bootstrap!: () => Promise<unknown>;
+    let subscriptions = 0;
+    const session = {
+      id: "coordinator",
+      agent: coordinatorAgent.id,
+      projectID: "project",
+      location: { directory: home },
+      time: { created: 1, updated: 1 },
+    };
+    const client = {
+      session: { get: async () => session, form: { list: async () => [] } },
+      permission: {
+        request: {
+          list: async () => ({ location: { directory: home }, data: [] }),
+        },
+      },
+    } as unknown as OpenCodeClient;
+    const stub = spyOn(
+      connections,
+      "createNativeConnection",
+    ).mockImplementation(() => ({
+      read: (work) => work(client, new AbortController().signal),
+      identity: () => ({ mac: "service" }),
+      dispose() {},
+    }));
+    const context = {
+      app: { version: "2.2.5" },
+      options: { dataDir: `${home}/data` },
+      location: { directory: home },
+      session: { get: client.session.get, hook: async () => registration },
+      event: {
+        async *subscribe({ signal }: { signal: AbortSignal }) {
+          subscriptions++;
+          await new Promise<void>((done) =>
+            signal.aborted
+              ? done()
+              : signal.addEventListener("abort", () => done(), { once: true }),
+          );
+        },
+      },
+      permission: { assert: async () => {} },
+      rpc: {
+        register: async (
+          _contract: unknown,
+          handlers: { bootstrap: () => Promise<unknown> },
+        ) => {
+          bootstrap = handlers.bootstrap;
+          return registration;
+        },
+      },
+      agent: {
+        list: async () => ({
+          location: { directory: home },
+          data: [structuredClone(coordinatorAgent)],
+        }),
+        transform: async () => registration,
+      },
+      tool: {
+        hook: async () => registration,
+        transform: async (change: (editor: unknown) => void) => {
+          change({
+            namespace() {},
+            add(tool: {
+              name: string;
+              execute(input: unknown, context: unknown): Promise<unknown>;
+            }) {
+              tools.set(tool.name, tool);
+            },
+          });
+          return registration;
+        },
+      },
+    } as unknown as Plugin.Context;
+    let close: unknown;
+    try {
+      close = await promisePlugin(() => {}).setup(context);
+      expect(await bootstrap()).toMatchObject({ authority: "held" });
+      const call = () =>
+        tools.get("list_followed_sessions")!.execute(
+          {},
+          {
+            sessionID: "coordinator",
+            agent: coordinatorAgent.id,
+            messageID: "message",
+            id: "call",
+            signal: new AbortController().signal,
+          },
+        );
+      await expect(call()).rejects.toThrow("unsafe or unavailable");
+      await chmod(`${home}/data`, 0o700);
+      await call();
+      expect(await bootstrap()).toMatchObject({ authority: "owned" });
+      expect(subscriptions).toBeGreaterThan(0);
+    } finally {
+      stub.mockRestore();
+      if (typeof close === "function") await close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
