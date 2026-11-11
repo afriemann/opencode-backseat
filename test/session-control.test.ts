@@ -162,9 +162,9 @@ function fixture() {
       },
     },
     agent: {
-      async list() {
+      async list(input?: { location: { directory: string } }) {
         return {
-          location: { directory: "/project" },
+          location: { directory: input?.location.directory ?? "/project" },
           data: [{ id: "engineer", hidden: false, mode: "all" }],
         };
       },
@@ -415,6 +415,23 @@ describe("Explicit adoption", () => {
         context,
       ),
     ).rejects.toThrow();
+    expect(f.calls).not.toContain("create");
+    await controller.dispose();
+  });
+  it("Reports an unknown worker location or agent as a validation failure", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    for (const input of [
+      { location: "/not-a-project", agent: "engineer" },
+      { location: "/project", agent: "missing-agent" },
+    ])
+      await expect(
+        controller.createSession(input, context),
+      ).rejects.toMatchObject({
+        name: "Error",
+        classification: "validation",
+        message: "Selected worker location or agent unavailable",
+      });
     expect(f.calls).not.toContain("create");
     await controller.dispose();
   });

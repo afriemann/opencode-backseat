@@ -39,6 +39,7 @@ import {
 } from "./tools.ts";
 import {
   createNativeConnection,
+  NativeConnectionError,
   DIAGNOSTIC_EVENTS,
   DIAGNOSTIC_PHASES,
   DIAGNOSTIC_FAILURES,
@@ -578,7 +579,9 @@ export class SessionController {
         !projects.some((project) => project.location === input.location) ||
         !agents.includes(agent)
       )
-        throw new Error("Selected worker location or agent unavailable");
+        throw new NativeConnectionError(
+          "Selected worker location or agent unavailable",
+        );
     });
     const payload = fingerprint(input);
     const result = await this.follower.transaction(async (state) => {

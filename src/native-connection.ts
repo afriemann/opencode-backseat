@@ -346,6 +346,13 @@ const unavailable = (
 ): Error =>
   new NativeConnectionError(`Native service ${reason}`, classification);
 
+const ERROR_CLASS_LABEL = /^(?:[A-Z][A-Za-z]{0,31})?Error$/;
+// Native errors may embed secrets, so only the error class name is surfaced.
+const errorClassSuffix = (error: unknown): string =>
+  error instanceof Error && ERROR_CLASS_LABEL.test(error.name)
+    ? ` (${error.name})`
+    : "";
+
 // Read the registered native endpoint without invoking the SDK's credentialed probe.
 export async function readNativeRegistration(
   file = fallback(),
@@ -674,7 +681,7 @@ export function createNativeConnection(options: {
             : callerSignal?.aborted
               ? unavailable("read cancelled", "cancelled")
               : unavailable(
-                  "connection unavailable or unsupported",
+                  `connection unavailable or unsupported${errorClassSuffix(error)}`,
                   "unavailable",
                 );
       } finally {
