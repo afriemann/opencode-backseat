@@ -7,6 +7,7 @@ export const FOLLOW_BOUNDS = {
   notificationBytes: 16 * 1024,
   progressDelayMs: 500,
   retryMaxMs: 30_000,
+  observeRetries: 5,
 } as const;
 export const STATE_BOUNDS = {
   sessionDeliveries: 800,

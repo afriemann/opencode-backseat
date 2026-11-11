@@ -48,6 +48,7 @@ import {
   diagnosticContext,
   type DiagnosticEmitter,
   type NativeConnection,
+  type NativeFailureClass,
 } from "./native-connection.ts";
 import { coordinatorAgent, isCoordinatorAgent } from "./coordinator-agent.ts";
 import {
@@ -772,12 +773,20 @@ export class SessionController {
   }
 }
 
+const TRANSIENT_OBSERVATION_FAILURES: ReadonlySet<NativeFailureClass> = new Set(
+  ["timeout", "cancelled", "unavailable"],
+);
+
 export class NativeFollower {
   private tail: Promise<unknown> = Promise.resolve();
   private closed = false;
   private failed = false;
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly retryDelays = new Map<string, number>();
+  private readonly observeRetries = new Map<
+    string,
+    { count: number; timer?: ReturnType<typeof setTimeout> | undefined }
+  >();
   private constructor(
     private readonly host: FollowHost,
     private state: FollowerState,
@@ -856,6 +865,32 @@ export class NativeFollower {
       discontinuity: previous.discontinuity || !!incoming.discontinuity,
       requests: [...requests.values()],
     };
+  }
+  private scheduleObservation(sessionID: string): void {
+    if (this.closed) return;
+    const entry = this.observeRetries.get(sessionID) ?? { count: 0 };
+    this.observeRetries.set(sessionID, entry);
+    // Only a retry that itself failed spends budget; hook-driven ingests share the pending timer.
+    if (entry.timer) return;
+    entry.count++;
+    entry.timer = setTimeout(
+      () => {
+        entry.timer = undefined;
+        void this.ingest(sessionID).catch((error: unknown) =>
+          admissionDiagnostic("Follower re-observation failed", error),
+        );
+      },
+      Math.min(
+        FOLLOW_BOUNDS.progressDelayMs * 2 ** (entry.count - 1),
+        FOLLOW_BOUNDS.retryMaxMs,
+      ),
+    );
+    entry.timer.unref();
+  }
+  private clearObservation(sessionID: string): void {
+    const entry = this.observeRetries.get(sessionID);
+    if (entry?.timer) clearTimeout(entry.timer);
+    this.observeRetries.delete(sessionID);
   }
   private schedule(coordinatorID: string, retry = false): void {
     if (this.timers.has(coordinatorID)) return;
@@ -960,6 +995,7 @@ export class NativeFollower {
         (follower) => follower.sessionID !== sessionID,
       );
       await this.save(next);
+      this.clearObservation(sessionID);
       if (
         !next.followers.some(
           (follower) => follower.coordinatorID === coordinatorID,
@@ -979,20 +1015,33 @@ export class NativeFollower {
     await this.serial(async () => {
       const next = this.snapshot(),
         follower = next.followers.find((row) => row.sessionID === sessionID);
-      if (!follower) return;
+      if (!follower) {
+        this.clearObservation(sessionID);
+        return;
+      }
       if (follower.gone && !gone) {
+        this.clearObservation(sessionID);
         await this.deliver(follower.coordinatorID);
         return;
       }
       if (gone) follower.gone = true;
       let observed: Awaited<ReturnType<FollowHost["observe"]>>;
+      let transient = false;
       try {
         observed = await this.host.observe(sessionID, follower.afterSeq);
       } catch (error) {
         admissionDiagnostic("Followed-session observation unavailable", error);
+        // A timed-out or unreachable read leaves the saved boundary valid: the
+        // next successful observation resumes from it, so nothing is missing.
+        // Persistent failure escalates to discontinuity after bounded retries.
+        transient =
+          error instanceof NativeConnectionError &&
+          TRANSIENT_OBSERVATION_FAILURES.has(error.classification) &&
+          (this.observeRetries.get(sessionID)?.count ?? 0) <
+            FOLLOW_BOUNDS.observeRetries;
         observed = {
           afterSeq: follower.afterSeq,
-          pending: { ...emptyPending(), discontinuity: true },
+          pending: { ...emptyPending(), discontinuity: !transient },
         };
       }
       const requests = [
@@ -1016,14 +1065,20 @@ export class NativeFollower {
         follower.pending = this.merge(follower.pending, { requests: fresh });
       follower.pending = this.merge(follower.pending, {
         ...pending,
-        idle: !!pending.idle && follower.idleSeq !== observed.afterSeq,
+        // Without a fresh boundary a repeated idle cannot be told from a new one, so deliver it.
+        idle:
+          !!pending.idle &&
+          (transient || follower.idleSeq !== observed.afterSeq),
         requests: fresh,
       });
-      if (follower.pending.idle) follower.idleSeq = observed.afterSeq;
+      if (follower.pending.idle && !transient)
+        follower.idleSeq = observed.afterSeq;
       follower.seenRequests = [
         ...new Set(requests.map((request) => `${request.kind}:${request.id}`)),
       ];
       await this.save(next);
+      if (transient) this.scheduleObservation(sessionID);
+      else this.clearObservation(sessionID);
       if (
         follower.pending.idle ||
         follower.pending.failed ||
@@ -1193,6 +1248,8 @@ export class NativeFollower {
     this.closed = true;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    for (const sessionID of [...this.observeRetries.keys()])
+      this.clearObservation(sessionID);
     await this.tail;
   }
 }
