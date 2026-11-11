@@ -18,7 +18,7 @@
     "@opencode/client": "2.2.5"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.2.5",
+    "@opencode/plugin": "2.2.6",
     "effect": "4.0.6",
     "@types/bun": "1.4.4",
     "typescript": "6.0.3",
