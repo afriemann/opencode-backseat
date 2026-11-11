@@ -757,10 +757,71 @@ describe("Conversational manual assignment", () => {
       await expect(
         update("/elsewhere", noAgent ? undefined : "engineer"),
       ).rejects.toThrow("changed");
-      if (!noAgent) await expect(update("/project")).rejects.toThrow("changed");
       expect(f.calls).toEqual(["backseat.update_session", "update"]);
       await controller.dispose();
     }
+  });
+  it("Addresses an existing session by ID alone", async () => {
+    for (const [, noDirectory, noAgent] of orphans) {
+      const f = orphaned(noDirectory, noAgent),
+        controller = await SessionController.load(f.host);
+      await controller.sessionOperation(
+        {
+          operation: "update_session",
+          sessionID: "worker",
+          payload: { archived: true },
+        },
+        context,
+      );
+      expect(f.calls).toEqual(["backseat.update_session", "update"]);
+      await controller.dispose();
+    }
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    await controller.sessionOperation(
+      { operation: "interrupt_session", sessionID: "worker", payload: {} },
+      context,
+    );
+    expect(f.calls).toContain("interrupt");
+    expect(
+      await controller.sendSession(
+        { sessionID: "worker", text: "continue" },
+        context,
+      ),
+    ).toMatchObject({ status: "admitted" });
+    expect(f.calls).toContain("prompt");
+    f.calls.length = 0;
+    await expect(
+      controller.sendSession(
+        { sessionID: "worker", agent: "other", text: "again" },
+        context,
+      ),
+    ).rejects.toThrow("changed");
+    await expect(
+      controller.sessionOperation(
+        {
+          operation: "interrupt_session",
+          sessionID: "worker",
+          location: "/elsewhere",
+          payload: {},
+        },
+        context,
+      ),
+    ).rejects.toThrow("changed");
+    expect(f.calls).not.toContain("prompt");
+    expect(f.calls).not.toContain("interrupt");
+    for (const operation of [
+      "create_native_session",
+      "import_session",
+    ] as const)
+      await expect(
+        controller.sessionOperation(
+          { operation, sessionID: "ses_new", agent: "engineer", payload: {} },
+          context,
+        ),
+      ).rejects.toThrow();
+    expect(f.calls).not.toContain("create");
+    await controller.dispose();
   });
   it("Rejects unavailable locations and agents outside update and delete", async () => {
     const interrupt = {

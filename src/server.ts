@@ -310,7 +310,7 @@ export class SessionController {
   ): Promise<unknown> {
     if ((await this.host.canonical(input.location)) !== input.location)
       throw new Error("Select a canonical project location");
-    const operation: SessionOperation = {
+    const operation: SessionOperation & { location: string } = {
       operation: "create_native_session",
       sessionID: `ses_${fingerprint([context.sessionID, context.messageID, context.id, "create", fingerprint(input)]).slice(0, 32)}`,
       location: input.location,
@@ -331,7 +331,7 @@ export class SessionController {
     };
   }
   async sendSession(
-    input: NativeSend & { location: string; agent: string },
+    input: NativeSend & { location?: string; agent?: string },
     context: NativeIdentity,
   ): Promise<unknown> {
     if (input.sessionID === context.sessionID)
@@ -343,10 +343,13 @@ export class SessionController {
     return this.follower.transaction(async (state) => {
       const selected = await this.target(input.sessionID);
       if (
-        selected.agent !== input.agent ||
-        selected.location.directory !== input.location
+        (input.agent !== undefined && selected.agent !== input.agent) ||
+        (input.location !== undefined &&
+          selected.location.directory !== input.location)
       )
         throw new Error("Selected native send target changed");
+      const location = selected.location.directory,
+        agent = selected.agent!;
       const previous = state.sessionDeliveries.find((row) => row.id === id);
       if (previous) {
         if (
@@ -377,8 +380,8 @@ export class SessionController {
         operation === "prompt" ? "send_session" : `${operation}_session`,
         {
           sessionID: input.sessionID,
-          location: input.location,
-          agent: input.agent,
+          location,
+          agent,
           payload,
         },
         context,
@@ -387,8 +390,8 @@ export class SessionController {
       const record: SessionDelivery = {
         id,
         sessionID: input.sessionID,
-        location: input.location,
-        agent: input.agent,
+        location,
+        agent,
         coordinatorID: context.sessionID,
         serviceID: this.serviceID(),
         operation,
@@ -562,7 +565,7 @@ export class SessionController {
     return { sessionID, following: false };
   }
   private async createNativeOperation(
-    input: SessionOperation,
+    input: SessionOperation & { location: string },
     context: NativeIdentity,
     prepared: ReturnType<typeof prepareNativeOperation>,
     action: string = input.operation,
@@ -675,27 +678,32 @@ export class SessionController {
         input.operation === "create_native_session" ||
         input.operation === "import_session";
     if (creates) {
-      if ((await this.host.canonical(input.location)) !== input.location)
+      if (
+        input.location === undefined ||
+        (await this.host.canonical(input.location)) !== input.location
+      )
         throw new Error("Select a canonical project location");
-      return this.createNativeOperation(input, context, prepared);
+      return this.createNativeOperation(
+        { ...input, location: input.location },
+        context,
+        prepared,
+      );
     }
     const orphanTolerant = input.operation === "update_session";
     const selected = await this.target(input.sessionID, orphanTolerant);
     if (
-      selected &&
-      (selected.agent !== input.agent ||
+      (input.agent !== undefined && selected.agent !== input.agent) ||
+      (input.location !== undefined &&
         selected.location.directory !== input.location)
     )
       throw new Error("Selected native operation target changed");
-    if (!(await this.locationMatches(input.location, orphanTolerant)))
+    const location = selected.location.directory;
+    if (!(await this.locationMatches(location, orphanTolerant)))
       throw new Error("Select a canonical project location");
     if (input.operation === "switch_session_agent") {
       const newAgent = text(object(input.payload).newAgent);
       const coordinator = await this.host.native.read((client, signal) =>
-        new NativeDiscovery(client, signal).isCoordinator(
-          input.location,
-          newAgent,
-        ),
+        new NativeDiscovery(client, signal).isCoordinator(location, newAgent),
       );
       if (coordinator)
         throw new Error("A coordinator agent cannot be a worker agent");
@@ -705,14 +713,14 @@ export class SessionController {
       input.operation,
       {
         sessionID: input.sessionID,
-        location: input.location,
-        agent: input.agent,
+        location,
+        agent: selected.agent,
         payload: input.payload,
         subject,
       },
       context,
     );
-    if (selected) await this.unchanged(selected, orphanTolerant);
+    await this.unchanged(selected, orphanTolerant);
     if (
       fingerprint(await this.host.native.read(prepared.subject)) !==
       fingerprint(subject)
