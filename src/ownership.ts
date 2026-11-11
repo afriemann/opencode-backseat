@@ -467,6 +467,8 @@ type CoreRegistry = {
     closing: boolean;
   };
 };
+export const conflictingStores =
+  "Conflicting coordination stores in one native service";
 const coordinatorCoreKey = Symbol.for("opencode.backseat.coordinator-core");
 
 export async function acquireCoordinatorCore<
@@ -489,7 +491,7 @@ export async function acquireCoordinatorCore<
   return serial(async () => {
     let entry = registry.entry;
     if (entry && entry.directory !== directory)
-      throw new Error("Conflicting coordination stores in one native service");
+      throw new Error(conflictingStores);
     if (entry?.closing)
       throw new Error("Coordination runtime shutdown is incomplete; held");
     if (!entry) {

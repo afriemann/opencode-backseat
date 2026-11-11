@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   stat,
@@ -162,7 +163,6 @@ describe("Shared durable coordination store", () => {
         "hardlink",
         "mode",
         "directory",
-        "interrupted",
       ]) {
         const directory = `${home}/${failure}`,
           storage = await openSharedStorage(directory);
@@ -178,10 +178,6 @@ describe("Shared durable coordination store", () => {
         if (failure === "hardlink") await link(file, `${home}/linked-state`);
         if (failure === "mode") await chmod(file, 0o644);
         if (failure === "directory") await chmod(directory, 0o755);
-        if (failure === "interrupted")
-          await writeFile(`${directory}/.publish-interrupted`, "unfinished", {
-            mode: 0o600,
-          });
         await expect(openSharedStorage(directory)).rejects.toThrow();
         if (failure === "symlink")
           expect(await readFile(`${home}/target`, "utf8")).toBe("unchanged");
@@ -220,6 +216,68 @@ describe("Shared durable coordination store", () => {
           await storage.close();
         }
       }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+  it("Recovers from an interrupted publication", async () => {
+    const home = await fixture("interrupted");
+    try {
+      const storage = await openSharedStorage(home);
+      await storage.set("delivery", { uncertain: true });
+      await storage.close();
+      await writeFile(`${home}/.publish-interrupted`, "unfinished", {
+        mode: 0o600,
+      });
+      const reopened = await openSharedStorage(home);
+      try {
+        expect(await reopened.get("delivery")).toEqual({ uncertain: true });
+      } finally {
+        await reopened.close();
+      }
+      expect(await readdir(home)).not.toContain(".publish-interrupted");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+  it("Holds on an unexpected store entry", async () => {
+    const home = await fixture("unexpected");
+    try {
+      await (await openSharedStorage(home)).close();
+      await writeFile(`${home}/.publish-linked`, "unfinished", { mode: 0o600 });
+      await link(`${home}/.publish-linked`, `${home}/.publish-second-link`);
+      await writeFile(`${home}/stray`, "data", { mode: 0o600 });
+      await expect(openSharedStorage(home)).rejects.toThrow();
+      await rm(`${home}/stray`);
+      await expect(openSharedStorage(home)).rejects.toThrow();
+      expect(await readdir(home)).toContain(".publish-linked");
+      await rm(`${home}/.publish-second-link`);
+      await rm(`${home}/.publish-linked`);
+      await writeFile(`${home}/.publish-open`, "x", { mode: 0o644 });
+      await expect(openSharedStorage(home)).rejects.toThrow();
+      expect(await readdir(home)).toContain(".publish-open");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+  it("Removes its temporary file when publication fails", async () => {
+    const home = await fixture("publish-failure");
+    try {
+      const storage = await openSharedStorage(home);
+      const renamed = spyOn(filesystem, "rename").mockRejectedValue(
+        new Error("rename failed"),
+      );
+      try {
+        await expect(
+          storage.set("delivery", { uncertain: true }),
+        ).rejects.toThrow("rename failed");
+      } finally {
+        renamed.mockRestore();
+        await storage.close();
+      }
+      expect(
+        (await readdir(home)).filter((name) => name.startsWith(".publish-")),
+      ).toEqual([]);
     } finally {
       await rm(home, { recursive: true, force: true });
     }

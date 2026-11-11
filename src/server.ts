@@ -52,12 +52,14 @@ import { coordinatorAgent, isCoordinatorAgent } from "./coordinator-agent.ts";
 import {
   CoordinatorOwnership,
   acquireCoordinatorCore,
+  conflictingStores,
   createFilesystemOwnershipPort,
   type CoordinatorCoreLease,
 } from "./ownership.ts";
 import {
   openAnchoredDirectory,
   openSharedStorage,
+  UnsafeStorageError,
   resolveDataDirectory,
   type SharedStorage,
 } from "./storage.ts";
@@ -1313,39 +1315,84 @@ type NativeCore = {
   projects: Map<string, ProjectAdapter>;
   bootstrap(): CoordinatorBootstrap;
   dispose(): Promise<void>;
+  onPromoted?(listener: () => void): void;
 };
+const backendOperations = [
+  "createSession",
+  "adoptSession",
+  "sendSession",
+  "deleteSession",
+  "sessionOperation",
+  "listFollowedSessions",
+  "stopFollowing",
+  "event",
+  "reload",
+] as const satisfies readonly (keyof SessionBackend)[];
 function unavailableCore(
   dataDir: string | undefined,
   initial: ProjectAdapter,
   reason: string,
+  retry?: (projects: Map<string, ProjectAdapter>) => Promise<NativeCore>,
 ): NativeCore {
-  const unavailable = async (): Promise<never> => {
-    throw new Error(reason);
+  const projects = new Map([[initial.location, initial]]);
+  const listeners: Array<() => void> = [];
+  let promoted: NativeCore | undefined,
+    attempt: Promise<NativeCore | undefined> | undefined;
+  const promote = (): Promise<NativeCore | undefined> =>
+    (attempt ??= (async () => {
+      try {
+        const next = await retry!(projects);
+        if (next.bootstrap().authority !== "owned") {
+          await next.dispose();
+          return undefined;
+        }
+        promoted = next;
+        for (const listener of listeners) listener();
+        return next;
+      } catch {
+        // The held reason is the stable outcome; the next call retries.
+        return undefined;
+      } finally {
+        attempt = undefined;
+      }
+    })());
+  const resolveCore = async (): Promise<NativeCore> => {
+    const core = promoted ?? (retry ? await promote() : undefined);
+    if (!core) throw new Error(reason);
+    return core;
   };
+  const backend = Object.fromEntries(
+    backendOperations.map((name) => [
+      name,
+      async (...args: unknown[]) =>
+        (
+          (await resolveCore()).backend[name] as (
+            ...input: unknown[]
+          ) => Promise<unknown>
+        )(...args),
+    ]),
+  ) as unknown as SessionBackend;
   return {
-    projects: new Map([[initial.location, initial]]),
-    bootstrap: () => ({
-      ...(dataDir === undefined ? {} : { dataDir }),
-      authority: "held",
-      reason,
-    }),
-    backend: {
-      createSession: unavailable,
-      adoptSession: unavailable,
-      sendSession: unavailable,
-      deleteSession: unavailable,
-      sessionOperation: unavailable,
-      listFollowedSessions: unavailable,
-      stopFollowing: unavailable,
-      event: unavailable,
-      reload: unavailable,
+    projects,
+    bootstrap: () =>
+      promoted?.bootstrap() ?? {
+        ...(dataDir === undefined ? {} : { dataDir }),
+        authority: "held",
+        reason,
+      },
+    backend,
+    dispose: async () => {
+      await promoted?.dispose();
     },
-    dispose: async () => {},
+    onPromoted: (listener) => {
+      listeners.push(listener);
+    },
   };
 }
 async function createNativeCore(
   dataDir: string,
   initial: ProjectAdapter,
+  projects = new Map([[initial.location, initial]]),
 ): Promise<NativeCore> {
   const ownership = new CoordinatorOwnership(
     dataDir,
@@ -1353,11 +1400,12 @@ async function createNativeCore(
     createFilesystemOwnershipPort(),
   );
   if ((await ownership.claim()) !== "owned")
-    return unavailableCore(dataDir, initial, ownership.reason);
+    return unavailableCore(dataDir, initial, ownership.reason, (shared) =>
+      createNativeCore(dataDir, initial, shared),
+    );
   let storage: SharedStorage | undefined;
   try {
     storage = await openSharedStorage(dataDir);
-    const projects = new Map([[initial.location, initial]]);
     const active = () => {
       const adapter = [...projects.values()].find(
         (value) => !value.abort.signal.aborted,
@@ -1440,7 +1488,9 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         abort: new AbortController(),
         native,
       };
-      let lease: CoordinatorCoreLease<NativeCore> | undefined, core: NativeCore;
+      let lease: CoordinatorCoreLease<NativeCore> | undefined,
+        unleased: NativeCore | undefined,
+        core: NativeCore;
       try {
         dataDir = resolveDataDirectory(ctx.options);
         lease = await acquireCoordinatorCore(dataDir, async () => {
@@ -1450,15 +1500,31 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         });
         core = lease.core;
       } catch (error) {
-        log("warn", "setup.degraded", { classification: "unavailable" });
-        core = unavailableCore(
+        const conflicting =
+          error instanceof Error && error.message === conflictingStores;
+        const code =
+          error instanceof Error && "code" in error
+            ? String(error.code)
+            : undefined;
+        log("warn", "setup.degraded", {
+          classification: "unavailable",
+          blocker: conflicting
+            ? "conflicting-store"
+            : error instanceof UnsafeStorageError
+              ? "unsafe-storage"
+              : code && /^E[A-Z0-9]+$/.test(code)
+                ? code
+                : "unknown",
+        });
+        core = unleased = unavailableCore(
           dataDir,
           adapter,
-          error instanceof Error &&
-            error.message ===
-              "Conflicting coordination stores in one native service"
-            ? error.message
+          conflicting
+            ? conflictingStores
             : "Coordination storage is unsafe or unavailable",
+          dataDir === undefined || conflicting
+            ? undefined
+            : (shared) => createNativeCore(dataDir!, adapter, shared),
         );
       }
       const existing = core.projects.get(location);
@@ -1493,6 +1559,7 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
                 failures,
                 "Project cleanup incomplete; runtime ownership retained",
               );
+            await unleased?.dispose();
             await lease?.release();
             trace.emit("info", "cleanup.completed");
           } catch (error) {
@@ -1501,8 +1568,8 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
           }
         })());
       try {
-        if (core.bootstrap().authority === "owned")
-          observing = (async () => {
+        const observe = () => {
+          observing ??= (async () => {
             while (!adapter.abort.signal.aborted) {
               try {
                 for await (const event of ctx.event.subscribe({
@@ -1558,6 +1625,18 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
               }
             }
           })();
+        };
+        if (core.bootstrap().authority === "owned") observe();
+        else
+          core.onPromoted?.(() => {
+            observe();
+            void backend.reload().catch(() =>
+              observerLog("warn", "observer.degraded", {
+                phase: "refresh",
+                classification: "unavailable",
+              }),
+            );
+          });
         const agents = await ctx.agent.transform((editor) => {
           if (editor.get(coordinatorAgent.id)) return;
           editor.update(coordinatorAgent.id, (agent) => {
