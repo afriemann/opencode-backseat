@@ -1316,7 +1316,7 @@ type NativeCore = {
   projects: Map<string, ProjectAdapter>;
   bootstrap(): CoordinatorBootstrap;
   dispose(): Promise<void>;
-  onPromoted?(listener: () => void): void;
+  onPromoted?(listener: () => void): () => void;
 };
 function blockerOf(error: unknown): string {
   if (error instanceof Error && error.message === conflictingStores)
@@ -1352,7 +1352,9 @@ function unavailableCore(
   const note = (blocker: string) => {
     if (blocker === reported) return;
     reported = blocker;
-    initial.degraded?.(blocker);
+    [...projects.values()]
+      .find((project) => !project.abort.signal.aborted)
+      ?.degraded?.(blocker);
   };
   const promote = (): Promise<NativeCore | undefined> =>
     (attempt ??= (async () => {
@@ -1405,6 +1407,10 @@ function unavailableCore(
     },
     onPromoted: (listener) => {
       listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+      };
     },
   };
 }
@@ -1641,8 +1647,9 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
           })();
         };
         if (core.bootstrap().authority === "owned") observe();
-        else
-          core.onPromoted?.(() => {
+        else {
+          const unsubscribe = core.onPromoted?.(() => {
+            if (adapter.abort.signal.aborted) return;
             observe();
             void backend.reload().catch(() =>
               observerLog("warn", "observer.degraded", {
@@ -1651,6 +1658,11 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
               }),
             );
           });
+          if (unsubscribe)
+            cleanupSteps.push(async () => {
+              unsubscribe();
+            });
+        }
         const agents = await ctx.agent.transform((editor) => {
           if (editor.get(coordinatorAgent.id)) return;
           editor.update(coordinatorAgent.id, (agent) => {
