@@ -479,6 +479,15 @@ describe("Automatic same-service native connection", () => {
         message:
           "Native service connection unavailable or unsupported (RangeError)",
       });
+      const named = new Error("PRIVATE_NATIVE_SENTINEL");
+      named.name = "https://127.0.0.1:1/token";
+      await expect(
+        f.connection.read(async () => {
+          throw named;
+        }),
+      ).rejects.toMatchObject({
+        message: "Native service connection unavailable or unsupported",
+      });
     } finally {
       f.connection.dispose();
     }

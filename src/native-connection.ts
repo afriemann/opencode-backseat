@@ -346,7 +346,7 @@ const unavailable = (
 ): Error =>
   new NativeConnectionError(`Native service ${reason}`, classification);
 
-const ERROR_CLASS_LABEL = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
+const ERROR_CLASS_LABEL = /^(?:[A-Z][A-Za-z]{0,31})?Error$/;
 // Native errors may embed secrets, so only the error class name is surfaced.
 const errorClassSuffix = (error: unknown): string =>
   error instanceof Error && ERROR_CLASS_LABEL.test(error.name)
