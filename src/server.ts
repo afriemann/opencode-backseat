@@ -1297,6 +1297,7 @@ type ProjectAdapter = {
   location: string;
   abort: AbortController;
   native: NativeConnection;
+  degraded?: (blocker: string) => void;
 };
 type SessionBackend = Pick<
   SessionController,
@@ -1317,6 +1318,14 @@ type NativeCore = {
   dispose(): Promise<void>;
   onPromoted?(listener: () => void): void;
 };
+function blockerOf(error: unknown): string {
+  if (error instanceof Error && error.message === conflictingStores)
+    return "conflicting-store";
+  if (error instanceof UnsafeStorageError) return "unsafe-storage";
+  const code =
+    error instanceof Error && "code" in error ? String(error.code) : "";
+  return /^E[A-Z0-9]+$/.test(code) ? code : "unknown";
+}
 const backendOperations = [
   "createSession",
   "adoptSession",
@@ -1337,27 +1346,35 @@ function unavailableCore(
   const projects = new Map([[initial.location, initial]]);
   const listeners: Array<() => void> = [];
   let promoted: NativeCore | undefined,
-    attempt: Promise<NativeCore | undefined> | undefined;
+    attempt: Promise<NativeCore | undefined> | undefined,
+    closed = false,
+    reported: string | undefined;
+  const note = (blocker: string) => {
+    if (blocker === reported) return;
+    reported = blocker;
+    initial.degraded?.(blocker);
+  };
   const promote = (): Promise<NativeCore | undefined> =>
     (attempt ??= (async () => {
       try {
         const next = await retry!(projects);
-        if (next.bootstrap().authority !== "owned") {
+        if (closed || next.bootstrap().authority !== "owned") {
           await next.dispose();
+          if (!closed) note("held");
           return undefined;
         }
         promoted = next;
         for (const listener of listeners) listener();
         return next;
-      } catch {
-        // The held reason is the stable outcome; the next call retries.
+      } catch (error) {
+        note(blockerOf(error));
         return undefined;
       } finally {
         attempt = undefined;
       }
     })());
   const resolveCore = async (): Promise<NativeCore> => {
-    const core = promoted ?? (retry ? await promote() : undefined);
+    const core = promoted ?? (retry && !closed ? await promote() : undefined);
     if (!core) throw new Error(reason);
     return core;
   };
@@ -1382,6 +1399,8 @@ function unavailableCore(
       },
     backend,
     dispose: async () => {
+      closed = true;
+      await attempt;
       await promoted?.dispose();
     },
     onPromoted: (listener) => {
@@ -1488,43 +1507,39 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         abort: new AbortController(),
         native,
       };
-      let lease: CoordinatorCoreLease<NativeCore> | undefined,
-        unleased: NativeCore | undefined,
-        core: NativeCore;
+      adapter.degraded = (blocker) =>
+        log("warn", "setup.degraded", {
+          classification: "unavailable",
+          blocker,
+        });
+      let lease: CoordinatorCoreLease<NativeCore> | undefined, core: NativeCore;
       try {
         dataDir = resolveDataDirectory(ctx.options);
-        lease = await acquireCoordinatorCore(dataDir, async () => {
-          const anchor = await openAnchoredDirectory(dataDir!);
-          await anchor.close();
-          return createNativeCore(dataDir!, adapter);
+        const directory = dataDir;
+        lease = await acquireCoordinatorCore(directory, async () => {
+          try {
+            const anchor = await openAnchoredDirectory(directory);
+            await anchor.close();
+            return await createNativeCore(directory, adapter);
+          } catch (error) {
+            adapter.degraded?.(blockerOf(error));
+            return unavailableCore(
+              directory,
+              adapter,
+              "Coordination storage is unsafe or unavailable",
+              (shared) => createNativeCore(directory, adapter, shared),
+            );
+          }
         });
         core = lease.core;
       } catch (error) {
-        const conflicting =
-          error instanceof Error && error.message === conflictingStores;
-        const code =
-          error instanceof Error && "code" in error
-            ? String(error.code)
-            : undefined;
-        log("warn", "setup.degraded", {
-          classification: "unavailable",
-          blocker: conflicting
-            ? "conflicting-store"
-            : error instanceof UnsafeStorageError
-              ? "unsafe-storage"
-              : code && /^E[A-Z0-9]+$/.test(code)
-                ? code
-                : "unknown",
-        });
-        core = unleased = unavailableCore(
+        adapter.degraded?.(blockerOf(error));
+        core = unavailableCore(
           dataDir,
           adapter,
-          conflicting
+          error instanceof Error && error.message === conflictingStores
             ? conflictingStores
             : "Coordination storage is unsafe or unavailable",
-          dataDir === undefined || conflicting
-            ? undefined
-            : (shared) => createNativeCore(dataDir!, adapter, shared),
         );
       }
       const existing = core.projects.get(location);
@@ -1559,7 +1574,6 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
                 failures,
                 "Project cleanup incomplete; runtime ownership retained",
               );
-            await unleased?.dispose();
             await lease?.release();
             trace.emit("info", "cleanup.completed");
           } catch (error) {

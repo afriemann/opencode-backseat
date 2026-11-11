@@ -446,17 +446,20 @@ describe("Shared durable coordination store", () => {
     try {
       close = await promisePlugin(() => {}).setup(context);
       expect(await bootstrap()).toMatchObject({ authority: "held" });
+      const call = () =>
+        tools.get("list_followed_sessions")!.execute(
+          {},
+          {
+            sessionID: "coordinator",
+            agent: coordinatorAgent.id,
+            messageID: "message",
+            id: "call",
+            signal: new AbortController().signal,
+          },
+        );
+      await expect(call()).rejects.toThrow("unsafe or unavailable");
       await chmod(`${home}/data`, 0o700);
-      await tools.get("list_followed_sessions")!.execute(
-        {},
-        {
-          sessionID: "coordinator",
-          agent: coordinatorAgent.id,
-          messageID: "message",
-          id: "call",
-          signal: new AbortController().signal,
-        },
-      );
+      await call();
       expect(await bootstrap()).toMatchObject({ authority: "owned" });
       expect(subscriptions).toBeGreaterThan(0);
     } finally {

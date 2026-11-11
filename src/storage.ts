@@ -369,20 +369,27 @@ export async function openSharedStorage(
       await anchor.validate();
       await read("state.json");
     } finally {
-      await file.close();
-      if (!renamed)
-        // The publish error is the one that matters; a failed cleanup is retried by the next writable open.
-        await unlink(`${anchor.path}/${temporary}`).catch(() => undefined);
+      try {
+        await file.close();
+      } finally {
+        if (!renamed)
+          // The publish error is the one that matters; a failed cleanup is retried by the next writable open.
+          await unlink(`${anchor.path}/${temporary}`).catch(() => undefined);
+      }
     }
   };
   const removeInterruptedPublications = async () => {
+    await anchor.validate();
     const uid = process.getuid?.();
     for await (const entry of await opendir(anchor.path)) {
       if (!interruptedPublication.test(entry.name)) continue;
       const path = `${anchor.path}/${entry.name}`,
-        status = await lstat(path);
+        status = await lstat(path).catch((error: unknown) => {
+          if (missing(error)) return undefined;
+          throw error;
+        });
       if (
-        status.isFile() &&
+        status?.isFile() &&
         status.uid === uid &&
         status.nlink === 1 &&
         (status.mode & 0o777) === 0o600
