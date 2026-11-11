@@ -468,6 +468,22 @@ describe("Automatic same-service native connection", () => {
     }
   });
 
+  it("Names the failing error class without exposing its message", async () => {
+    const f = fixture();
+    try {
+      await expect(
+        f.connection.read(async () => {
+          throw new RangeError("PRIVATE_NATIVE_SENTINEL http://127.0.0.1:1/x");
+        }),
+      ).rejects.toMatchObject({
+        message:
+          "Native service connection unavailable or unsupported (RangeError)",
+      });
+    } finally {
+      f.connection.dispose();
+    }
+  });
+
   it("Rejects an unavailable or different native service", async () => {
     for (const kind of [
       "missing",

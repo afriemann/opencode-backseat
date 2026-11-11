@@ -1,0 +1,2 @@
+- [x] Surface the worker location or agent validation error as itself (scenario: Reports an unknown worker location or agent as a validation failure)
+- [x] Append the sanitized error class to the generic native failure (scenario: Names the failing error class without exposing its message)
