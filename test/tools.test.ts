@@ -3,6 +3,7 @@ import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import { createCoordinator } from "../src/coordinator-agent.ts";
 import { NativeConnectionError } from "../src/native-connection.ts";
+import { CONTENT_READERS } from "../src/native-content.ts";
 import {
   createCoordinationTools,
   type CoordinationToolPort,
@@ -211,6 +212,11 @@ function fixture() {
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Fine-grained Code Mode queries", () => {
+  it("Tells the reader how to reach the latest messages", () => {
+    const description = CONTENT_READERS.read_session_messages.description;
+    expect(description).toContain("order desc");
+    expect(description).toContain("limit 1");
+  });
   it("Pages selected session content incrementally", async () => {
     const f = fixture();
     const target = {

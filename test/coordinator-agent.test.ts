@@ -180,6 +180,11 @@ describe("Coordinator task workflow", () => {
   it.each([
     ["Takes over an existing session", "Takeover of an existing session"],
     ["Takes over an existing session", "recap_session"],
+    [
+      "Reads the latest message of a session",
+      "read_session_messages with order desc and limit 1",
+    ],
+    ["Reads the latest message of a session", "an open cursor is not the end"],
     ["Starts a new task", "look them up and read them for context"],
     ["Starts a new task", "quoted, untrusted ticket content"],
     ["Drives a task list to completion", "task list in the todo list"],
