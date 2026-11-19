@@ -464,7 +464,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
   const specs: Record<string, ToolSpec> = {
     list_sessions: {
       description:
-        "List native session metadata and hierarchy across projects without TUI attachment. Statuses are OR-ed; different filters are AND-ed. Defaults: running/waiting/inactive, root sessions only, no archived sessions, limit 50, order desc. includeSubagents includes all levels unless parentID selects roots or direct children. Updated/created Before bounds are exclusive and After bounds inclusive; with the matching order the scan stops early. subpath is the exact path relative to the project root and requires projectID. hydrate:false skips status reads (status unknown) and cannot combine with statuses. Status reads run under a time budget; unhydrated rows are deferred to the cursor and the result is partial. Each call scans at most 200 rows. Continue with the opaque cursor and unchanged filters even after an empty page. partial or unknownCount is not proof of no matches or completion.",
+        'List native session metadata and hierarchy across projects without TUI attachment. Statuses are OR-ed; different filters are AND-ed. Defaults: running/waiting/inactive, root sessions only, no archived sessions, limit 50, order desc. includeSubagents includes all levels unless parentID selects roots or direct children. Updated/created Before bounds are exclusive and After bounds inclusive; with the matching order the scan stops early. subpath is the exact path relative to the project root and requires projectID. hydrate:false skips status reads (status unknown) and cannot combine with statuses. Status reads run under a time budget; rows not yet read are held back and returned by a later call with the cursor. Each call scans at most 200 rows. Paging: a result with a cursor is not the end, so call again with the same arguments plus that cursor, even after a short or empty page; a result without a cursor is the complete listing unless available is false, which is a failure to list (report its reason; never treat it as empty). partial is informational and never decides whether to continue; only the cursor does. unknownCount is the number of rows in the scan of this result whose status could not be read; the default status filter hides them, so pass statuses ["unknown"] to list them or hydrate:false when status is not needed. Errors: after a timeout or cancellation retry the same cursor; after any other error, including continuation unavailable, query changed or did not advance, restart without a cursor.',
       input: inputSchema({
         statuses: {
           type: "array",
@@ -492,7 +492,7 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         cursor: {
           ...stringSchema,
           description:
-            "Opaque caller/query/instance-bound cursor; expires after five minutes. Keep every other argument unchanged.",
+            "Cursor from the previous result; pass it back unchanged with every other argument unchanged. Omit it on the first call. Expires after five minutes.",
         },
         order: { enum: ["asc", "desc"] },
       }),
