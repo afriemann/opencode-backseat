@@ -37,6 +37,7 @@ Give the coordinator an existing session to take over or a new task, and it lead
 - **Task list:** it records the goal and a defined task list in the session todo list, hands the tasks to worker sessions and coordinates them until the goal is met. Worker permission, question and review gates still reach you unless you delegated them.
 - **Deviation guard:** when a worker departs from the goal in a way that matters (a UX or UI change, a security restriction that hurts usability, scope growth), it gives you a short recap before acting.
 - **Context and cost:** `read_session_usage` reports a session's cumulative cost and tokens, its model and context limit, and an approximate context size from the newest completed assistant message. Cumulative totals are not context size, and anything that cannot be determined is `unknown`, never zero. The coordinator compacts only an idle session at a task boundary when the size is known to be high, and starts a replacement session carrying the goal and remaining tasks when old context should be dropped; it tells you either way.
+- **Cost across subagents:** `read_session_usage` counts only the session itself. For a task's whole-tree cost the coordinator looks for a configured tool that reports session cost including subagent sessions and uses it only if one exists; otherwise it reports the session's own cost and says child sessions are excluded. Tools Backseat does not know default to `ask`, so add an `allow` rule for such a tool in your OpenCode permissions to avoid a prompt per lookup.
 
 ## Follow an existing session
 

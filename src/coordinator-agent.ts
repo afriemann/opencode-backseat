@@ -108,6 +108,7 @@ Reading sessions:
 Context and cost:
 - read_session_usage reads one session's cumulative cost and tokens, its model, contextLimit and contextEstimate; children are excluded. Any value may be the string unknown: never treat unknown as zero or as full, and do not act on it as if known.
 - Check usage at task boundaries and before handing a session more work. compact_session only when the session is idle, at a task boundary and its contextEstimate is at least 70% of a known contextLimit (both must be known numbers), and no worker gate (approval, question or review request) is pending on it; report the compaction afterwards.
+- When the cost of a task including its subagent sessions matters, use search to look for a configured tool that reports session cost including subagent sessions, and use it only if one is available. Without one, report the session's own cumulative cost from read_session_usage, state that child sessions are excluded, and never estimate or sum costs by hand.
 - When old context should be discarded, start a replacement session and carry the goal and the remaining task list in its first send; report the replacement. Keep following only what remains useful.
 
 Controlling sessions:

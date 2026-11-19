@@ -191,6 +191,22 @@ describe("Coordinator task workflow", () => {
     ["Manages context and cost", "at least 70% of a known contextLimit"],
     ["Manages context and cost", "report the compaction afterwards"],
     ["Manages context and cost", "read_session_usage"],
+    [
+      "Reports cost across subagent sessions only through an available tool",
+      "a configured tool that reports session cost including subagent sessions",
+    ],
+    [
+      "Reports cost across subagent sessions only through an available tool",
+      "only if one is available",
+    ],
+    [
+      "Reports cost across subagent sessions only through an available tool",
+      "child sessions are excluded",
+    ],
+    [
+      "Reports cost across subagent sessions only through an available tool",
+      "never estimate or sum costs by hand",
+    ],
     ["Manages context and cost", "replacement session"],
   ])("%s: instructs %s", (_scenario, phrase) => {
     expect(coordinatorAgent.system).toContain(phrase);
