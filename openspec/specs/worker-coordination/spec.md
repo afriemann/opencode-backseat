@@ -744,3 +744,9 @@ The coordinator's instructions SHALL direct it to establish the goal of a sessio
 
 - **WHEN** the coordinator invokes the usage tool and no inherited rule matches its permission action
 - **THEN** the operation is allowed, while an inherited ask or deny rule appended to the coordinator's permission prefix still applies.
+
+#### Scenario: Reports cost across subagent sessions only through an available tool
+
+- **WHEN** the cost of a task including its subagent sessions is relevant
+- **THEN** it is instructed to look for a configured tool that reports session cost including subagent sessions and to use it only if one is available.
+- **AND** without such a tool it is instructed to report the session's own cumulative cost, state that child sessions are excluded, and never estimate or sum costs by hand.
