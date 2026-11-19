@@ -798,6 +798,16 @@ The coordinator's instructions SHALL direct it to establish the goal of a sessio
 - **THEN** it is instructed to look for a configured tool that reports session cost including subagent sessions and to use it only if one is available.
 - **AND** without such a tool it is instructed to report the session's own cumulative cost, state that child sessions are excluded, and never estimate or sum costs by hand.
 
+#### Scenario: Does not restate form answers
+
+- **WHEN** the coordinator has replied to a worker's form
+- **THEN** it is instructed not to send the worker a follow-up message that repeats the answers, since the reply already delivered them.
+
+#### Scenario: Restates listed tasks when relaying a choice
+
+- **WHEN** a worker lists tasks, steps or options and asks which to take
+- **THEN** it is instructed to restate that list, slimmed down where needed, when relaying the question to the user.
+
 ### Requirement: Native project directory discovery
 
 The coordinator SHALL discover every directory the host reports for a project, including worktree directories, as a selectable project location.
