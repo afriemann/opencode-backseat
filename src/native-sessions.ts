@@ -1,5 +1,5 @@
 import type { OpenCodeClient, SessionInfo } from "@opencode/client";
-import { isCoordinatorAgent } from "./coordinator-agent.ts";
+import type { CoordinatorCandidate } from "./coordinator-agent.ts";
 import type { DiagnosticContext } from "./native-connection.ts";
 
 export type NativeClient = OpenCodeClient;
@@ -146,9 +146,28 @@ export interface ModelChoice {
   status: string;
   variants: readonly string[];
 }
+export async function modelContextLimit(
+  client: Pick<NativeClient, "model">,
+  location: string,
+  model: { providerID: string; id: string },
+  signal?: AbortSignal,
+): Promise<number | undefined> {
+  const result = await client.model.list(
+    { location: { directory: location } },
+    signal ? { signal } : undefined,
+  );
+  if (result.location.directory !== location)
+    throw new Error("Model discovery does not match the selected location");
+  return result.data.find(
+    (entry) =>
+      entry.providerID === model.providerID && entry.modelID === model.id,
+  )?.limit.context;
+}
+export type CoordinatorMatcher = (agent: CoordinatorCandidate) => boolean;
 export class NativeDiscovery {
   constructor(
     private readonly client: NativeCatalogClient,
+    private readonly matchesCoordinator: CoordinatorMatcher,
     private readonly signal?: AbortSignal,
   ) {}
   async projects(): Promise<
@@ -183,7 +202,7 @@ export class NativeDiscovery {
     if (result.location.directory !== location)
       throw new Error("Agent discovery does not match the selected location");
     return result.data
-      .filter((agent) => !isCoordinatorAgent(agent))
+      .filter((agent) => !this.matchesCoordinator(agent))
       .map((agent) => agent.id);
   }
   async isCoordinator(location: string, agentID: string): Promise<boolean> {
@@ -192,7 +211,7 @@ export class NativeDiscovery {
       this.signal ? { signal: this.signal } : undefined,
     );
     return result.data.some(
-      (agent) => agent.id === agentID && isCoordinatorAgent(agent),
+      (agent) => agent.id === agentID && this.matchesCoordinator(agent),
     );
   }
   async models(location: string): Promise<readonly ModelChoice[]> {

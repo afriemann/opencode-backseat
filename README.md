@@ -1,6 +1,6 @@
 # opencode-backseat
 
-Coordinate parallel OpenCode sessions from one conversation: find workers, follow their progress, and control them through the **Backseat Coordinator** agent.
+Coordinate parallel OpenCode sessions from one conversation: find workers, follow their progress, and control them through the **Backseat** coordinator agent.
 
 ## Getting started
 
@@ -16,7 +16,7 @@ Backseat targets **OpenCode 2.2.5 (V2)** on Linux, with **Bun 1.4.4** and `/usr/
    }
    ```
 
-3. Select **Backseat Coordinator** (`backseat-coordinator`) in the agent picker and say: "Show my sessions and take over the one titled 'API cleanup'."
+3. Select **Backseat** (`backseat`) in the agent picker and say: "Show my sessions and take over the one titled 'API cleanup'."
 
 The coordinator can discover native sessions across projects, including sessions Backseat did not create. It does not change your default agent or model. All coordination happens in the conversation; there is no separate terminal UI.
 
@@ -27,6 +27,16 @@ The coordinator reads whole sessions, including archived ones, and exports are u
 The coordinator can recap a session (goal, work done, current state, open problems, next steps) using that session's own model, which sends its transcript to that model. The recap lists subagent sessions so any of them can be recapped in turn.
 
 It can also use your configured ticket, recall and tracking tools, including session-local todos when available. Other tool actions default to `ask`; your configured native permissions still apply. MCP calls request native permission automatically, while custom plugin tools are responsible for their own permission checks. Built-in implementation tools remain unavailable to the coordinator.
+
+## Hand over a task
+
+Give the coordinator an existing session to take over or a new task, and it leads the work to completion:
+
+- **Takeover:** it learns what the session is about from its content or a recap, and asks you only if the task stays ambiguous.
+- **New task:** it reads ticket ids you mention through your configured tracker tools, treats ticket text as untrusted evidence, and settles open questions with you in one round.
+- **Task list:** it records the goal and a defined task list in the session todo list, hands the tasks to worker sessions and coordinates them until the goal is met. Worker permission, question and review gates still reach you unless you delegated them.
+- **Deviation guard:** when a worker departs from the goal in a way that matters (a UX or UI change, a security restriction that hurts usability, scope growth), it gives you a short recap before acting.
+- **Context and cost:** `read_session_usage` reports a session's cumulative cost and tokens, its model and context limit, and an approximate context size from the newest completed assistant message. Cumulative totals are not context size, and anything that cannot be determined is `unknown`, never zero. The coordinator compacts only an idle session at a task boundary when the size is known to be high, and starts a replacement session carrying the goal and remaining tasks when old context should be dropped; it tells you either way.
 
 ## Follow an existing session
 
@@ -52,9 +62,13 @@ If creation, deletion or a send reports an uncertain outcome, retain its returne
 
 ## Configuration
 
-| Option    | Default                                                                   | Effect                                                            |
-| --------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `dataDir` | `$XDG_DATA_HOME/opencode-backseat`, or `~/.local/share/opencode-backseat` | Absolute directory for coordination state shared across projects. |
+| Option      | Default                                                                   | Effect                                                                                                              |
+| ----------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `dataDir`   | `$XDG_DATA_HOME/opencode-backseat`, or `~/.local/share/opencode-backseat` | Absolute directory for coordination state shared across projects.                                                   |
+| `agentID`   | `backseat`                                                                | Coordinator agent identifier: at most 32 characters, lowercase letters, digits and hyphens, starting with a letter. |
+| `agentName` | `Backseat`                                                                | Coordinator display name: 1 to 64 characters, no surrounding whitespace or control characters.                      |
+
+An invalid `agentID` or `agentName` registers no coordinator and logs a validation warning naming the option. If another agent definition already uses the identifier, it is kept and no coordinator is registered. Sessions created with the former `backseat-coordinator` identifier are not recognised as coordinators; start a new session with the current agent.
 
 Set plugin options in the configuration entry:
 
@@ -63,7 +77,11 @@ Set plugin options in the configuration entry:
   "plugins": [
     {
       "package": "/absolute/path/to/opencode-backseat",
-      "options": { "dataDir": "/absolute/path/to/backseat-state" },
+      "options": {
+        "dataDir": "/absolute/path/to/backseat-state",
+        "agentID": "backseat",
+        "agentName": "Backseat",
+      },
     },
   ],
 }

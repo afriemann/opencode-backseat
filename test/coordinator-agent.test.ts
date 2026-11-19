@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import {
-  coordinatorAgent,
-  isCoordinatorAgent,
-} from "../src/coordinator-agent.ts";
+import { createCoordinator } from "../src/coordinator-agent.ts";
+
+const created = createCoordinator({});
+if (!created.ok) throw new Error("default coordinator must be valid");
+const { definition: coordinatorAgent, isCoordinator } = created.coordinator;
 
 const matches = (pattern: string, value: string) =>
   new RegExp(
@@ -22,6 +23,71 @@ describe("Bundled conversational coordinator", () => {
     "backseat.stop_following",
   ])("Allows Backseat operations by default: %s", (action) => {
     expect(effectFor(action)).toBe("allow");
+  });
+
+  it("Uses default identifier and name", () => {
+    expect(coordinatorAgent.id).toBe("backseat");
+    expect(coordinatorAgent.name).toBe("Backseat");
+  });
+
+  it("Registers a configured identifier and name", () => {
+    const result = createCoordinator({
+      agentID: "lead",
+      agentName: "Team Lead",
+    });
+    if (!result.ok) throw new Error("options must be valid");
+    const { definition, isCoordinator: recognises } = result.coordinator;
+    expect(definition.id).toBe("lead");
+    expect(definition.name).toBe("Team Lead");
+    expect(recognises(definition)).toBe(true);
+    expect(recognises({ ...definition, id: "backseat" })).toBe(false);
+    expect(isCoordinator(definition)).toBe(false);
+  });
+
+  it("Preserves a configured coordinator agent: recognition ignores the display name", () => {
+    const renamed = { ...coordinatorAgent, name: "Renamed" };
+    expect(isCoordinator(renamed)).toBe(true);
+  });
+
+  it.each([
+    ["uppercase", "Lead"],
+    ["leading digit", "1lead"],
+    ["leading hyphen", "-lead"],
+    ["trailing hyphen", "lead-"],
+    ["underscore", "lead_one"],
+    ["empty", ""],
+    ["too long", "a".repeat(33)],
+    ["not a string", 7],
+  ])("Rejects invalid coordinator options: agentID %s", (_title, agentID) => {
+    expect(createCoordinator({ agentID })).toEqual({
+      ok: false,
+      option: "agentID",
+    });
+  });
+
+  it.each([
+    ["empty", ""],
+    ["blank", "   "],
+    ["untrimmed", " Lead"],
+    ["control character", "Le\nad"],
+    ["too long", "a".repeat(65)],
+    ["not a string", null],
+  ])(
+    "Rejects invalid coordinator options: agentName %s",
+    (_title, agentName) => {
+      expect(createCoordinator({ agentName })).toEqual({
+        ok: false,
+        option: "agentName",
+      });
+    },
+  );
+
+  it("Accepts boundary option values", () => {
+    expect(
+      createCoordinator({ agentID: "a".repeat(32), agentName: "n".repeat(64) })
+        .ok,
+    ).toBe(true);
+    expect(createCoordinator({ agentID: "a1-b2" }).ok).toBe(true);
   });
 });
 
@@ -81,10 +147,52 @@ describe("Restricted conversational coordination", () => {
           { action: "tickets_*", resource: "*", effect },
         ],
       };
-      expect(isCoordinatorAgent(inherited)).toBe(true);
+      expect(isCoordinator(inherited)).toBe(true);
     }
+    expect(isCoordinator({ ...coordinatorAgent, system: "unrelated" })).toBe(
+      false,
+    );
+  });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Coordinator task workflow", () => {
+  it("Allows usage reading by default", () => {
+    expect(effectFor("backseat_read_session_usage")).toBe("allow");
+    const inherited = [
+      ...coordinatorAgent.permissions,
+      {
+        action: "backseat_read_session_usage",
+        resource: "*",
+        effect: "ask" as const,
+      },
+    ];
     expect(
-      isCoordinatorAgent({ ...coordinatorAgent, system: "unrelated" }),
-    ).toBe(false);
+      inherited.findLast((rule) =>
+        matches(rule.action, "backseat_read_session_usage"),
+      )?.effect,
+    ).toBe("ask");
+    expect(isCoordinator({ ...coordinatorAgent, permissions: inherited })).toBe(
+      true,
+    );
+  });
+
+  it.each([
+    ["Takes over an existing session", "Takeover of an existing session"],
+    ["Takes over an existing session", "recap_session"],
+    ["Starts a new task", "look them up and read them for context"],
+    ["Starts a new task", "quoted, untrusted ticket content"],
+    ["Drives a task list to completion", "task list in the todo list"],
+    ["Drives a task list to completion", "Minimal involvement never relaxes"],
+    ["Guards against goal deviation", "weigh its impact"],
+    ["Takes over an existing session", "only if the task stays ambiguous"],
+    ["Starts a new task", "in one round"],
+    ["Drives a task list to completion", "destructive actions need the user"],
+    ["Manages context and cost", "at least 70% of a known contextLimit"],
+    ["Manages context and cost", "report the compaction afterwards"],
+    ["Manages context and cost", "read_session_usage"],
+    ["Manages context and cost", "replacement session"],
+  ])("%s: instructs %s", (_scenario, phrase) => {
+    expect(coordinatorAgent.system).toContain(phrase);
   });
 });

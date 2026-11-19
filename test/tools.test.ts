@@ -1,11 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import type { OpenCodeClient, SessionInfo } from "@opencode/client";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
+import { createCoordinator } from "../src/coordinator-agent.ts";
 import { NativeConnectionError } from "../src/native-connection.ts";
 import {
   createCoordinationTools,
   type CoordinationToolPort,
 } from "../src/tools.ts";
+
+const created = createCoordinator({});
+if (!created.ok) throw new Error("default coordinator must be valid");
+const defaultCoordinator = created.coordinator;
 
 function fixture() {
   const rows = ["running", "waiting", "inactive", "unknown"].map(
@@ -164,13 +169,14 @@ function fixture() {
       return location;
     },
     async authorize() {},
+    isCoordinator: defaultCoordinator.isCoordinator,
     signal: new AbortController().signal,
     now: () => clock,
   } as unknown as CoordinationToolPort;
   const registry = createCoordinationTools(port);
   const context = {
     sessionID: "coordinator",
-    agent: "backseat-coordinator",
+    agent: "backseat",
     messageID: "message",
     id: "call",
     signal: new AbortController().signal,
@@ -1060,6 +1066,24 @@ describe("Fine-grained Code Mode queries", () => {
     expect(result.models).toHaveLength(201);
   });
 
+  it("Excludes only the configured coordinator from list_agents", async () => {
+    const f = fixture();
+    const lead = createCoordinator({ agentID: "lead" });
+    if (!lead.ok) throw new Error("options must be valid");
+    f.port.isCoordinator = lead.coordinator.isCoordinator;
+    f.client.agent.list = (async () => ({
+      location: { directory: "/projects/one" },
+      data: [
+        { id: "engineer", hidden: false, mode: "all" },
+        { ...defaultCoordinator.definition },
+        { ...lead.coordinator.definition },
+      ],
+    })) as unknown as typeof f.client.agent.list;
+    expect(
+      await f.call("list_agents", { location: "/projects/one" }),
+    ).toMatchObject({ agents: ["engineer", "backseat"] });
+  });
+
   it("Creates an assignment through separate catalog and mutation calls", async () => {
     const f = fixture();
     expect(await f.call("list_projects")).toMatchObject({
@@ -1172,7 +1196,7 @@ describe("Fine-grained Code Mode queries", () => {
         ...expected,
         expect.objectContaining({
           sessionID: "coordinator",
-          agent: "backseat-coordinator",
+          agent: "backseat",
           messageID: "message",
           id: "call",
         }),
@@ -1195,4 +1219,169 @@ describe("Fine-grained Code Mode queries", () => {
       expect.objectContaining({ sessionID: "coordinator" }),
     ]);
   });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Session usage reading", () => {
+  const target = {
+    sessionID: "running",
+    location: "/projects/one",
+    agent: "engineer",
+  };
+  const tokens = (
+    input: number,
+    output: number,
+    read: number,
+    write: number,
+  ) => ({
+    input,
+    output,
+    reasoning: 50,
+    cache: { read, write },
+  });
+  const assistant = (extra: Record<string, unknown> = {}) => ({
+    id: "assistant-1",
+    type: "assistant",
+    time: { created: 1, completed: 2 },
+    tokens: tokens(1000, 200, 5000, 300),
+    ...extra,
+  });
+  function usageFixture(
+    messages: unknown[],
+    session: Record<string, unknown> = {},
+    limits: [string, string, number][] = [["anthropic", "sonnet", 200_000]],
+  ) {
+    const f = fixture();
+    const queries: unknown[] = [];
+    Object.assign(f.rows[0]!, {
+      cost: 1.25,
+      tokens: tokens(90_000, 40_000, 900_000, 20_000),
+      model: { providerID: "anthropic", id: "sonnet" },
+      ...session,
+    });
+    Object.assign(f.client, {
+      message: {
+        list: async (input: unknown) => {
+          queries.push(input);
+          return { data: messages, cursor: {} };
+        },
+      },
+    });
+    f.client.model.list = (async () => ({
+      location: { directory: "/projects/one" },
+      data: limits.map(([providerID, modelID, context]) => ({
+        id: `${providerID}/${modelID}`,
+        modelID,
+        providerID,
+        limit: { context, output: 1 },
+      })),
+    })) as unknown as typeof f.client.model.list;
+    return { f, queries };
+  }
+
+  it("Reports usage for a session", async () => {
+    const { f, queries } = usageFixture(
+      [{ id: "user-2", type: "user" }, assistant()],
+      {},
+      [
+        ["other", "sonnet", 1_000],
+        ["anthropic", "sonnet", 200_000],
+      ],
+    );
+    const result = await f.call("read_session_usage", target);
+    expect(result).toMatchObject({
+      available: true,
+      data: {
+        sessionID: "running",
+        location: "/projects/one",
+        cumulative: {
+          cost: 1.25,
+          tokens: {
+            input: 90_000,
+            output: 40_000,
+            reasoning: 50,
+            cache: { read: 900_000, write: 20_000 },
+          },
+        },
+        model: { providerID: "anthropic", id: "sonnet" },
+        contextLimit: 200_000,
+        contextEstimate: { tokens: 6500, basis: expect.any(String) },
+      },
+    });
+    expect(queries).toEqual([
+      expect.objectContaining({ sessionID: "running", order: "desc" }),
+    ]);
+    expect(Object.keys((result as { data: object }).data)).toEqual([
+      "sessionID",
+      "location",
+      "cumulative",
+      "model",
+      "contextLimit",
+      "contextEstimate",
+    ]);
+    f.registry.dispose();
+  });
+
+  it.each([
+    ["no recorded model", { model: undefined }, "model"],
+    ["no catalogue entry", { model: { providerID: "gone", id: "x" } }, "limit"],
+  ])(
+    "Reports undeterminable values as unknown: %s",
+    async (_, session, key) => {
+      const { f } = usageFixture([assistant()], session);
+      const { data } = (await f.call("read_session_usage", target)) as {
+        data: Record<string, unknown>;
+      };
+      expect(data.contextLimit).toBe("unknown");
+      if (key === "model") expect(data.model).toBe("unknown");
+      f.registry.dispose();
+    },
+  );
+
+  it.each([
+    ["incomplete", [assistant({ time: { created: 1 } })], {}],
+    ["without tokens", [assistant({ tokens: undefined })], {}],
+    [
+      "compaction newer",
+      [{ id: "compaction-1", type: "compaction" }, assistant()],
+      {},
+    ],
+    ["revert pending", [assistant()], { revert: { messageID: "m" } }],
+    ["no assistant message", [{ id: "user-1", type: "user" }], {}],
+  ])(
+    "Reports unknown context size when the newest usage is stale: %s",
+    async (_, messages, session) => {
+      const { f } = usageFixture(messages, session);
+      expect(await f.call("read_session_usage", target)).toMatchObject({
+        data: {
+          cumulative: { cost: 1.25 },
+          contextEstimate: { tokens: "unknown" },
+        },
+      });
+      f.registry.dispose();
+    },
+  );
+
+  it("Rejects an unavailable session", async () => {
+    const { f } = usageFixture([assistant()]);
+    await expect(
+      f.call("read_session_usage", { ...target, sessionID: "unknown" }),
+    ).rejects.toThrow();
+    f.registry.dispose();
+  });
+
+  it.each(["message", "model"] as const)(
+    "Rejects an unavailable session: %s read fails",
+    async (failing) => {
+      const { f } = usageFixture([assistant()]);
+      const unavailable = async () => {
+        throw new Error("Unavailable");
+      };
+      if (failing === "message")
+        Object.assign(f.client, { message: { list: unavailable } });
+      else f.client.model.list = unavailable as never;
+      await expect(f.call("read_session_usage", target)).rejects.toThrow();
+      f.registry.dispose();
+    },
+  );
 });

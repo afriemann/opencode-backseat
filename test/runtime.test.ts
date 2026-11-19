@@ -5,7 +5,11 @@ import type { Plugin } from "@opencode/plugin";
 import type { OpenCodeClient, OpenCodeEvent } from "@opencode/client";
 import * as connections from "../src/native-connection.ts";
 import { promisePlugin } from "../src/server.ts";
-import { coordinatorAgent } from "../src/coordinator-agent.ts";
+import { createCoordinator } from "../src/coordinator-agent.ts";
+const defaultCoordinator = createCoordinator({});
+if (!defaultCoordinator.ok)
+  throw new Error("default coordinator must be valid");
+const coordinatorAgent = defaultCoordinator.coordinator.definition;
 
 // spec: openspec/specs/worker-coordination/spec.md
 describe("Restricted conversational coordination", () => {
@@ -467,5 +471,142 @@ describe("Shared durable coordination store", () => {
       if (typeof close === "function") await close();
       await rm(home, { recursive: true, force: true });
     }
+  });
+});
+
+// spec: openspec/specs/worker-coordination/spec.md
+describe("Bundled conversational coordinator", () => {
+  async function withPlugin(
+    options: Record<string, unknown>,
+    existing: unknown,
+    check: (seen: {
+      registered: Array<{ id: string; value: Record<string, unknown> }>;
+      events: Array<{ event: string; fields?: Record<string, unknown> }>;
+    }) => void,
+  ) {
+    const root = resolve(".opencode/backseat");
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const home = await mkdtemp(`${root}/coordinator-`);
+    const registered: Array<{ id: string; value: Record<string, unknown> }> =
+      [];
+    const events: Array<{ event: string; fields?: Record<string, unknown> }> =
+      [];
+    const registration = { dispose: async () => {} };
+    const factory = connections.createNativeConnection;
+    const stub = spyOn(
+      connections,
+      "createNativeConnection",
+    ).mockImplementation((native) =>
+      factory({ ...native, registration: async () => undefined }),
+    );
+    const context = {
+      app: { version: "2.2.5" },
+      options: { dataDir: `${home}/data`, ...options },
+      location: { directory: home },
+      session: { hook: async () => registration },
+      event: {
+        async *subscribe({ signal }: { signal: AbortSignal }) {
+          await new Promise<void>((done) =>
+            signal.aborted
+              ? done()
+              : signal.addEventListener("abort", () => done(), { once: true }),
+          );
+        },
+      },
+      permission: { assert: async () => {} },
+      rpc: { register: async () => registration },
+      agent: {
+        transform: async (change: (editor: unknown) => void) => {
+          change({
+            get: () => existing,
+            update: (id: string, update: (value: unknown) => void) => {
+              const value: Record<string, unknown> = {};
+              update(value);
+              registered.push({ id, value });
+            },
+          });
+          return registration;
+        },
+      },
+      tool: {
+        hook: async () => registration,
+        transform: async () => registration,
+      },
+    } as unknown as Plugin.Context;
+    let close: unknown;
+    try {
+      close = await promisePlugin((_level, event, fields) => {
+        events.push({ event, ...(fields ? { fields } : {}) });
+      }).setup(context);
+      check({ registered, events });
+    } finally {
+      stub.mockRestore();
+      if (typeof close === "function") await close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+  const degraded = (
+    events: Array<{ event: string; fields?: Record<string, unknown> }>,
+  ) =>
+    events
+      .filter((entry) => entry.event === "setup.degraded")
+      .map((entry) => ({
+        classification: entry.fields?.classification,
+        option: entry.fields?.option,
+      }));
+
+  it("Registers a configured identifier and name", async () => {
+    await withPlugin(
+      { agentID: "lead", agentName: "Team Lead" },
+      undefined,
+      ({ registered, events }) => {
+        expect(registered).toHaveLength(1);
+        expect(registered[0]?.id).toBe("lead");
+        expect(registered[0]?.value).toMatchObject({
+          id: "lead",
+          name: "Team Lead",
+          mode: "primary",
+        });
+        expect(degraded(events)).toEqual([]);
+      },
+    );
+  });
+
+  it.each([
+    ["agentID", { agentID: "Not Valid" }],
+    ["agentID", { agentID: 7 }],
+    ["agentName", { agentName: "" }],
+    ["agentName", { agentName: "multi\nline" }],
+  ])("Rejects invalid coordinator options: %s", async (option, options) => {
+    await withPlugin(options, undefined, ({ registered, events }) => {
+      expect(registered).toEqual([]);
+      expect(degraded(events)).toEqual([
+        { classification: "validation", option },
+      ]);
+    });
+  });
+
+  it("Preserves an equivalent coordinator definition without a diagnostic", async () => {
+    await withPlugin(
+      {},
+      structuredClone(coordinatorAgent),
+      ({ registered, events }) => {
+        expect(registered).toEqual([]);
+        expect(degraded(events)).toEqual([]);
+      },
+    );
+  });
+
+  it("Preserves a configured coordinator agent", async () => {
+    await withPlugin(
+      {},
+      { id: "backseat", name: "User agent" },
+      ({ registered, events }) => {
+        expect(registered).toEqual([]);
+        expect(degraded(events)).toEqual([
+          { classification: "validation", option: "agentID" },
+        ]);
+      },
+    );
   });
 });

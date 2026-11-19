@@ -1,4 +1,8 @@
-import type { OpenCodeClient, MessageListInput } from "@opencode/client";
+import type {
+  OpenCodeClient,
+  MessageListInput,
+  SessionInfo,
+} from "@opencode/client";
 import { randomUUID } from "node:crypto";
 import {
   emptyPending,
@@ -8,7 +12,7 @@ import {
   text,
   type FollowPending,
 } from "./state.ts";
-import { readNativeAsks } from "./native-sessions.ts";
+import { modelContextLimit, readNativeAsks } from "./native-sessions.ts";
 
 export async function observeFollowedSession(
   client: OpenCodeClient,
@@ -209,6 +213,21 @@ export const CONTENT_READERS = {
       toolsLevel: { enum: ["none", "summary", "detail"] },
     },
   ),
+  read_session_usage: {
+    kind: "usage",
+    description:
+      "Read cost, token usage and an approximate context size for one native session. Select exact sessionID and canonical location from list_sessions; agent optionally confirms the current agent. cumulative is the session's total cost and tokens across every turn and never measures how full the context is; contextEstimate is the approximate size of the next prompt, derived from the newest completed assistant message, and contextLimit is the model's context window. Any value that cannot be determined is the string unknown, never zero. Child sessions are not included.",
+    input: {
+      type: "object",
+      properties: {
+        sessionID: stringSchema,
+        location: stringSchema,
+        agent: stringSchema,
+      },
+      required: ["sessionID", "location"],
+      additionalProperties: false,
+    },
+  },
   export_session: reader(
     "export",
     "Export native session transfer data in bounded chunks. Content is returned unredacted by default; set sanitize true to request redaction.",
@@ -243,6 +262,7 @@ export type ContentKind =
   | "form"
   | "instructions"
   | "stats"
+  | "usage"
   | "export";
 export interface ContentQuery {
   sessionID: string;
@@ -418,6 +438,56 @@ function nativeID(value: unknown): string {
   const id = text(value);
   if (id.length > 200) throw new Error("Native identity exceeds its bound");
   return id;
+}
+const UNKNOWN = "unknown" as const;
+const USAGE_MESSAGE_WINDOW = 20;
+async function contextEstimate(
+  client: OpenCodeClient,
+  session: SessionInfo,
+  signal: AbortSignal,
+): Promise<{ tokens: number | typeof UNKNOWN; basis: string }> {
+  const unknown = (basis: string) => ({ tokens: UNKNOWN, basis });
+  if (session.revert) return unknown("a revert is pending on the session");
+  const page = await client.message.list(
+    { sessionID: session.id, order: "desc", limit: USAGE_MESSAGE_WINDOW },
+    { signal },
+  );
+  const newest = page.data.find(
+    (message) => message.type === "assistant" || message.type === "compaction",
+  );
+  if (!newest) return unknown("no assistant message in the newest messages");
+  if (newest.type === "compaction")
+    return unknown("a compaction is newer than the newest assistant message");
+  if (newest.time.completed === undefined || !newest.tokens)
+    return unknown(
+      "the newest assistant message is incomplete or has no token counts",
+    );
+  const { input, output, cache } = newest.tokens;
+  return {
+    tokens: input + cache.read + cache.write + output,
+    basis:
+      "approximate: input, cache read, cache write and output tokens of the newest completed assistant message",
+  };
+}
+async function readUsage(
+  client: OpenCodeClient,
+  session: SessionInfo,
+  location: string,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const limit = session.model
+    ? await modelContextLimit(client, location, session.model, signal)
+    : undefined;
+  return {
+    sessionID: session.id,
+    location,
+    cumulative: { cost: session.cost, tokens: session.tokens },
+    model: session.model
+      ? { providerID: session.model.providerID, id: session.model.id }
+      : UNKNOWN,
+    contextLimit: limit ?? UNKNOWN,
+    contextEstimate: await contextEstimate(client, session, signal),
+  };
 }
 export function createNativeContent(
   now: () => number = Date.now,
@@ -667,6 +737,9 @@ export function createNativeContent(
               },
               options,
             );
+            break;
+          case "usage":
+            data = await readUsage(client, session, location, signal);
             break;
           case "export":
             data = await client.experimental.session.export(

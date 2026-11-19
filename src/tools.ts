@@ -21,6 +21,7 @@ import {
 } from "./native-operations.ts";
 import {
   NativeDiscovery,
+  type CoordinatorMatcher,
   readNativeInventory,
   refreshNativeSessions,
   type NativeInventory,
@@ -73,6 +74,7 @@ export const isCoordinatorToolPermitted = (id: string): boolean =>
   !id.startsWith("use_");
 export interface CoordinationToolPort {
   diagnostics?: DiagnosticEmitter;
+  isCoordinator: CoordinatorMatcher;
   native: NativeConnection;
   backend: Pick<
     SessionController,
@@ -505,7 +507,12 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         return {
           projects: await native(
             context,
-            (client, signal) => new NativeDiscovery(client, signal).projects(),
+            (client, signal) =>
+              new NativeDiscovery(
+                client,
+                port.isCoordinator,
+                signal,
+              ).projects(),
             diagnostics,
           ),
         };
@@ -523,7 +530,9 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           agents: await native(
             context,
             (client, signal) =>
-              new NativeDiscovery(client, signal).agents(location),
+              new NativeDiscovery(client, port.isCoordinator, signal).agents(
+                location,
+              ),
             diagnostics,
           ),
         };
@@ -541,7 +550,9 @@ export function createCoordinationTools(port: CoordinationToolPort): {
           models: await native(
             context,
             (client, signal) =>
-              new NativeDiscovery(client, signal).models(location),
+              new NativeDiscovery(client, port.isCoordinator, signal).models(
+                location,
+              ),
             diagnostics,
           ),
         };
