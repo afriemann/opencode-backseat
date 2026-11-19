@@ -156,14 +156,25 @@ function fixture() {
         calls.push(`permission:${JSON.stringify(input)}`);
       },
       request: {
-        async list() {
-          return { location: { directory: "/project" }, data: [] };
+        async list(input?: { location: { directory: string } }) {
+          return {
+            location: { directory: input?.location.directory ?? "/project" },
+            data: [],
+          };
         },
       },
     },
     project: {
       async list() {
         return [{ id: "project", canonical: "/project", sandboxes: [] }];
+      },
+    },
+    worktree: {
+      async list() {
+        return [
+          { directory: "/project" },
+          { directory: "/project/.worktrees/feature", strategy: "git" },
+        ];
       },
     },
     agent: {
@@ -471,6 +482,18 @@ describe("Explicit adoption", () => {
         message: "Selected worker location or agent unavailable",
       });
     expect(f.calls).not.toContain("create");
+    await controller.dispose();
+  });
+  it("Creates a worker in a project's additional directory", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    expect(
+      await controller.createSession(
+        { location: "/project/.worktrees/feature", agent: "engineer" },
+        context,
+      ),
+    ).toMatchObject({ status: "admitted", following: true });
+    expect(f.calls).toContain("create");
     await controller.dispose();
   });
   it("Requires a visible description on inserted synthetic text", async () => {

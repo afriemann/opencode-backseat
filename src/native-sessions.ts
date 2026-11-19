@@ -20,6 +20,7 @@ export const NATIVE_BOUNDS = Object.freeze({
 });
 export interface NativeCatalogClient {
   project: Pick<NativeClient["project"], "list">;
+  worktree: Pick<NativeClient["worktree"], "list">;
   agent: Pick<NativeClient["agent"], "list">;
   model: Pick<NativeClient["model"], "list">;
   session: Pick<NativeClient["session"], "list">;
@@ -179,16 +180,34 @@ export class NativeDiscovery {
     );
     const pathName = (path: string) =>
       path.split("/").filter(Boolean).at(-1) ?? path;
-    const choices = projects.flatMap((p) =>
-      [...new Set([p.canonical, ...p.sandboxes])].map((location) => ({
-        id: JSON.stringify([p.id, location]),
-        projectID: p.id,
-        title:
-          location === p.canonical
-            ? (p.name ?? pathName(location))
-            : `${p.name ?? pathName(p.canonical)} / ${pathName(location)}`,
-        location,
-      })),
+    const directories: (readonly string[])[] = [];
+    for (let i = 0; i < projects.length; i += NATIVE_BOUNDS.concurrentReads)
+      directories.push(
+        ...(await Promise.all(
+          projects
+            .slice(i, i + NATIVE_BOUNDS.concurrentReads)
+            .map(async (p) =>
+              (
+                await this.client.worktree.list(
+                  { projectID: p.id },
+                  this.signal ? { signal: this.signal } : undefined,
+                )
+              ).map((w) => w.directory),
+            ),
+        )),
+      );
+    const choices = projects.flatMap((p, index) =>
+      [...new Set([p.canonical, ...p.sandboxes, ...directories[index]!])].map(
+        (location) => ({
+          id: JSON.stringify([p.id, location]),
+          projectID: p.id,
+          title:
+            location === p.canonical
+              ? (p.name ?? pathName(location))
+              : `${p.name ?? pathName(p.canonical)} / ${pathName(location)}`,
+          location,
+        }),
+      ),
     );
     if (choices.some((c) => !c.location.startsWith("/")))
       throw new Error("Project discovery is incomplete or unsupported");
