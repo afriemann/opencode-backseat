@@ -684,6 +684,11 @@ The coordinator SHALL report a native operation failure with its specific cause 
 - **WHEN** a native operation fails with an unexpected error
 - **THEN** the failure names the error class and excludes the error message, URLs and registration contents.
 
+#### Scenario: Reports a typed host rejection as a rejection
+
+- **WHEN** the verified native service rejects a requested operation with a typed error, such as a permission request that no longer exists
+- **THEN** the failure states that the native service rejected the request, names the error class, and does not describe the connection as unavailable or unsupported.
+
 ### Requirement: Session usage reading
 
 The coordinator SHALL read one native session's cost, token usage and context size through a dedicated read-only tool without fetching unrelated sessions.
