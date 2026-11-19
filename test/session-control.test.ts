@@ -23,7 +23,8 @@ const context = {
 function fixture() {
   let state: unknown;
   const calls: string[] = [],
-    notices: unknown[] = [];
+    notices: unknown[] = [],
+    timeouts: (number | undefined)[] = [];
   let uncertain = false;
   const missing = new Set<string>();
   const children = new Map<string, SessionInfo[]>();
@@ -184,7 +185,8 @@ function fixture() {
   let denied = false;
   const host: SessionControllerHost = {
     native: {
-      async read(work) {
+      async read(work, _diagnostics, timeoutMs) {
+        timeouts.push(timeoutMs);
         return work(client, new AbortController().signal);
       },
       identity() {
@@ -218,6 +220,7 @@ function fixture() {
     host,
     calls,
     notices,
+    timeouts,
     client,
     sessions,
     missing,
@@ -1243,6 +1246,48 @@ describe("Session recap", () => {
     expect(prompts).toHaveLength(1);
     expect(JSON.stringify(prompts[0])).toContain("failing tests");
     expect(f.calls).toContain("backseat.recap_session");
+    await controller.dispose();
+  });
+  it.each([
+    ["recap_session", {}],
+    ["generate_session", { prompt: "summarise" }],
+  ] as const)(
+    "Gives %s the 120 second operation deadline",
+    async (operation, payload) => {
+      const f = fixture(),
+        controller = await SessionController.load(f.host);
+      const session = f.client.session as unknown as Record<string, unknown>;
+      session.active = async () => ({});
+      session.list = async () => ({ data: [], cursor: {} });
+      session.generate = async () => "generated";
+      await controller.sessionOperation(
+        {
+          operation,
+          sessionID: "worker",
+          location: "/project",
+          agent: "engineer",
+          payload,
+        },
+        context,
+      );
+      expect(f.timeouts).toContain(120_000);
+      await controller.dispose();
+    },
+  );
+  it("Keeps the default read deadline for other operations", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    await controller.sessionOperation(
+      {
+        operation: "update_session",
+        sessionID: "worker",
+        location: "/project",
+        agent: "engineer",
+        payload: { title: "renamed" },
+      },
+      context,
+    );
+    expect(f.timeouts).not.toContain(120_000);
     await controller.dispose();
   });
   it("Recaps a subagent on demand", async () => {

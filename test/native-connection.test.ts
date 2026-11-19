@@ -23,6 +23,7 @@ describe("Automatic same-service native connection", () => {
       password: "fixture-password", // pragma: allowlist secret - dummy native registration
     };
     let response: ((request: Request) => Promise<Response>) | undefined;
+    let onRegistrationRead: (() => void) | undefined;
     const transport: typeof fetch = Object.assign(
       async (input: string | URL | Request, init?: RequestInit) => {
         const request = new Request(input, init);
@@ -52,7 +53,10 @@ describe("Automatic same-service native connection", () => {
     const connection = createNativeConnection({
       location: "/projects/coordinator",
       version: "2.2.5",
-      registration: async () => registration,
+      registration: async () => {
+        onRegistrationRead?.();
+        return registration;
+      },
       fetch: transport,
       ...(diagnostics ? { diagnostics } : {}),
     });
@@ -61,6 +65,9 @@ describe("Automatic same-service native connection", () => {
       calls,
       setRegistration(value: unknown) {
         registration = value;
+      },
+      onRegistrationRead(value: () => void) {
+        onRegistrationRead = value;
       },
       setResponse(value: typeof response) {
         response = value;
@@ -234,6 +241,89 @@ describe("Automatic same-service native connection", () => {
       timeout.mockRestore();
       f.connection.dispose();
     }
+  });
+
+  describe("operation deadline", () => {
+    function deadlines() {
+      const controllers = new Map<number, AbortController>();
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation(
+        (ms: number) => {
+          const controller = new AbortController();
+          controllers.set(ms, controller);
+          return controller.signal;
+        },
+      );
+      return { controllers, spy };
+    }
+
+    it("Recaps a session whose generation outlasts the default read deadline", async () => {
+      const f = fixture();
+      const { controllers, spy } = deadlines();
+      try {
+        const result = await f.connection.read(
+          async (_client, signal) => {
+            controllers.get(10_000)!.abort();
+            await Promise.resolve();
+            expect(signal.aborted).toBe(false);
+            return "recap";
+          },
+          undefined,
+          120_000,
+        );
+        expect(result).toBe("recap");
+      } finally {
+        spy.mockRestore();
+        f.connection.dispose();
+      }
+    });
+
+    it("Reports a timeout when the handshake exceeds the default read deadline", async () => {
+      const f = fixture();
+      const { controllers, spy } = deadlines();
+      let reads = 0;
+      f.onRegistrationRead(() => {
+        if (++reads === 2) controllers.get(10_000)!.abort();
+      });
+      let started = false;
+      try {
+        const error = await f.connection
+          .read(
+            async () => {
+              started = true;
+              throw new Error("operation started");
+            },
+            undefined,
+            120_000,
+          )
+          .catch((caught: unknown) => caught as Error);
+        expect(error.message).toBe("Native service read timed out");
+        expect(started).toBe(false);
+      } finally {
+        spy.mockRestore();
+        f.connection.dispose();
+      }
+    });
+
+    it("Reports a timeout when generation exceeds the recap deadline", async () => {
+      const f = fixture();
+      const { controllers, spy } = deadlines();
+      try {
+        const error = await f.connection
+          .read(
+            async () => {
+              controllers.get(120_000)!.abort();
+              throw new Error("PRIVATE_NATIVE_SENTINEL http://127.0.0.1");
+            },
+            undefined,
+            120_000,
+          )
+          .catch((caught: unknown) => caught as Error);
+        expect(error.message).toBe("Native service read timed out");
+      } finally {
+        spy.mockRestore();
+        f.connection.dispose();
+      }
+    });
   });
 
   it("Logging failure preserves coordination outcomes", async () => {

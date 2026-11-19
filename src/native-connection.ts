@@ -490,6 +490,7 @@ export interface NativeConnection {
   read<T>(
     operation: (client: OpenCodeClient, signal: AbortSignal) => Promise<T>,
     diagnostics?: DiagnosticContext,
+    operationTimeoutMs?: number,
   ): Promise<T>;
   identity(input: { nonce: string; origin: string }): { mac: string };
   dispose(): void;
@@ -531,7 +532,7 @@ export function createNativeConnection(options: {
     };
   };
   return {
-    async read(operation, context) {
+    async read(operation, context, operationTimeoutMs) {
       const diagnostics =
         context ?? diagnosticContext(options.diagnostics, "native");
       let phase: (typeof DIAGNOSTIC_PHASES)[number] = "registration";
@@ -552,7 +553,7 @@ export function createNativeConnection(options: {
         const registered = registration(await source(), options.version);
         deadline = AbortSignal.timeout(REQUEST_TIMEOUT);
         deadline.addEventListener("abort", onDeadline, { once: true });
-        const signal = AbortSignal.any([lifetime.signal, deadline]);
+        let signal = AbortSignal.any([lifetime.signal, deadline]);
         phase = "client";
         const guarded: typeof fetch = Object.assign(
           async (input: string | URL | Request, init?: RequestInit) => {
@@ -646,6 +647,13 @@ export function createNativeConnection(options: {
         )
           throw unavailable("registration changed");
         phase = "operation";
+        if (operationTimeoutMs !== undefined) {
+          signal.throwIfAborted();
+          deadline.removeEventListener("abort", onDeadline);
+          deadline = AbortSignal.timeout(operationTimeoutMs);
+          deadline.addEventListener("abort", onDeadline, { once: true });
+          signal = AbortSignal.any([lifetime.signal, deadline]);
+        }
         const result = await operation(client, signal);
         signal.throwIfAborted();
         phase = "revalidation";

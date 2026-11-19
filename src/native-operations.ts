@@ -562,9 +562,14 @@ export interface SessionOperation {
 type Work = (client: OpenCodeClient, signal: AbortSignal) => Promise<unknown>;
 const RECAP_PROMPT =
   "Recap this session for a coordinator who has not read it: the goal, what was done, the current state, open problems or failures, pending decisions, and next steps. Be concise and factual; mention subagent work only briefly.";
-const simple = (execute: Work): PreparedOperation => ({
+const LLM_OPERATION_TIMEOUT_MS = 120_000;
+const simple = (
+  execute: Work,
+  executeTimeoutMs?: number,
+): PreparedOperation => ({
   subject: async () => null,
   execute,
+  ...(executeTimeoutMs === undefined ? {} : { executeTimeoutMs }),
 });
 function optionalBoolean(value: unknown): boolean | undefined {
   if (value === undefined || typeof value === "boolean") return value;
@@ -588,6 +593,7 @@ function json(value: unknown, depth = 0): JsonValue {
 export interface PreparedOperation {
   subject: Work;
   execute: Work;
+  executeTimeoutMs?: number;
 }
 
 function nativePermissions(
@@ -895,8 +901,10 @@ export function prepareNativeOperation(
       );
     case "generate_session": {
       const prompt = bulkText(value.prompt);
-      return simple((client, signal) =>
-        client.session.generate({ sessionID, prompt }, { signal }),
+      return simple(
+        (client, signal) =>
+          client.session.generate({ sessionID, prompt }, { signal }),
+        LLM_OPERATION_TIMEOUT_MS,
       );
     }
     case "recap_session": {
@@ -941,7 +949,7 @@ export function prepareNativeOperation(
           if (cursor) cursors.add(cursor);
         } while (cursor);
         return { sessionID, recap, children, childrenComplete: complete };
-      });
+      }, LLM_OPERATION_TIMEOUT_MS);
     }
     case "stage_session_revert": {
       const messageID = text(value.messageID),
