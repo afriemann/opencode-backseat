@@ -8,11 +8,15 @@ import {
   SessionController,
   type SessionControllerHost,
 } from "../src/server.ts";
-import { coordinatorAgent } from "../src/coordinator-agent.ts";
+import { createCoordinator } from "../src/coordinator-agent.ts";
+const created = createCoordinator({});
+if (!created.ok) throw new Error("default coordinator must be valid");
+const defaultCoordinator = created.coordinator;
+const coordinatorAgent = defaultCoordinator.definition;
 
 const context = {
   sessionID: "coordinator",
-  agent: "backseat-coordinator",
+  agent: "backseat",
   messageID: "msg_call",
   id: "call",
 };
@@ -30,7 +34,7 @@ function fixture() {
       id,
       {
         id,
-        agent: id === "coordinator" ? "backseat-coordinator" : "engineer",
+        agent: id === "coordinator" ? "backseat" : "engineer",
         projectID: "project",
         location: { directory: "/project" },
         time: { created: 1, updated: 1 },
@@ -78,7 +82,7 @@ function fixture() {
           return {
             id: messageID,
             type: "assistant",
-            agent: "backseat-coordinator",
+            agent: "backseat",
             time: { created: Number(messageID.replace("msg_", "")) || 1 },
           };
         },
@@ -208,6 +212,7 @@ function fixture() {
         });
       return location;
     },
+    isCoordinator: defaultCoordinator.isCoordinator,
   };
   return {
     host,
@@ -411,7 +416,7 @@ describe("Explicit adoption", () => {
       controller = await SessionController.load(f.host);
     await expect(
       controller.createSession(
-        { location: "/project", agent: "backseat-coordinator" },
+        { location: "/project", agent: "backseat" },
         context,
       ),
     ).rejects.toThrow();
@@ -484,7 +489,7 @@ describe("Explicit native request replies", () => {
           operation: "interrupt_session",
           sessionID: "coordinator",
           location: "/project",
-          agent: "backseat-coordinator",
+          agent: "backseat",
           payload: {},
         },
         context,
@@ -1119,6 +1124,40 @@ describe("Full native session controls", () => {
     await switchTo("helper");
     expect(f.calls).toContain("switch");
     await expect(switchTo(coordinatorAgent.id)).rejects.toThrow("coordinator");
+    await controller.dispose();
+  });
+  it("Rejects worker assignments to the configured coordinator only", async () => {
+    const f = fixture();
+    const lead = createCoordinator({ agentID: "lead" });
+    if (!lead.ok) throw new Error("options must be valid");
+    f.host.isCoordinator = lead.coordinator.isCoordinator;
+    const controller = await SessionController.load(f.host);
+    (f.client.agent as unknown as { list: unknown }).list = async () => ({
+      location: { directory: "/project" },
+      data: [
+        { id: "engineer", hidden: false, mode: "all" },
+        lead.coordinator.definition,
+        coordinatorAgent,
+      ],
+    });
+    (f.client.session as unknown as { switchAgent: unknown }).switchAgent =
+      async () => {
+        f.calls.push("switch");
+      };
+    const switchTo = (newAgent: string) =>
+      controller.sessionOperation(
+        {
+          operation: "switch_session_agent",
+          sessionID: "worker",
+          location: "/project",
+          agent: "engineer",
+          payload: { newAgent },
+        },
+        context,
+      );
+    await expect(switchTo("lead")).rejects.toThrow("coordinator");
+    await switchTo("backseat");
+    expect(f.calls).toContain("switch");
     await controller.dispose();
   });
   it("Accepts long sends and payloads", async () => {

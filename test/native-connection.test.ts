@@ -342,6 +342,36 @@ describe("Automatic same-service native connection", () => {
     }
   });
 
+  it("Projects only allowlisted configuration-option labels", () => {
+    const logged: Record<string, unknown>[] = [];
+    const diagnostics = Effect.runSync(
+      hostDiagnostics.pipe(
+        Effect.provideService(
+          Logger.CurrentLoggers,
+          new Set([
+            Logger.make(({ message }) => {
+              logged.push(
+                (Array.isArray(message) ? message : [message]).find(
+                  (part) => typeof part === "object" && part !== null,
+                ) as Record<string, unknown>,
+              );
+            }),
+          ]),
+        ),
+      ),
+    );
+    for (const option of ["agentID", "agentName", "PRIVATE_OPTION_SENTINEL"])
+      diagnostics("warn", "setup.degraded", {
+        classification: "validation",
+        option,
+      });
+    expect(logged.map((record) => record.option)).toEqual([
+      "agentID",
+      "agentName",
+      undefined,
+    ]);
+  });
+
   it("Excludes sensitive diagnostic data", async () => {
     const records: Record<string, unknown>[] = [];
     const hostile = fixture((_level, event, fields) => {

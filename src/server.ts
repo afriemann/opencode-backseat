@@ -10,6 +10,7 @@ import { setTimeout as pause } from "node:timers/promises";
 import { observeFollowedSession } from "./native-content.ts";
 import {
   NativeDiscovery,
+  type CoordinatorMatcher,
   readNativeSessionDelivery,
 } from "./native-sessions.ts";
 import {
@@ -50,7 +51,7 @@ import {
   type NativeConnection,
   type NativeFailureClass,
 } from "./native-connection.ts";
-import { coordinatorAgent, isCoordinatorAgent } from "./coordinator-agent.ts";
+import { createCoordinator, type Coordinator } from "./coordinator-agent.ts";
 import {
   CoordinatorOwnership,
   acquireCoordinatorCore,
@@ -104,6 +105,7 @@ export interface SessionControllerHost {
     }): Promise<unknown>;
   };
   canonical(location: string): Promise<string>;
+  isCoordinator: CoordinatorMatcher;
 }
 function admissionDiagnostic(message: string, error: unknown): void {
   process.stderr.write(
@@ -574,7 +576,11 @@ export class SessionController {
     const agent = input.agent;
     if (agent === undefined) throw new Error("Worker agent required");
     await this.host.native.read(async (client, signal) => {
-      const discovery = new NativeDiscovery(client, signal);
+      const discovery = new NativeDiscovery(
+        client,
+        this.host.isCoordinator,
+        signal,
+      );
       const [projects, agents] = await Promise.all([
         discovery.projects(),
         discovery.agents(input.location),
@@ -704,7 +710,11 @@ export class SessionController {
     if (input.operation === "switch_session_agent") {
       const newAgent = text(object(input.payload).newAgent);
       const coordinator = await this.host.native.read((client, signal) =>
-        new NativeDiscovery(client, signal).isCoordinator(location, newAgent),
+        new NativeDiscovery(
+          client,
+          this.host.isCoordinator,
+          signal,
+        ).isCoordinator(location, newAgent),
       );
       if (coordinator)
         throw new Error("A coordinator agent cannot be a worker agent");
@@ -1285,6 +1295,7 @@ export const hostDiagnostics = Effect.gen(function* () {
       for (const [key, values] of [
         ["phase", DIAGNOSTIC_PHASES],
         ["classification", DIAGNOSTIC_FAILURES],
+        ["option", ["agentID", "agentName"]],
         [
           "operation",
           [
@@ -1365,6 +1376,7 @@ type ProjectAdapter = {
   location: string;
   abort: AbortController;
   native: NativeConnection;
+  coordinator?: Coordinator;
   degraded?: (blocker: string) => void;
 };
 type SessionBackend = Pick<
@@ -1509,6 +1521,8 @@ async function createNativeCore(
     const controller = await SessionController.load({
       storage,
       canonical,
+      isCoordinator: (agent) =>
+        active().coordinator?.isCoordinator(agent) ?? false,
       native: {
         read: (work, options) => active().native.read(work, options),
         identity: (input) => active().native.identity(input),
@@ -1568,6 +1582,13 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         log("warn", "setup.degraded", { classification: "validation" });
         return;
       }
+      const created = createCoordinator(ctx.options);
+      if (!created.ok)
+        log("warn", "setup.degraded", {
+          classification: "validation",
+          option: created.option,
+        });
+      const coordinator = created.ok ? created.coordinator : undefined;
       let dataDir: string | undefined;
       const location = await canonical(ctx.location.directory),
         native = createNativeConnection({
@@ -1580,6 +1601,7 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         location,
         abort: new AbortController(),
         native,
+        ...(coordinator ? { coordinator } : {}),
       };
       adapter.degraded = (blocker) =>
         log("warn", "setup.degraded", {
@@ -1731,11 +1753,24 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
               unsubscribe();
             });
         }
+        let conflictReported = false;
         const agents = await ctx.agent.transform((editor) => {
-          if (editor.get(coordinatorAgent.id)) return;
-          editor.update(coordinatorAgent.id, (agent) => {
-            Object.assign(agent, coordinatorAgent, {
-              permissions: coordinatorAgent.permissions.map((rule) => ({
+          if (!coordinator) return;
+          const { definition } = coordinator;
+          const existing = editor.get(definition.id);
+          if (existing) {
+            if (!conflictReported && !coordinator.isCoordinator(existing)) {
+              conflictReported = true;
+              log("warn", "setup.degraded", {
+                classification: "validation",
+                option: "agentID",
+              });
+            }
+            return;
+          }
+          editor.update(definition.id, (agent) => {
+            Object.assign(agent, definition, {
+              permissions: definition.permissions.map((rule) => ({
                 ...rule,
               })),
             });
@@ -1746,7 +1781,8 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
           sessionID: string,
           agent: string,
         ) => {
-          if (agent && agent !== coordinatorAgent.id) return false;
+          if (!coordinator || (agent && agent !== coordinator.definition.id))
+            return false;
           if (adapter.abort.signal.aborted || !sessionID || !agent)
             throw new Error("Coordinator tool identity is unavailable");
           const session = await ctx.session.get({ sessionID });
@@ -1780,12 +1816,12 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
             fingerprint(current.location) !== fingerprint(session.location)
           )
             throw new Error("Coordinator tool identity changed during lookup");
-          return isCoordinatorAgent(definition);
+          return coordinator.isCoordinator(definition);
         };
         const contextTools = await ctx.session.hook(
           "context",
           async (event) => {
-            if (event.agent !== coordinatorAgent.id) return;
+            if (event.agent !== coordinator?.definition.id) return;
             try {
               if (!(await matchesExecutionRole(event.sessionID, event.agent)))
                 return;
@@ -1850,6 +1886,7 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         });
         cleanupSteps.push(() => rpc.dispose());
         const registry = createCoordinationTools({
+          isCoordinator: (agent) => coordinator?.isCoordinator(agent) ?? false,
           native,
           backend,
           canonical,
@@ -1862,7 +1899,9 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
               ))
             )
               throw new Error(
-                "Select Backseat Coordinator for coordination tools",
+                coordinator
+                  ? `Select ${coordinator.definition.name} for coordination tools`
+                  : "Coordination tools are unavailable: check the agentID and agentName plugin options",
               );
           },
         });
