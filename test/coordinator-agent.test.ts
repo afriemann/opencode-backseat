@@ -221,6 +221,14 @@ describe("Coordinator task workflow", () => {
       "never estimate or sum costs by hand",
     ],
     ["Manages context and cost", "replacement session"],
+    [
+      "Does not restate form answers",
+      "never send a follow-up that repeats the answers",
+    ],
+    [
+      "Restates listed tasks when relaying a choice",
+      "restate that list, slimmed down where needed",
+    ],
   ])("%s: instructs %s", (_scenario, phrase) => {
     expect(coordinatorAgent.system).toContain(phrase);
   });
