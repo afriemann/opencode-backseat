@@ -1136,12 +1136,15 @@ describe("Fine-grained Code Mode queries", () => {
       "update_session",
     ])
       expect(required(name)).not.toEqual(expect.arrayContaining(["location"]));
+    expect(required("synthetic_session")).toEqual(
+      expect.arrayContaining(["text", "options"]),
+    );
     for (const name of ["create_native_session", "import_session"])
       expect(required(name)).toEqual(
         expect.arrayContaining(["location", "agent"]),
       );
     for (const [kind, options] of [
-      ["synthetic", { resume: false }],
+      ["synthetic", { description: "review: reminder", resume: false }],
       ["shell", {}],
       ["compact", { delivery: "queue" }],
       ["command", { name: "review" }],

@@ -39,6 +39,11 @@ export const DIAGNOSTIC_EVENTS = [
   "observer.degraded",
   "observer.failed",
   "catalog.failed",
+  "catalog.filtered",
+  "setup.configured",
+  "tool.denied",
+  "admission.uncertain",
+  "follower.degraded",
 ] as const;
 export const DIAGNOSTIC_PHASES = [
   "registration",

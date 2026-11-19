@@ -61,6 +61,8 @@ After sending, the separate `follow_session` content reader can track responses 
 
 If creation, deletion or a send reports an uncertain outcome, retain its returned identity and reconcile it instead of blindly repeating the action. Commands and skills cannot confirm a lost acknowledgement by a caller-selected message ID. Deleting a session also deletes its child sessions; Backseat retains delivery records, so deletion is not a full data purge.
 
+Backseat's tools are reachable only through OpenCode's Code Mode `execute` tool, by design. Coordination is restricted to the Backseat agent you select: a session using it loses OpenCode's built-in implementation tools (shell, edit, read, search, web, subagent, skill, `lsp_*`, `use_*`) from its catalog and cannot call them, including from Code Mode; every other tool stays available under your configured permissions. Text inserted with the synthetic tool needs a non-blank `description`, which is shown in the worker transcript. The instruction-entry tools (`put_session_instruction`, `remove_session_instruction`) are ordinary visible tool calls and log a debug entry each time one runs. Tool parameters named `location` select a project from `list_projects`, not a working directory.
+
 ## Configuration
 
 | Option      | Default                                                                   | Effect                                                                                                              |
