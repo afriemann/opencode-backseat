@@ -404,6 +404,30 @@ describe("Exclusive coordinator authority", () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+  it("Reacquires ownership left by a previous boot", async () => {
+    const home = await fixture("previous-boot");
+    try {
+      expect(await child(home, "previous", true)).toBe("owned");
+      const lock = `${home}/ownership.lock`,
+        record = JSON.parse(await readFile(lock, "utf8"));
+      // The recorded PID is this live process, so only the boot id can mark it terminated.
+      const selfStat = await readFile("/proc/self/stat", "utf8");
+      record.identity.pid = process.pid;
+      record.identity.start = selfStat
+        .slice(selfStat.lastIndexOf(")") + 2)
+        .split(" ")[19];
+      record.identity.boot = "00000000-0000-4000-8000-000000000000";
+      await writeFile(lock, JSON.stringify(record));
+      const next = authority(home, "next");
+      try {
+        expect(await next.claim()).toBe("owned");
+      } finally {
+        await next.dispose(async () => {});
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
   it("Fences an unloaded project without releasing other participants", async () => {
     const home = await fixture("service-core");
     let created = 0,
