@@ -350,6 +350,33 @@ describe("Native session content pagination", () => {
     }
     expect(joined).toBe(JSON.stringify(original));
   });
+  it("Returns large default pages", async () => {
+    const f = fixture();
+    const query = {
+      sessionID: f.query.sessionID,
+      location: f.query.location,
+      agent: f.query.agent,
+      limit: f.query.limit,
+      order: f.query.order,
+    };
+    const original = [{ text: "x".repeat(127_000) }];
+    f.setData(original);
+    const read = (input: typeof query & { maxBytes?: number }) =>
+      f.content.read("context", input, "caller", "service", f.client, f.signal);
+    expect(await read(query)).toMatchObject({
+      available: true,
+      data: original,
+    });
+    f.setData([{ text: "z".repeat(128_000) }]);
+    expect(await read(query)).toMatchObject({ encoding: "json-text" });
+    f.setData([{ text: "y".repeat(900_000) }]);
+    expect(await read({ ...query, maxBytes: 1_048_576 })).toMatchObject({
+      available: true,
+    });
+    await expect(read({ ...query, maxBytes: 1_048_577 })).rejects.toThrow(
+      "bound",
+    );
+  });
   it("Reports snapshot capacity exhaustion", async () => {
     const f = fixture(1000);
     f.setData([{ text: "large".repeat(1000) }]);

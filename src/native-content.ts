@@ -97,7 +97,8 @@ export async function observeFollowedSession(
 
 export const CONTENT_BOUNDS = {
   pageItems: 100,
-  pageBytes: 64_000,
+  pageBytes: 1_048_576,
+  defaultPageBytes: 128_000,
   trackingBytes: 8_000_000,
   snapshotBytes: 256 * 1024 * 1024,
   handles: 1024,
@@ -137,7 +138,7 @@ function reader(
 ) {
   return {
     kind,
-    description: `${description} Select exact sessionID and canonical location from list_sessions; agent optionally confirms the current agent. No task binding or terminal attachment is required. Returns bounded data or json-text chunks with offsetChars and an opaque cursor. Continue with the same arguments and cursor; concatenate chunks for one native page. Handles expire one hour after last use and bind the caller, service, target and query. Chunks of one page come from a single snapshot, so concatenation is consistent. Defaults: 20 messages, 24000 response bytes.`,
+    description: `${description} Select exact sessionID and canonical location from list_sessions; agent optionally confirms the current agent. No task binding or terminal attachment is required. Returns bounded data or json-text chunks with offsetChars and an opaque cursor. Continue with the same arguments and cursor; concatenate chunks for one native page. Handles expire one hour after last use and bind the caller, service, target and query. Chunks of one page come from a single snapshot, so concatenation is consistent. Defaults: 20 messages, ${CONTENT_BOUNDS.defaultPageBytes} response bytes; maxBytes up to ${CONTENT_BOUNDS.pageBytes}.`,
     input: {
       type: "object",
       properties: { ...commonProperties, ...properties },
@@ -235,8 +236,7 @@ export const CONTENT_READERS = {
   ),
   follow_session: {
     kind: "tracking",
-    description:
-      "Follow bounded native activity after a retained sendID, such as the ID returned by send_session or a selected native inbox/message ID. Supply exact sessionID and canonical location; agent optionally confirms the target. Returns send-anchor status, exclusive afterSeq, bounded event summaries and changed assistant-message updates, including in-progress text. Output is since-send activity, not proof of causal attribution; interleaved flags other delivered inputs. Continue polling with cursor and unchanged arguments; more means immediate catch-up remains. Unfinished messages are refetched without replaying full history. Large updates use json-text chunks keyed by messageID, version and offsetChars; replace starts a new version. Handles expire after five inactive minutes. Discontinuity or unavailable history is explicit, never an empty-success claim. Retain the send ID and do not resend to recover tracking. Defaults: 50 events and 24000 bytes per call; max 100 events and 64000 bytes.",
+    description: `Follow bounded native activity after a retained sendID, such as the ID returned by send_session or a selected native inbox/message ID. Supply exact sessionID and canonical location; agent optionally confirms the target. Returns send-anchor status, exclusive afterSeq, bounded event summaries and changed assistant-message updates, including in-progress text. Output is since-send activity, not proof of causal attribution; interleaved flags other delivered inputs. Continue polling with cursor and unchanged arguments; more means immediate catch-up remains. Unfinished messages are refetched without replaying full history. Large updates use json-text chunks keyed by messageID, version and offsetChars; replace starts a new version. Handles expire after five inactive minutes. Discontinuity or unavailable history is explicit, never an empty-success claim. Retain the send ID and do not resend to recover tracking. Defaults: 50 events and ${CONTENT_BOUNDS.defaultPageBytes} bytes per call; max 100 events and ${CONTENT_BOUNDS.pageBytes} bytes.`,
     input: {
       type: "object",
       properties: { ...commonProperties, sendID: stringSchema },
@@ -560,7 +560,9 @@ export function createNativeContent(
         agent = input.agent === undefined ? undefined : text(input.agent);
       const limit = input.limit === undefined ? 20 : integer(input.limit, 1);
       const maxBytes =
-        input.maxBytes === undefined ? 24_000 : integer(input.maxBytes, 1024);
+        input.maxBytes === undefined
+          ? CONTENT_BOUNDS.defaultPageBytes
+          : integer(input.maxBytes, 1024);
       const order = input.order ?? "asc";
       if (
         limit > CONTENT_BOUNDS.pageItems ||
@@ -875,7 +877,9 @@ export function createNativeContent(
           location = text(input.location);
         const limit = input.limit === undefined ? 50 : integer(input.limit, 1);
         const maxBytes =
-          input.maxBytes === undefined ? 24_000 : integer(input.maxBytes, 1024);
+          input.maxBytes === undefined
+            ? CONTENT_BOUNDS.defaultPageBytes
+            : integer(input.maxBytes, 1024);
         if (
           limit > CONTENT_BOUNDS.pageItems ||
           maxBytes > CONTENT_BOUNDS.pageBytes

@@ -104,6 +104,14 @@ describe("Conversational manual assignment", () => {
       "relay it to the user instead of answering on their behalf, unless the user delegated that decision",
     );
   });
+  it("Closes a pending gate before sending other input", () => {
+    expect(coordinatorAgent.system).toContain(
+      "cancel_session_form or reply_permission with decision reject",
+    );
+    expect(coordinatorAgent.system).toContain(
+      "before sending that session any other input",
+    );
+  });
 });
 
 // spec: openspec/specs/worker-coordination/spec.md

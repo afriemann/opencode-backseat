@@ -80,6 +80,11 @@ function fixture() {
         ];
       },
     },
+    worktree: {
+      async list() {
+        return [{ directory: "/projects/one" }];
+      },
+    },
     agent: {
       async list() {
         return {
@@ -1090,6 +1095,36 @@ describe("Fine-grained Code Mode queries", () => {
     ).toMatchObject({ agents: ["engineer", "backseat"] });
   });
 
+  it("Lists a project's additional directories", async () => {
+    const f = fixture();
+    f.client.worktree.list = (async () => [
+      { directory: "/projects/one" },
+      { directory: "/projects/one-feature", strategy: "git" },
+      { directory: "/projects/one-feature", strategy: "git" },
+    ]) as unknown as typeof f.client.worktree.list;
+    expect(await f.call("list_projects")).toMatchObject({
+      projects: [
+        { projectID: "project", title: "One", location: "/projects/one" },
+        {
+          projectID: "project",
+          title: "One / one-feature",
+          location: "/projects/one-feature",
+        },
+      ],
+    });
+    expect(
+      ((await f.call("list_projects")) as { projects: unknown[] }).projects,
+    ).toHaveLength(2);
+  });
+  it("Fails explicitly when project directories cannot be read", async () => {
+    const f = fixture();
+    f.client.worktree.list = (async () => {
+      throw new Error("worktrees unavailable");
+    }) as unknown as typeof f.client.worktree.list;
+    await expect(f.call("list_projects")).rejects.toThrow(
+      "worktrees unavailable",
+    );
+  });
   it("Creates an assignment through separate catalog and mutation calls", async () => {
     const f = fixture();
     expect(await f.call("list_projects")).toMatchObject({

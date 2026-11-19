@@ -351,6 +351,11 @@ The coordinator SHALL send requested input directly to selected sessions without
 - **WHEN** the coordinator assigns work to a worker or a worker stops at a gate of its own
 - **THEN** the coordinator's instructions forbid prescribing or overriding the worker's process and require relaying the gate to the user unless the user delegated the decision.
 
+#### Scenario: Closes a pending gate before sending other input
+
+- **WHEN** a followed session has a pending form or permission request and the coordinator needs to send that session other input
+- **THEN** the coordinator is instructed to cancel the form or reject the permission request first, so the session is not left waiting on it.
+
 ### Requirement: Explicit native subtree deletion
 
 The coordinator SHALL delete a selected native subtree through its typed native control subject to configured permissions.
@@ -470,6 +475,11 @@ The coordinator SHALL retrieve bounded native session history and activity indep
 
 - **WHEN** a new snapshot does not fit the memory budget
 - **THEN** the least recently used snapshots are evicted first, and the read fails with a capacity error naming the budget only if the snapshot alone exceeds it.
+
+#### Scenario: Returns large default pages
+
+- **WHEN** a content read omits maxBytes
+- **THEN** its page may carry up to 128,000 bytes, and an explicit maxBytes up to 1,048,576 is accepted.
 
 ### Requirement: Since-send response tracking
 
@@ -787,3 +797,23 @@ The coordinator's instructions SHALL direct it to establish the goal of a sessio
 - **WHEN** the cost of a task including its subagent sessions is relevant
 - **THEN** it is instructed to look for a configured tool that reports session cost including subagent sessions and to use it only if one is available.
 - **AND** without such a tool it is instructed to report the session's own cumulative cost, state that child sessions are excluded, and never estimate or sum costs by hand.
+
+### Requirement: Native project directory discovery
+
+The coordinator SHALL discover every directory the host reports for a project, including worktree directories, as a selectable project location.
+
+#### Scenario: Lists a project's additional directories
+
+- **GIVEN** a project whose host-reported directories include one that is neither its canonical path nor a sandbox
+- **WHEN** projects are listed
+- **THEN** that directory is returned as its own location of the project, titled with the project name and directory name, and appears once even if the host reports it repeatedly.
+
+#### Scenario: Creates a worker in a project's additional directory
+
+- **WHEN** a worker is created at a host-reported directory of a project
+- **THEN** the worker is created and followed as at the project's canonical path.
+
+#### Scenario: Fails explicitly when project directories cannot be read
+
+- **WHEN** the host cannot list a project's directories
+- **THEN** project discovery fails with the host's error rather than returning a partial list.
