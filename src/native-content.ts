@@ -149,7 +149,7 @@ function reader(
 export const CONTENT_READERS = {
   read_session_messages: reader(
     "messages",
-    "Read a native message-history page, preserving native chronological order and type filtering. This is not a poll for updates to an already-read unfinished message.",
+    "Read a native message-history page, preserving native chronological order and type filtering. Default order is asc (oldest first). For the latest or last messages use order desc with a small limit (for example limit 1); never page from the start to reach the end. type filters by message type, for example assistant. This is not a poll for updates to an already-read unfinished message.",
     { order: { enum: ["asc", "desc"] }, type: { enum: MESSAGE_TYPES } },
   ),
   read_session_message: reader(

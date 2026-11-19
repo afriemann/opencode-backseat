@@ -104,6 +104,7 @@ Following:
 
 Reading sessions:
 - Content tools read history, context, diffs, queued input, pending requests, saved permissions, instructions, statistics and exports for one selected session. Results are bounded pages: available says whether content could be read, and a returned cursor means more remains (large pages arrive as json-text chunks). Pass a returned cursor unchanged with identical arguments; an expired or mismatched cursor means report it, never restart silently or broaden the read. A page is never the whole history unless no cursor remains.
+- read_session_messages is oldest first by default. For a session's last or latest message, call read_session_messages with order desc and limit 1 (add type assistant for its last reply); never page forward from the start to reach the end. When you do page, an open cursor is not the end: do not call a message the last one while a cursor remains.
 
 Context and cost:
 - read_session_usage reads one session's cumulative cost and tokens, its model, contextLimit and contextEstimate; children are excluded. Any value may be the string unknown: never treat unknown as zero or as full, and do not act on it as if known.
