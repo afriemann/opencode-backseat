@@ -397,7 +397,7 @@ Backseat SHALL emit structured operational diagnostics through host logging, sub
 
 ### Requirement: Diagnostic privacy boundary
 
-Backseat SHALL restrict diagnostic records to a closed allowlist of fixed event, operation, phase, failure, request-category, error-code and configuration-option labels, integer HTTP statuses from 100 through 599, nonnegative finite durations and counts, continuation-presence booleans, and independent diagnostic-only tokens.
+Backseat SHALL restrict diagnostic records to a closed allowlist of fixed event, operation, phase, failure, request-category, error-code and configuration-option labels, the fixed plugin runtime label, plugin and host version labels of numeric dotted form, integer HTTP statuses from 100 through 599, nonnegative finite durations and counts, continuation-presence booleans, and independent diagnostic-only tokens.
 
 #### Scenario: Excludes sensitive diagnostic data
 
@@ -406,6 +406,12 @@ Backseat SHALL restrict diagnostic records to a closed allowlist of fixed event,
 - **AND** existing detailed user-facing registration errors remain unchanged
 - **AND** both the native producer and host projection reject arbitrary labels and invalid numbers independently, using fixed unknown categories or codes rather than exception text
 - **AND** exceptional diagnostic property access or emission does not change results, original errors, permission checks, cancellation or cleanup
+
+#### Scenario: Reports resolved configuration without option values
+
+- **WHEN** setup completes
+- **THEN** the setup diagnostic carries the plugin and host versions, the runtime label and the names of the configured options
+- **AND** no option value is logged.
 
 ### Requirement: Diagnostic failure isolation
 
@@ -530,6 +536,12 @@ The coordinator SHALL expose dedicated typed native controls governed by configu
 - **THEN** the operation targets that session at its live location and agent under configured policy, including when its agent no longer exists.
 - **AND** a supplied location or agent that differs from the live session is rejected without acting.
 
+#### Scenario: Requires a visible description on inserted synthetic text
+
+- **WHEN** a coordinator inserts synthetic text without a description or with a blank description
+- **THEN** the call is rejected before any native call.
+- **AND** a non-blank description is forwarded with the text so the host shows a row for it.
+
 ### Requirement: Explicit native request replies
 
 The coordinator SHALL answer selected current native permission and form requests using its judgment and user instructions, subject to configured policy on the reply operation.
@@ -602,6 +614,16 @@ The plugin SHALL wake a session's following coordinator when native progress, id
 - **WHEN** a saved native boundary is unavailable or history changes
 - **THEN** the coordinator receives explicit discontinuity rather than fabricated continuous progress.
 - **BUT** when an observation read merely times out, is cancelled or the native service is unreachable, the saved boundary is kept and observation is retried with backoff from it; discontinuity is reported only if the failure persists beyond a bounded number of retries.
+
+#### Scenario: Notifies when a followed worker finishes a turn
+
+- **WHEN** a followed session's native execution succeeds
+- **THEN** its coordinator receives an idle notification for that session.
+
+#### Scenario: Shows each notification in the coordinator transcript
+
+- **WHEN** a background notification is delivered to a coordinator
+- **THEN** it carries a fixed non-empty description so the host shows a visible row for it.
 
 ### Requirement: Explicit following lifecycle
 

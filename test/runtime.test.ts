@@ -19,11 +19,17 @@ describe("Restricted conversational coordination", () => {
     "Allows configured coordination tools and session-local tracking",
     "Bootstraps without disclosing task state",
     "Rejects unauthorised shared-state reads",
+    "Reuses the coordinator role decision within a session",
+    "Does not latch a failed coordinator role lookup",
+    "Reports tool identity failures",
   ])("%s", async (scenario) => {
     const root = resolve(".opencode/backseat");
     await mkdir(root, { recursive: true, mode: 0o700 });
     const home = await mkdtemp(`${root}/events-`);
     const notices: unknown[] = [];
+    const diagnostics: string[] = [];
+    let agentLookups = 0,
+      failLookup = false;
     const tools = new Map<
       string,
       { execute(input: unknown, context: unknown): Promise<unknown> }
@@ -96,7 +102,7 @@ describe("Restricted conversational coordination", () => {
           if (++subscriptions === 1) throw new Error("Event transport closed");
           await trigger;
           yield {
-            type: "session.idle",
+            type: "session.execution.succeeded",
             location: { directory: `${home}/external` },
             data: { sessionID: "worker" },
           } as OpenCodeEvent;
@@ -119,18 +125,22 @@ describe("Restricted conversational coordination", () => {
         },
       },
       agent: {
-        list: async () => ({
-          location: { directory: home },
-          data: [
-            {
-              ...structuredClone(coordinatorAgent),
-              permissions: [
-                ...coordinatorAgent.permissions,
-                { action: "*", resource: "*", effect: "allow" },
-              ],
-            },
-          ],
-        }),
+        list: async () => {
+          agentLookups++;
+          if (failLookup) throw new Error("Catalog unavailable");
+          return {
+            location: { directory: home },
+            data: [
+              {
+                ...structuredClone(coordinatorAgent),
+                permissions: [
+                  ...coordinatorAgent.permissions,
+                  { action: "*", resource: "*", effect: "allow" },
+                ],
+              },
+            ],
+          };
+        },
         transform: async () => registration,
       },
       tool: {
@@ -154,7 +164,9 @@ describe("Restricted conversational coordination", () => {
     } as unknown as Plugin.Context;
     let close: unknown;
     try {
-      close = await promisePlugin(() => {}).setup(context);
+      close = await promisePlugin((_level, event) => {
+        diagnostics.push(event);
+      }).setup(context);
       const identity = {
         sessionID: "coordinator",
         agent: coordinatorAgent.id,
@@ -208,11 +220,57 @@ describe("Restricted conversational coordination", () => {
           "execute",
           "backseat_stop_following",
         ]);
+        expect(diagnostics).toContain("catalog.filtered");
         for (const tool of denied) {
           await expect(
             hooks.get("execute.before")!({ ...identity, tool }),
           ).rejects.toThrow("not permitted");
         }
+        expect(diagnostics).toContain("tool.denied");
+        return;
+      }
+      const catalogOf = (): typeof identity & {
+        tools: Record<string, object>;
+      } => ({
+        ...identity,
+        tools: { shell: {}, execute: {} },
+      });
+      if (
+        scenario === "Reuses the coordinator role decision within a session"
+      ) {
+        await hooks.get("context")!(catalogOf());
+        const before = agentLookups;
+        const second = catalogOf();
+        await hooks.get("context")!(second);
+        await hooks.get("context")!(catalogOf());
+        expect(agentLookups).toBe(before);
+        expect(Object.keys(second.tools)).toEqual(["execute"]);
+        await expect(
+          hooks.get("execute.before")!({ ...identity, tool: "shell" }),
+        ).rejects.toThrow("not permitted");
+        expect(agentLookups).toBeGreaterThan(before);
+        return;
+      }
+      if (scenario === "Does not latch a failed coordinator role lookup") {
+        failLookup = true;
+        const failed = catalogOf();
+        await hooks.get("context")!(failed);
+        expect(failed.tools).toEqual({});
+        failLookup = false;
+        const recovered = catalogOf();
+        await hooks.get("context")!(recovered);
+        expect(Object.keys(recovered.tools)).toEqual(["execute"]);
+        return;
+      }
+      if (scenario === "Reports tool identity failures") {
+        await expect(
+          hooks.get("execute.before")!({
+            ...identity,
+            sessionID: "worker",
+            tool: "execute",
+          }),
+        ).rejects.toThrow("identity is unavailable or changed");
+        expect(diagnostics).toContain("tool.failed");
         return;
       }
       if (
@@ -570,6 +628,24 @@ describe("Bundled conversational coordinator", () => {
         expect(degraded(events)).toEqual([]);
       },
     );
+  });
+
+  it("Reports resolved configuration without option values", async () => {
+    await withPlugin({ agentID: "lead" }, undefined, ({ events }) => {
+      const configured = events.find(
+        (entry) => entry.event === "setup.configured",
+      );
+      expect(configured?.fields).toMatchObject({
+        runtime: "v2",
+        hostVersion: "2.2.5",
+        pluginVersion: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+      });
+      expect(configured?.fields?.options).toEqual(
+        expect.arrayContaining(["agentID", "dataDir"]),
+      );
+      expect(JSON.stringify(configured)).not.toContain("lead");
+      expect(JSON.stringify(configured)).not.toContain(".opencode/backseat");
+    });
   });
 
   it.each([

@@ -690,7 +690,9 @@ export function createCoordinationTools(port: CoordinationToolPort): {
         [
           "sessionID",
           ...(kind === "compact" || kind === "skill" ? [] : ["text"]),
-          ...(kind === "command" || kind === "skill" ? ["options"] : []),
+          ...(kind === "command" || kind === "skill" || kind === "synthetic"
+            ? ["options"]
+            : []),
         ],
       ),
       async run(v, context) {

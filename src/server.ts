@@ -3,6 +3,7 @@ import { Plugin as EffectPlugin } from "@opencode/plugin/effect";
 import { fromPromise } from "@opencode/plugin/promise/adapter";
 import { Effect } from "effect";
 import type { OpenCodeEvent } from "@opencode/client";
+import pluginPackage from "../package.json" with { type: "json" };
 import { randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
@@ -91,6 +92,7 @@ export interface FollowHost {
   ): Promise<{ afterSeq: number; pending: FollowPending }>;
   notify(notification: FollowNotification): Promise<"admitted" | "uncertain">;
   reconcile(notification: FollowNotification): Promise<"admitted" | "unknown">;
+  diagnostics?: DiagnosticEmitter | undefined;
 }
 export interface SessionControllerHost {
   native: Pick<NativeConnection, "read" | "identity">;
@@ -106,16 +108,25 @@ export interface SessionControllerHost {
   };
   canonical(location: string): Promise<string>;
   isCoordinator: CoordinatorMatcher;
+  diagnostics?: DiagnosticEmitter | undefined;
 }
-function admissionDiagnostic(message: string, error: unknown): void {
-  process.stderr.write(
-    JSON.stringify({
-      service: "backseat",
-      level: "warn",
-      message,
-      errorClass: error instanceof Error ? error.name : "unknown",
-    }) + "\n",
-  );
+const NOTIFICATION_DESCRIPTION = "backseat: worker update";
+const RUNTIME_LABEL = "v2";
+const ROLE_LATCH_LIMIT = 256;
+const VERSION_LABEL = /^\d+\.\d+\.\d+$/;
+const CONFIG_OPTION_NAMES: readonly string[] = [
+  "agentID",
+  "agentName",
+  "dataDir",
+];
+function admissionDiagnostic(
+  diagnostics: DiagnosticEmitter | undefined,
+  event: "admission.uncertain" | "follower.degraded",
+  action: string,
+): void {
+  diagnosticContext(diagnostics, "native", action).emit("warn", event, {
+    classification: "unknown",
+  });
 }
 export class SessionController {
   private follower!: NativeFollower;
@@ -124,6 +135,7 @@ export class SessionController {
     const controller = new SessionController(host);
     controller.follower = await NativeFollower.load({
       storage: host.storage,
+      diagnostics: host.diagnostics,
       async target(sessionID) {
         const session = await controller.target(sessionID);
         return { sessionID: session.id, location: session.location.directory };
@@ -164,6 +176,7 @@ export class SessionController {
               sessionID: notification.coordinatorID,
               id: notification.id,
               text: notification.text,
+              description: NOTIFICATION_DESCRIPTION,
               metadata: { "backseat.notification": true },
               delivery: "queue",
               resume: true,
@@ -408,9 +421,13 @@ export class SessionController {
       try {
         await this.host.native.read(send);
         record.status = "admitted";
-      } catch (error) {
+      } catch {
         record.status = "ambiguous";
-        admissionDiagnostic("Native send admission uncertain", error);
+        admissionDiagnostic(
+          this.host.diagnostics,
+          "admission.uncertain",
+          "send_session",
+        );
       }
       return { sendID: id, sessionID: input.sessionID, status: record.status };
     });
@@ -539,9 +556,13 @@ export class SessionController {
           client.session.remove({ sessionID }, { signal }),
         );
         record.status = "admitted";
-      } catch (error) {
+      } catch {
         record.status = "ambiguous";
-        admissionDiagnostic("Native deletion outcome uncertain", error);
+        admissionDiagnostic(
+          this.host.diagnostics,
+          "admission.uncertain",
+          "delete_session",
+        );
       }
       return { sessionID, status: record.status, members };
     });
@@ -614,10 +635,11 @@ export class SessionController {
               current.location.directory === input.location
             )
               previous.status = "admitted";
-          } catch (error) {
+          } catch {
             admissionDiagnostic(
-              "Native creation reconciliation unavailable",
-              error,
+              this.host.diagnostics,
+              "admission.uncertain",
+              "create_session",
             );
           }
         }
@@ -664,9 +686,13 @@ export class SessionController {
         )
           throw new Error("Created native session identity mismatch");
         record.status = "admitted";
-      } catch (error) {
+      } catch {
         record.status = "ambiguous";
-        admissionDiagnostic("Native creation admission uncertain", error);
+        admissionDiagnostic(
+          this.host.diagnostics,
+          "admission.uncertain",
+          "create_session",
+        );
       }
       return { sessionID: input.sessionID, status: record.status };
     });
@@ -742,13 +768,25 @@ export class SessionController {
       undefined,
       prepared.executeTimeoutMs,
     );
+    if (
+      input.operation === "put_session_instruction" ||
+      input.operation === "remove_session_instruction"
+    )
+      diagnosticContext(this.host.diagnostics, "native", input.operation).emit(
+        "debug",
+        "native.completed",
+      );
     if (input.operation === "fork_session") {
       const session = object(result),
         sessionID = text(session.id);
       try {
         await this.follower.follow(sessionID, context.sessionID);
-      } catch (error) {
-        admissionDiagnostic("Fork created but following unavailable", error);
+      } catch {
+        admissionDiagnostic(
+          this.host.diagnostics,
+          "follower.degraded",
+          "control",
+        );
         return { ...session, following: false };
       }
     }
@@ -772,7 +810,7 @@ export class SessionController {
       value.data.form?.sessionID;
     if (!sessionID) return;
     const pending: Partial<FollowPending> = {};
-    if (value.type === "session.idle") pending.idle = true;
+    if (value.type === "session.execution.succeeded") pending.idle = true;
     if (
       value.type === "session.execution.failed" ||
       value.type === "session.step.failed"
@@ -898,8 +936,12 @@ export class NativeFollower {
     entry.timer = setTimeout(
       () => {
         entry.timer = undefined;
-        void this.ingest(sessionID).catch((error: unknown) =>
-          admissionDiagnostic("Follower re-observation failed", error),
+        void this.ingest(sessionID).catch(() =>
+          admissionDiagnostic(
+            this.host.diagnostics,
+            "follower.degraded",
+            "observe",
+          ),
         );
       },
       Math.min(
@@ -926,8 +968,12 @@ export class NativeFollower {
       );
     const timer = setTimeout(() => {
       this.timers.delete(coordinatorID);
-      void this.flush(coordinatorID).catch((error: unknown) =>
-        admissionDiagnostic("Follower delivery failed", error),
+      void this.flush(coordinatorID).catch(() =>
+        admissionDiagnostic(
+          this.host.diagnostics,
+          "follower.degraded",
+          "recover",
+        ),
       );
     }, delay);
     timer.unref();
@@ -1052,7 +1098,11 @@ export class NativeFollower {
       try {
         observed = await this.host.observe(sessionID, follower.afterSeq);
       } catch (error) {
-        admissionDiagnostic("Followed-session observation unavailable", error);
+        admissionDiagnostic(
+          this.host.diagnostics,
+          "follower.degraded",
+          "observe",
+        );
         // A timed-out or unreachable read leaves the saved boundary valid: the
         // next successful observation resumes from it, so nothing is missing.
         // Persistent failure escalates to discontinuity after bounded retries.
@@ -1129,8 +1179,12 @@ export class NativeFollower {
         let status: FollowNotification["status"] = "uncertain";
         try {
           status = await this.host.notify(structuredClone(existing));
-        } catch (error) {
-          admissionDiagnostic("Follower notification retry uncertain", error);
+        } catch {
+          admissionDiagnostic(
+            this.host.diagnostics,
+            "admission.uncertain",
+            "recover",
+          );
         }
         const retried = this.snapshot();
         retried.notifications.find((row) => row.id === existing.id)!.status =
@@ -1233,9 +1287,13 @@ export class NativeFollower {
     let status: FollowNotification["status"];
     try {
       status = await this.host.notify(structuredClone(notification));
-    } catch (error) {
+    } catch {
       status = "uncertain";
-      admissionDiagnostic("Follower notification admission uncertain", error);
+      admissionDiagnostic(
+        this.host.diagnostics,
+        "admission.uncertain",
+        "recover",
+      );
     }
     const completed = this.snapshot();
     completed.notifications.find((row) => row.id === notification.id)!.status =
@@ -1336,6 +1394,17 @@ export const hostDiagnostics = Effect.gen(function* () {
         )
           record[key] = value;
       }
+      for (const key of ["pluginVersion", "hostVersion"]) {
+        const value = fields[key];
+        if (typeof value === "string" && VERSION_LABEL.test(value))
+          record[key] = value;
+      }
+      if (fields.runtime === RUNTIME_LABEL) record.runtime = RUNTIME_LABEL;
+      if (Array.isArray(fields.options))
+        record.options = fields.options.filter(
+          (name): name is string =>
+            typeof name === "string" && CONFIG_OPTION_NAMES.includes(name),
+        );
       if (event.endsWith("failed") && record.classification === undefined)
         record.classification = "unknown";
       for (const key of [
@@ -1380,6 +1449,7 @@ type ProjectAdapter = {
   location: string;
   abort: AbortController;
   native: NativeConnection;
+  diagnostics: DiagnosticEmitter;
   coordinator?: Coordinator;
   degraded?: (blocker: string) => void;
 };
@@ -1525,6 +1595,7 @@ async function createNativeCore(
     const controller = await SessionController.load({
       storage,
       canonical,
+      diagnostics: initial.diagnostics,
       isCoordinator: (agent) =>
         active().coordinator?.isCoordinator(agent) ?? false,
       native: {
@@ -1587,6 +1658,12 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         log("warn", "setup.degraded", { classification: "validation" });
         return;
       }
+      log("info", "setup.configured", {
+        pluginVersion: pluginPackage.version,
+        hostVersion: ctx.app.version,
+        runtime: RUNTIME_LABEL,
+        options: Object.keys(ctx.options ?? {}),
+      });
       const created = createCoordinator(ctx.options);
       if (!created.ok)
         log("warn", "setup.degraded", {
@@ -1606,6 +1683,7 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         location,
         abort: new AbortController(),
         native,
+        diagnostics,
         ...(coordinator ? { coordinator } : {}),
       };
       adapter.degraded = (blocker) =>
@@ -1823,22 +1901,42 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
             throw new Error("Coordinator tool identity changed during lookup");
           return coordinator.isCoordinator(definition);
         };
+        // Only catalog filtering is latched; execute.before re-checks live and stays the enforcement gate.
+        const latchedRoles = new Map<string, Promise<boolean>>();
+        cleanupSteps.push(async () => latchedRoles.clear());
+        const latchedRole = (sessionID: string, agent: string) => {
+          const key = JSON.stringify([sessionID, agent]);
+          const known = latchedRoles.get(key);
+          if (known) return known;
+          if (latchedRoles.size >= ROLE_LATCH_LIMIT)
+            latchedRoles.delete(latchedRoles.keys().next().value!);
+          const lookup = matchesExecutionRole(sessionID, agent);
+          latchedRoles.set(key, lookup);
+          lookup.catch(() => {
+            if (latchedRoles.get(key) === lookup) latchedRoles.delete(key);
+          });
+          return lookup;
+        };
         const contextTools = await ctx.session.hook(
           "context",
           async (event) => {
             if (event.agent !== coordinator?.definition.id) return;
+            const trace = diagnosticContext(diagnostics, "tool");
             try {
-              if (!(await matchesExecutionRole(event.sessionID, event.agent)))
-                return;
+              if (!(await latchedRole(event.sessionID, event.agent))) return;
+              let removed = 0;
               for (const name of Object.keys(event.tools))
-                if (!isCoordinatorToolPermitted(name)) delete event.tools[name];
+                if (!isCoordinatorToolPermitted(name)) {
+                  delete event.tools[name];
+                  removed++;
+                }
+              if (removed > 0)
+                trace.emit("debug", "catalog.filtered", { count: removed });
             } catch {
               event.tools = {};
-              diagnosticContext(diagnostics, "tool").emit(
-                "error",
-                "catalog.failed",
-                { classification: "unavailable" },
-              );
+              trace.emit("error", "catalog.failed", {
+                classification: "unavailable",
+              });
             }
           },
         );
@@ -1846,6 +1944,7 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
         const executionTools = await ctx.tool.hook(
           "execute.before",
           async (event) => {
+            const trace = diagnosticContext(diagnostics, "tool");
             let matches: boolean;
             try {
               matches = await matchesExecutionRole(
@@ -1853,12 +1952,19 @@ export const promisePlugin = (diagnostics: DiagnosticEmitter) =>
                 event.agent,
               );
             } catch {
+              trace.emit("error", "tool.failed", {
+                classification: adapter.abort.signal.aborted
+                  ? "disposed"
+                  : "unavailable",
+              });
               throw new Error(
                 "Coordinator tool identity is unavailable or changed",
               );
             }
-            if (matches && !isCoordinatorToolPermitted(event.tool))
+            if (matches && !isCoordinatorToolPermitted(event.tool)) {
+              trace.emit("warn", "tool.denied");
               throw new Error("Coordinator tool is not permitted");
+            }
           },
         );
         cleanupSteps.push(() => executionTools.dispose());

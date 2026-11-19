@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type {
   OpenCodeClient,
   OpenCodeEvent,
@@ -260,6 +260,35 @@ describe("Explicit adoption", () => {
     expect(f.notices).toHaveLength(1);
     await controller.dispose();
   });
+  it("Notifies when a followed worker finishes a turn", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    await controller.adoptSession("worker", context);
+    await controller.event({
+      type: "session.idle",
+      data: { sessionID: "worker" },
+    } as OpenCodeEvent);
+    expect(f.notices).toHaveLength(0);
+    await controller.event({
+      type: "session.execution.succeeded",
+      data: { sessionID: "worker" },
+    } as OpenCodeEvent);
+    expect(f.notices).toHaveLength(1);
+    await controller.dispose();
+  });
+  it("Shows each notification in the coordinator transcript", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    await controller.adoptSession("worker", context);
+    await controller.event({
+      type: "session.execution.succeeded",
+      data: { sessionID: "worker" },
+    } as OpenCodeEvent);
+    expect(f.notices[0]).toMatchObject({
+      description: expect.stringMatching(/\S/),
+    });
+    await controller.dispose();
+  });
   it("Adopts the selected existing worker", async () => {
     const f = fixture(),
       controller = await SessionController.load(f.host);
@@ -267,7 +296,7 @@ describe("Explicit adoption", () => {
     expect(result).toMatchObject({ sessionID: "worker", following: true });
     expect(f.calls).toEqual(["backseat.adopt"]);
     await controller.event({
-      type: "session.idle",
+      type: "session.execution.succeeded",
       data: { sessionID: "worker" },
     } as OpenCodeEvent);
     expect(f.notices).toHaveLength(1);
@@ -319,7 +348,8 @@ describe("Explicit adoption", () => {
     await controller.event({
       id: "notification-event",
       created: 1,
-      type: "session.idle",
+      type: "session.execution.succeeded",
+      durable: { aggregateID: "worker", seq: 2, version: 1 },
       metadata: { "backseat.notification": true },
       data: { sessionID: "worker" },
     });
@@ -441,6 +471,32 @@ describe("Explicit adoption", () => {
         message: "Selected worker location or agent unavailable",
       });
     expect(f.calls).not.toContain("create");
+    await controller.dispose();
+  });
+  it("Requires a visible description on inserted synthetic text", async () => {
+    const f = fixture(),
+      controller = await SessionController.load(f.host);
+    const send = (options?: Record<string, unknown>) =>
+      controller.sendSession(
+        {
+          sessionID: "worker",
+          text: "note",
+          kind: "synthetic",
+          ...(options === undefined ? {} : { options }),
+        },
+        context,
+      );
+    for (const options of [undefined, {}, { description: "  " }])
+      await expect(send(options)).rejects.toThrow("description");
+    expect(f.notices).toHaveLength(0);
+    await send({ description: "review: reminder" });
+    expect(f.notices).toEqual([
+      expect.objectContaining({
+        sessionID: "worker",
+        text: "note",
+        description: "review: reminder",
+      }),
+    ]);
     await controller.dispose();
   });
   it("Rejects changed or unapproved manual targets", async () => {
@@ -620,6 +676,25 @@ describe("Conversational manual assignment", () => {
     ).toMatchObject({ status: "admitted", following: true });
     expect(f.calls.filter((call) => call === "create")).toHaveLength(1);
     await reloaded.dispose();
+  });
+  it("Reports uncertain admission through diagnostics without stderr output", async () => {
+    const f = fixture(),
+      events: { event: string }[] = [],
+      stderr = spyOn(process.stderr, "write");
+    f.host.diagnostics = (_level, event) => events.push({ event });
+    const controller = await SessionController.load(f.host);
+    f.uncertain();
+    await controller.createSession(
+      { location: "/project", agent: "engineer" },
+      context,
+    );
+    const writes = stderr.mock.calls.map(([chunk]) => String(chunk));
+    stderr.mockRestore();
+    expect(events).toContainEqual(
+      expect.objectContaining({ event: "admission.uncertain" }),
+    );
+    expect(writes.filter((text) => text.includes("backseat"))).toEqual([]);
+    await controller.dispose();
   });
   it("Deletes the approved native subtree and preserves task history", async () => {
     const f = fixture(),
@@ -971,7 +1046,7 @@ describe("Conversational manual assignment", () => {
       sessions: [],
     });
     await controller.event({
-      type: "session.idle",
+      type: "session.execution.succeeded",
       data: { sessionID: "worker" },
     } as OpenCodeEvent);
     expect(f.notices).toHaveLength(0);
@@ -1048,6 +1123,47 @@ describe("Full native session controls", () => {
     expect(f.calls).toContain("interrupt");
     expect(f.calls).toContain("update");
     expect(f.calls).toContain("remove");
+    await controller.dispose();
+  });
+  it("Reports model-initiated instruction entry changes", async () => {
+    const f = fixture(),
+      actions: unknown[] = [];
+    f.host.diagnostics = (_level, event, fields) => {
+      if (event === "native.completed") actions.push(fields?.action);
+    };
+    const controller = await SessionController.load(f.host);
+    (
+      f.client.experimental as unknown as {
+        session: { instructions: { entry: Record<string, unknown> } };
+      }
+    ).session.instructions = {
+      entry: { put: async () => {}, remove: async () => {} },
+    };
+    const target = {
+      sessionID: "worker",
+      location: "/project",
+      agent: "engineer",
+    };
+    await controller.sessionOperation(
+      {
+        operation: "put_session_instruction",
+        ...target,
+        payload: { key: "k", value: "v" },
+      },
+      context,
+    );
+    await controller.sessionOperation(
+      {
+        operation: "remove_session_instruction",
+        ...target,
+        payload: { key: "k" },
+      },
+      context,
+    );
+    expect(actions).toEqual([
+      "put_session_instruction",
+      "remove_session_instruction",
+    ]);
     await controller.dispose();
   });
   it("Uses any non-coordinator native agent", async () => {

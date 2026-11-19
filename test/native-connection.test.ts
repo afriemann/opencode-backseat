@@ -462,6 +462,49 @@ describe("Automatic same-service native connection", () => {
     ]);
   });
 
+  it("Projects configuration labels without option values", () => {
+    const logged: Record<string, unknown>[] = [];
+    const diagnostics = Effect.runSync(
+      hostDiagnostics.pipe(
+        Effect.provideService(
+          Logger.CurrentLoggers,
+          new Set([
+            Logger.make(({ message }) => {
+              logged.push(
+                (Array.isArray(message) ? message : [message]).find(
+                  (part) => typeof part === "object" && part !== null,
+                ) as Record<string, unknown>,
+              );
+            }),
+          ]),
+        ),
+      ),
+    );
+    diagnostics("info", "setup.configured", {
+      pluginVersion: "0.1.0",
+      hostVersion: "2.2.5",
+      runtime: "v2",
+      options: ["agentID", "dataDir", "PRIVATE_OPTION_SENTINEL"],
+    });
+    diagnostics("info", "setup.configured", {
+      pluginVersion: "0.1.0 /home/private",
+      hostVersion: "v2",
+      runtime: "node",
+      options: "agentID",
+    });
+    expect(logged).toMatchObject([
+      {
+        event: "setup.configured",
+        pluginVersion: "0.1.0",
+        hostVersion: "2.2.5",
+        runtime: "v2",
+        options: ["agentID", "dataDir"],
+      },
+      { event: "setup.configured" },
+    ]);
+    expect(Object.keys(logged[1]!).sort()).toEqual(["event", "service"]);
+  });
+
   it("Excludes sensitive diagnostic data", async () => {
     const records: Record<string, unknown>[] = [];
     const hostile = fixture((_level, event, fields) => {

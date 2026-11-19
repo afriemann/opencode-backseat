@@ -88,7 +88,7 @@ export const NATIVE_SEND_OPTIONS = {
       delivery: deliverySchema,
       resume: boolean,
     },
-    [],
+    ["description"],
   ),
   shell: schema({}, []),
   compact: schema({ delivery: deliverySchema }, []),
@@ -100,7 +100,7 @@ export const NATIVE_SEND_OPTIONS = {
 };
 export const NATIVE_SEND_DESCRIPTIONS = {
   synthetic:
-    "Insert native synthetic text, optionally hidden when options.description is omitted. resume false stores without starting a turn.",
+    "Insert native synthetic text into the selected session. options.description is required: a short non-blank label naming the source, shown to the user as a row beside the inserted text. resume false stores without starting a turn.",
   shell:
     "Execute text as a native shell command in the selected session under configured OpenCode permissions.",
   compact:
@@ -139,6 +139,11 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
               ? ["skillID", "resume"]
               : [];
   exact(value, keys);
+  if (
+    kind === "synthetic" &&
+    (typeof value.description !== "string" || value.description.trim() === "")
+  )
+    throw new Error("Synthetic text requires a non-blank options.description");
   const delivery =
     value.delivery === undefined ? undefined : text(value.delivery);
   if (delivery !== undefined && delivery !== "steer" && delivery !== "queue")
@@ -235,8 +240,6 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
     ...(delivery === undefined ? {} : { delivery }),
     ...(resume === undefined ? {} : { resume }),
   };
-  const description =
-    value.description === undefined ? undefined : bulkText(value.description);
   switch (kind) {
     case "prompt":
       return (client, signal) =>
@@ -260,7 +263,7 @@ export function prepareNativeSend(input: NativeSend, sendID: string): Work {
             text: input.text,
             ...scheduling,
             ...(metadata === undefined ? {} : { metadata }),
-            ...(description === undefined ? {} : { description }),
+            description: bulkText(value.description),
           },
           { signal },
         );
