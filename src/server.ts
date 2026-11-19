@@ -737,7 +737,11 @@ export class SessionController {
       fingerprint(subject)
     )
       throw new Error("Selected native operation subject changed");
-    const result = await this.host.native.read(prepared.execute);
+    const result = await this.host.native.read(
+      prepared.execute,
+      undefined,
+      prepared.executeTimeoutMs,
+    );
     if (input.operation === "fork_session") {
       const session = object(result),
         sessionID = text(session.id);
@@ -1524,7 +1528,8 @@ async function createNativeCore(
       isCoordinator: (agent) =>
         active().coordinator?.isCoordinator(agent) ?? false,
       native: {
-        read: (work, options) => active().native.read(work, options),
+        read: (work, diagnostics, operationTimeoutMs) =>
+          active().native.read(work, diagnostics, operationTimeoutMs),
         identity: (input) => active().native.identity(input),
       },
       permission: {
