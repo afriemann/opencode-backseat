@@ -103,12 +103,10 @@ async function ownerStatus(
   identity: ProcessIdentity,
 ): Promise<"terminated" | "live" | "unverifiable"> {
   const current = await processIdentity();
-  // A different host/boot/PID namespace is uncertainty, not termination proof.
-  if (
-    identity.boot !== current.boot ||
-    identity.namespace !== current.namespace
-  )
-    return "unverifiable";
+  // No process survives a reboot; the exclusive lock already fences same-host owners.
+  if (identity.boot !== current.boot) return "terminated";
+  // A different PID namespace under the same boot is uncertainty, not termination proof.
+  if (identity.namespace !== current.namespace) return "unverifiable";
   try {
     return (await processStart(identity.pid)) !== identity.start
       ? "terminated"
