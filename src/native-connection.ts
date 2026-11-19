@@ -347,6 +347,12 @@ const unavailable = (
   new NativeConnectionError(`Native service ${reason}`, classification);
 
 const ERROR_CLASS_LABEL = /^(?:[A-Z][A-Za-z]{0,31})?Error$/;
+const REJECTION_TAG = /^[A-Z][A-Za-z]{0,63}Error$/;
+// Typed host errors carry their class in `_tag`; the message stays hidden.
+const rejectionTag = (error: unknown): string | undefined => {
+  const tag = (error as { _tag?: unknown } | null)?._tag;
+  return typeof tag === "string" && REJECTION_TAG.test(tag) ? tag : undefined;
+};
 // Native errors may embed secrets, so only the error class name is surfaced.
 const errorClassSuffix = (error: unknown): string =>
   error instanceof Error && ERROR_CLASS_LABEL.test(error.name)
@@ -666,6 +672,10 @@ export function createNativeConnection(options: {
         diagnostics.emit("debug", "native.completed", { phase: "completion" });
         return result;
       } catch (error) {
+        const rejection =
+          phase === "operation" && !transportFailed
+            ? rejectionTag(error)
+            : undefined;
         diagnostics.emit("error", "native.failed", {
           phase,
           classification: lifetime.signal.aborted
@@ -674,7 +684,7 @@ export function createNativeConnection(options: {
               ? "timeout"
               : callerSignal?.aborted
                 ? "cancelled"
-                : error instanceof NativeConnectionError
+                : error instanceof NativeConnectionError || rejection
                   ? "validation"
                   : transportFailed
                     ? "transport"
@@ -688,10 +698,12 @@ export function createNativeConnection(options: {
             ? unavailable("read timed out", "timeout")
             : callerSignal?.aborted
               ? unavailable("read cancelled", "cancelled")
-              : unavailable(
-                  `connection unavailable or unsupported${errorClassSuffix(error)}`,
-                  "unavailable",
-                );
+              : rejection
+                ? unavailable(`rejected the request (${rejection})`)
+                : unavailable(
+                    `connection unavailable or unsupported${errorClassSuffix(error)}`,
+                    "unavailable",
+                  );
       } finally {
         deadline?.removeEventListener("abort", onDeadline);
         requests.close();

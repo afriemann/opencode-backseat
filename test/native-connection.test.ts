@@ -613,6 +613,46 @@ describe("Automatic same-service native connection", () => {
     }
   });
 
+  it("Reports a typed host rejection as a rejection", async () => {
+    const failures: unknown[] = [];
+    const f = fixture((level, event, fields) => {
+      if (level === "error" && event === "native.failed") failures.push(fields);
+    });
+    try {
+      await expect(
+        f.connection.read(async () => {
+          throw Object.assign(new Error("PRIVATE_NATIVE_SENTINEL"), {
+            _tag: "PermissionNotFoundError",
+          });
+        }),
+      ).rejects.toMatchObject({
+        message:
+          "Native service rejected the request (PermissionNotFoundError)",
+      });
+      expect(failures[0]).toMatchObject({
+        phase: "operation",
+        classification: "validation",
+      });
+      failures.length = 0;
+      await expect(
+        f.connection.read(async (client) => {
+          f.setResponse(async () => {
+            throw Object.assign(new Error("PRIVATE_NATIVE_SENTINEL"), {
+              _tag: "RequestError",
+            });
+          });
+          return client.session.active({});
+        }),
+      ).rejects.toMatchObject({
+        message:
+          "Native service connection unavailable or unsupported (ClientError)",
+      });
+      expect(failures[0]).toMatchObject({ classification: "transport" });
+    } finally {
+      f.connection.dispose();
+    }
+  });
+
   it("Rejects an unavailable or different native service", async () => {
     for (const kind of [
       "missing",

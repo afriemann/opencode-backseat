@@ -503,7 +503,7 @@ export const NATIVE_OPERATIONS = {
   },
   reply_permission: {
     description:
-      "Reply to one pending native permission request using once, always, or reject. Configured OpenCode permissions apply to the selected request and decision. This does not grant permissions to the coordinator itself. Returns completed or throws when the request or target changed.",
+      "Reply to one pending native permission request. Set decision to once, always, or reject (the field is named decision, not reply); message is optional. Configured OpenCode permissions apply to the selected request and decision. This does not grant permissions to the coordinator itself. Returns completed or throws when the request or target changed.",
     input: schema(
       {
         requestID: string,
